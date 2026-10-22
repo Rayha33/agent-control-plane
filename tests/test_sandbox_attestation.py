@@ -4,21 +4,34 @@ import hashlib
 import json
 import os
 from dataclasses import replace
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
-from agent_control_plane.supervisor import sandbox_attestation
+from agent_control_plane.supervisor import oci_worker, sandbox_attestation
 from agent_control_plane.supervisor.common import SupervisorError, canonical_json
+from agent_control_plane.supervisor.oci_worker import _oci_worker_systemd_slice
 from agent_control_plane.supervisor.sandbox_attestation import (
     ProcessSnapshot,
     collect_running_runtime_attestation,
     read_private_runc_pid_file,
+    running_attestation_has_collector_provenance,
     running_attestation_is_self_consistent,
     validate_running_runtime_attestation,
+    verify_linux_process_membership,
+    verify_running_runtime_process_membership,
 )
 
-_WRAPPER_CGROUP = "/user.slice/user-1000.slice/user@1000.service/app.slice/acp-worker.service"
-_SCOPE_CGROUP = "/user.slice/user-1000.slice/user@1000.service/app.slice/acp-container.scope"
+_ATTEMPT_SLICE_UNIT = _oci_worker_systemd_slice("acp-test-container")
+_ATTEMPT_SLICE_CGROUP = (
+    f"/user.slice/user-1000.slice/user@1000.service/app.slice/{_ATTEMPT_SLICE_UNIT}"
+)
+_MONITOR_PARENT_CGROUP = "/user.slice/user-1000.slice/user@1000.service/app.slice"
+_WRAPPER_CGROUP = f"{_MONITOR_PARENT_CGROUP}/acp-worker.service"
+_LAUNCH_DRIVER_UNIT = "acp-launch-driver-test-execution.service"
+_LAUNCH_DRIVER_CGROUP = f"{_ATTEMPT_SLICE_CGROUP}/{_LAUNCH_DRIVER_UNIT}"
+_SCOPE_CGROUP = f"{_ATTEMPT_SLICE_CGROUP}/acp-container.scope"
 
 
 def _proc_stat(pid: int, state: str, start: int, comm: str = "worker (gate)") -> bytes:
@@ -26,16 +39,31 @@ def _proc_stat(pid: int, state: str, start: int, comm: str = "worker (gate)") ->
     return f"{pid} ({comm}) ".encode("ascii") + b" ".join(fields) + b"\n"
 
 
-def _properties(*, unit: str, invocation: str, cgroup: str, active: str = "active") -> bytes:
-    return f"ActiveState={active}\nControlGroup={cgroup}\nId={unit}\nInvocationID={invocation}\n".encode(
-        "ascii"
+def _properties(
+    *,
+    unit: str,
+    invocation: str,
+    cgroup: str,
+    active: str = "active",
+    main_pid: int | None = None,
+) -> bytes:
+    properties = (
+        f"ActiveState={active}\nControlGroup={cgroup}\nId={unit}\nInvocationID={invocation}\n"
     )
+    if main_pid is not None:
+        properties += f"MainPID={main_pid}\n"
+    return properties.encode("ascii")
 
 
 def _valid_observations() -> dict:
-    pids = (101, 202, 303)
-    starts = {101: 1101, 202: 1202, 303: 1303}
-    groups = {101: _WRAPPER_CGROUP, 202: _WRAPPER_CGROUP, 303: _SCOPE_CGROUP}
+    pids = (101, 202, 303, 404)
+    starts = {101: 1101, 202: 1202, 303: 1303, 404: 1404}
+    groups = {
+        101: _WRAPPER_CGROUP,
+        202: _LAUNCH_DRIVER_CGROUP,
+        303: _SCOPE_CGROUP,
+        404: _LAUNCH_DRIVER_CGROUP,
+    }
     return {
         "runc_state": json.dumps(
             {
@@ -56,7 +84,21 @@ def _valid_observations() -> dict:
             for pid in pids
         },
         "wrapper_properties": _properties(
-            unit="acp-worker.service", invocation="1" * 32, cgroup=_WRAPPER_CGROUP
+            unit="acp-worker.service",
+            invocation="1" * 32,
+            cgroup=_WRAPPER_CGROUP,
+            main_pid=101,
+        ),
+        "launch_driver_properties": _properties(
+            unit=_LAUNCH_DRIVER_UNIT,
+            invocation="4" * 32,
+            cgroup=_LAUNCH_DRIVER_CGROUP,
+            main_pid=404,
+        ),
+        "attempt_slice_properties": _properties(
+            unit=_ATTEMPT_SLICE_UNIT,
+            invocation="3" * 32,
+            cgroup=_ATTEMPT_SLICE_CGROUP,
         ),
         "scope_properties": _properties(
             unit="acp-container.scope", invocation="2" * 32, cgroup=_SCOPE_CGROUP
@@ -69,9 +111,21 @@ def _valid_observations() -> dict:
         "expected_runc_client_identity": "linux:202:1202",
         "expected_wrapper_unit": "acp-worker.service",
         "expected_wrapper_invocation_id": "1" * 32,
+        "expected_launch_driver_unit": _LAUNCH_DRIVER_UNIT,
+        "expected_attempt_slice_unit": _ATTEMPT_SLICE_UNIT,
+        "expected_attempt_slice_invocation_id": "3" * 32,
         "expected_scope_unit": "acp-container.scope",
         "expected_scope_invocation_id": "2" * 32,
         "expected_cgroup_path": _SCOPE_CGROUP,
+        "resource_control_files": {
+            "memory.max": b"1073741824\n",
+            "cpu.max": b"100000 100000\n",
+            "pids.max": b"256\n",
+        },
+        "expected_memory_max_bytes": 1_073_741_824,
+        "expected_cpu_quota": 100_000,
+        "expected_cpu_period": 100_000,
+        "expected_pids_max": 256,
     }
 
 
@@ -98,13 +152,177 @@ def test_attestation_binds_runtime_state_pid_start_identities_and_cgroups() -> N
     receipt = _validate()
 
     assert receipt.container_id == "acp-test-container"
+    assert receipt.monitor_placement == "outside_attempt_slice"
     assert receipt.init_pid == 303
     assert receipt.init_identity == "linux:303:1303"
     assert receipt.wrapper_control_group == _WRAPPER_CGROUP
+    assert receipt.attempt_slice_unit == _ATTEMPT_SLICE_UNIT
+    assert receipt.attempt_slice_invocation_id == "3" * 32
+    assert receipt.attempt_slice_control_group == _ATTEMPT_SLICE_CGROUP
     assert receipt.cgroup_path == _SCOPE_CGROUP
+    assert receipt.memory_max_bytes == 1_073_741_824
+    assert receipt.cpu_quota == 100_000
+    assert receipt.cpu_period == 100_000
+    assert receipt.pids_max == 256
     assert len(receipt.runc_state_sha256) == 64
     assert len(receipt.evidence_sha256) == 64
     assert receipt.audit_payload()["init_identity"] == "linux:303:1303"
+
+
+def test_release_verifier_rereads_all_execution_processes(monkeypatch: pytest.MonkeyPatch) -> None:
+    receipt = _validate()
+    snapshots = _valid_observations()["process_snapshots"]
+    observed: list[int] = []
+
+    def read_snapshot(pid: int) -> ProcessSnapshot:
+        observed.append(pid)
+        return snapshots[pid]
+
+    monkeypatch.setattr(sandbox_attestation, "read_linux_process_snapshot", read_snapshot)
+    verify_running_runtime_process_membership(receipt)
+
+    assert set(observed) == {
+        receipt.monitor_pid,
+        receipt.launch_driver_pid,
+        receipt.runc_client_pid,
+        receipt.init_pid,
+    }
+    assert len(observed) == 4
+
+
+def test_process_membership_verifier_returns_stable_identity_for_exact_cgroup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pid = 404
+    snapshot = ProcessSnapshot(
+        stat_before=_proc_stat(pid, "S", 1404),
+        cgroup=f"0::{_SCOPE_CGROUP}\n".encode("ascii"),
+        stat_after=_proc_stat(pid, "S", 1404),
+    )
+    observed: list[int] = []
+
+    def read_snapshot(observed_pid: int) -> ProcessSnapshot:
+        observed.append(observed_pid)
+        return snapshot
+
+    monkeypatch.setattr(sandbox_attestation, "read_linux_process_snapshot", read_snapshot)
+
+    assert verify_linux_process_membership(pid, expected_cgroup=_SCOPE_CGROUP) == "linux:404:1404"
+    assert observed == [pid]
+
+
+@pytest.mark.parametrize("drift", ["pid_reuse", "wrong_cgroup", "exited"])
+def test_process_membership_verifier_rejects_changed_identity_or_cgroup(
+    drift: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pid = 404
+    if drift == "pid_reuse":
+        snapshot = ProcessSnapshot(
+            _proc_stat(pid, "S", 1404),
+            f"0::{_SCOPE_CGROUP}\n".encode("ascii"),
+            _proc_stat(pid, "S", 9404),
+        )
+    elif drift == "wrong_cgroup":
+        snapshot = ProcessSnapshot(
+            _proc_stat(pid, "S", 1404),
+            b"0::/user.slice/foreign.scope\n",
+            _proc_stat(pid, "S", 1404),
+        )
+    else:
+        snapshot = ProcessSnapshot(
+            _proc_stat(pid, "Z", 1404),
+            f"0::{_SCOPE_CGROUP}\n".encode("ascii"),
+            _proc_stat(pid, "Z", 1404),
+        )
+    monkeypatch.setattr(sandbox_attestation, "read_linux_process_snapshot", lambda _pid: snapshot)
+
+    with pytest.raises(SupervisorError):
+        verify_linux_process_membership(pid, expected_cgroup=_SCOPE_CGROUP)
+
+
+def test_attestation_binds_runc_client_to_exact_launch_driver_service(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observations = _valid_observations()
+    receipt = _validate()
+    assert running_attestation_is_self_consistent(receipt)
+    assert receipt.launch_driver_unit == _LAUNCH_DRIVER_UNIT
+    assert receipt.launch_driver_pid == 404
+    assert receipt.launch_driver_identity == "linux:404:1404"
+    assert receipt.launch_driver_invocation_id == "4" * 32
+    assert receipt.launch_driver_control_group == _LAUNCH_DRIVER_CGROUP
+
+    snapshots = observations["process_snapshots"]
+    monkeypatch.setattr(
+        sandbox_attestation, "read_linux_process_snapshot", lambda pid: snapshots[pid]
+    )
+    verify_running_runtime_process_membership(receipt)
+
+    client = snapshots[202]
+    snapshots[202] = ProcessSnapshot(
+        stat_before=client.stat_before,
+        cgroup=f"0::{_ATTEMPT_SLICE_CGROUP}/acp-launch-driver.service\n".encode("ascii"),
+        stat_after=client.stat_after,
+    )
+    with pytest.raises(
+        SupervisorError, match="live process identities or cgroup membership no longer match"
+    ) as stale:
+        verify_running_runtime_process_membership(receipt)
+    assert isinstance(stale.value.__cause__, SupervisorError)
+    assert "live execution process cgroup membership changed" in str(stale.value.__cause__)
+
+
+def test_initial_attestation_rejects_runc_client_inside_worker_attempt_slice() -> None:
+    observations = _valid_observations()
+    client = observations["process_snapshots"][202]
+    observations["process_snapshots"][202] = ProcessSnapshot(
+        stat_before=client.stat_before,
+        cgroup=f"0::{_ATTEMPT_SLICE_CGROUP}/acp-launch-driver.service\n".encode("ascii"),
+        stat_after=client.stat_after,
+    )
+
+    with pytest.raises(
+        SupervisorError, match="runc client is outside its exact launch-driver service cgroup"
+    ):
+        validate_running_runtime_attestation(**observations)
+
+
+@pytest.mark.parametrize("drift", ["pid_reuse", "moved_cgroup", "exited"])
+def test_release_verifier_rejects_process_identity_or_cgroup_drift(
+    drift: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    receipt = _validate()
+    snapshots = _valid_observations()["process_snapshots"]
+    init = snapshots[receipt.init_pid]
+    if drift == "pid_reuse":
+        changed = ProcessSnapshot(
+            _proc_stat(receipt.init_pid, "S", 9999),
+            init.cgroup,
+            _proc_stat(receipt.init_pid, "S", 9999),
+        )
+    elif drift == "moved_cgroup":
+        changed = ProcessSnapshot(
+            init.stat_before,
+            b"0::/user.slice/foreign.scope\n",
+            init.stat_after,
+        )
+    else:
+        changed = ProcessSnapshot(
+            _proc_stat(receipt.init_pid, "Z", 1303),
+            init.cgroup,
+            _proc_stat(receipt.init_pid, "Z", 1303),
+        )
+    snapshots[receipt.init_pid] = changed
+    monkeypatch.setattr(
+        sandbox_attestation,
+        "read_linux_process_snapshot",
+        lambda pid: snapshots[pid],
+    )
+
+    with pytest.raises(SupervisorError) as stale:
+        verify_running_runtime_process_membership(receipt)
+
+    assert stale.value.code == "sandbox_runtime_attestation_stale"
 
 
 def test_private_runc_pid_file_reader_accepts_stable_file(tmp_path) -> None:
@@ -213,13 +431,14 @@ def test_private_runc_pid_file_reader_opens_nonblocking_after_fifo_swap(
     assert swapped
 
 
-def test_collector_reads_pid_and_proc_observations_itself(tmp_path, monkeypatch) -> None:
+def test_observation_normalization_cannot_mint_collector_provenance(tmp_path, monkeypatch) -> None:
     observations = _valid_observations()
     state_root, pid_file = _private_pid_file(tmp_path)
     proc_observations = {
         101: (_proc_stat(101, "S", 1101), _WRAPPER_CGROUP.encode("ascii")),
-        202: (_proc_stat(202, "S", 1202), _WRAPPER_CGROUP.encode("ascii")),
+        202: (_proc_stat(202, "S", 1202), _LAUNCH_DRIVER_CGROUP.encode("ascii")),
         303: (_proc_stat(303, "S", 1303), _SCOPE_CGROUP.encode("ascii")),
+        404: (_proc_stat(404, "S", 1404), _LAUNCH_DRIVER_CGROUP.encode("ascii")),
     }
 
     monkeypatch.setattr(sandbox_attestation.sys, "platform", "linux")
@@ -231,11 +450,18 @@ def test_collector_reads_pid_and_proc_observations_itself(tmp_path, monkeypatch)
         return b"0::" + cgroup + b"\n" if parts[-1] == "cgroup" else before_or_after_stat
 
     monkeypatch.setattr(sandbox_attestation, "_read_proc_file", read_proc)
-    receipt = collect_running_runtime_attestation(
+    monkeypatch.setattr(
+        sandbox_attestation,
+        "read_cgroup_resource_controls",
+        lambda _path, **_kwargs: observations["resource_control_files"],
+    )
+    receipt = sandbox_attestation._collect_running_runtime_attestation_from_observations(
         runc_state=observations["runc_state"],
         pid_file_path=pid_file,
         state_root=state_root,
         wrapper_properties=observations["wrapper_properties"],
+        launch_driver_properties=observations["launch_driver_properties"],
+        attempt_slice_properties=observations["attempt_slice_properties"],
         scope_properties=observations["scope_properties"],
         expected_container_id=observations["expected_container_id"],
         expected_bundle_path=observations["expected_bundle_path"],
@@ -245,23 +471,309 @@ def test_collector_reads_pid_and_proc_observations_itself(tmp_path, monkeypatch)
         expected_runc_client_identity=observations["expected_runc_client_identity"],
         expected_wrapper_unit=observations["expected_wrapper_unit"],
         expected_wrapper_invocation_id=observations["expected_wrapper_invocation_id"],
+        expected_launch_driver_unit=observations["expected_launch_driver_unit"],
+        expected_attempt_slice_unit=observations["expected_attempt_slice_unit"],
+        expected_attempt_slice_invocation_id=observations["expected_attempt_slice_invocation_id"],
         expected_scope_unit=observations["expected_scope_unit"],
         expected_scope_invocation_id=observations["expected_scope_invocation_id"],
         expected_cgroup_path=observations["expected_cgroup_path"],
+        expected_memory_max_bytes=observations["expected_memory_max_bytes"],
+        expected_cpu_quota=observations["expected_cpu_quota"],
+        expected_cpu_period=observations["expected_cpu_period"],
+        expected_pids_max=observations["expected_pids_max"],
     )
 
     assert receipt.init_pid == 303
     assert receipt.init_identity == "linux:303:1303"
+    assert running_attestation_is_self_consistent(receipt)
+    assert not running_attestation_has_collector_provenance(receipt)
+
+
+@pytest.mark.parametrize(
+    "drift_unit",
+    [None, "acp-worker.service", _LAUNCH_DRIVER_UNIT, _ATTEMPT_SLICE_UNIT, "acp-container.scope"],
+)
+def test_trusted_collector_reads_stable_pinned_runc_and_systemd_units(
+    tmp_path, monkeypatch, drift_unit: str | None
+) -> None:
+    observations = _valid_observations()
+    state_root, pid_file = _private_pid_file(tmp_path)
+    proc_observations = {
+        101: (_proc_stat(101, "S", 1101), _WRAPPER_CGROUP.encode("ascii")),
+        202: (_proc_stat(202, "S", 1202), _LAUNCH_DRIVER_CGROUP.encode("ascii")),
+        303: (_proc_stat(303, "S", 1303), _SCOPE_CGROUP.encode("ascii")),
+        404: (_proc_stat(404, "S", 1404), _LAUNCH_DRIVER_CGROUP.encode("ascii")),
+    }
+    commands: list[tuple[list[str], dict]] = []
+    unit_read_counts: dict[str, int] = {}
+    executable_fd = os.open(os.devnull, os.O_RDONLY)
+    monkeypatch.setattr(sandbox_attestation.sys, "platform", "linux")
+    monkeypatch.setattr(
+        sandbox_attestation, "_trusted_systemctl_executable", lambda: Path("/usr/bin/systemctl")
+    )
+    monkeypatch.setattr(
+        sandbox_attestation,
+        "_trusted_systemd_command_environment",
+        lambda: {"LANG": "C", "LC_ALL": "C"},
+    )
+    monkeypatch.setattr(
+        oci_worker,
+        "_verify_trusted_runc_executable",
+        lambda _pin: Path("/usr/bin/runc"),
+    )
+    monkeypatch.setattr(
+        oci_worker,
+        "_open_verified_runc_executable",
+        lambda _pin: executable_fd,
+    )
+
+    def run_bounded(argv, **kwargs):
+        command = list(argv)
+        commands.append((command, kwargs))
+        if command[0] == "/usr/bin/runc":
+            assert command[1:] == [
+                "--root",
+                str(state_root),
+                "state",
+                "acp-test-container",
+            ]
+            assert kwargs["pass_fds"] == (executable_fd,)
+            assert kwargs["exec_fd"] == executable_fd
+            return 0, observations["runc_state"].decode("utf-8")
+        assert command[:4] == [
+            "/usr/bin/systemctl",
+            "--user",
+            "show",
+            "--no-pager",
+        ]
+        expected_properties = "ActiveState,ControlGroup,Id,InvocationID"
+        if command[-1] in {"acp-worker.service", _LAUNCH_DRIVER_UNIT}:
+            expected_properties += ",MainPID"
+        assert command[4] == f"--property={expected_properties}"
+        assert command[5] == "--"
+        assert kwargs.get("exec_fd") is None
+        result = {
+            "acp-worker.service": observations["wrapper_properties"],
+            _LAUNCH_DRIVER_UNIT: observations["launch_driver_properties"],
+            _ATTEMPT_SLICE_UNIT: observations["attempt_slice_properties"],
+            "acp-container.scope": observations["scope_properties"],
+        }[command[-1]]
+        unit_read_counts[command[-1]] = unit_read_counts.get(command[-1], 0) + 1
+        if command[-1] == drift_unit and unit_read_counts[command[-1]] == 2:
+            lines = result.decode("ascii").splitlines()
+            replacement = "f" * 32
+            if f"InvocationID={replacement}" in lines:
+                replacement = "e" * 32
+            lines = [
+                f"InvocationID={replacement}" if line.startswith("InvocationID=") else line
+                for line in lines
+            ]
+            result = ("\n".join(lines) + "\n").encode("ascii")
+        return 0, result.decode("ascii")
+
+    monkeypatch.setattr(oci_worker, "_run_bounded_command", run_bounded)
+
+    def read_proc(path: str) -> bytes:
+        parts = path.split("/")
+        pid = int(parts[2])
+        before_or_after_stat, cgroup = proc_observations[pid]
+        return b"0::" + cgroup + b"\n" if parts[-1] == "cgroup" else before_or_after_stat
+
+    monkeypatch.setattr(sandbox_attestation, "_read_proc_file", read_proc)
+    monkeypatch.setattr(
+        sandbox_attestation,
+        "read_cgroup_resource_controls",
+        lambda _path, **_kwargs: observations["resource_control_files"],
+    )
+    expected = {
+        key: value
+        for key, value in observations.items()
+        if key
+        not in {
+            "runc_state",
+            "pid_file",
+            "process_snapshots",
+            "wrapper_properties",
+            "launch_driver_properties",
+            "attempt_slice_properties",
+            "scope_properties",
+            "resource_control_files",
+        }
+    }
+    runc_pin = SimpleNamespace(sha256="a" * 64)
+    if drift_unit is not None:
+        provenance_ids_before = set(sandbox_attestation._COLLECTED_ATTESTATIONS)
+        with pytest.raises(SupervisorError, match="systemd unit identity changed"):
+            collect_running_runtime_attestation(
+                runc_executable_pin=runc_pin,
+                state_root=state_root,
+                pid_file_path=pid_file,
+                **expected,
+            )
+        assert unit_read_counts[drift_unit] == 2
+        assert set(sandbox_attestation._COLLECTED_ATTESTATIONS).issubset(provenance_ids_before)
+        return
+
+    receipt = collect_running_runtime_attestation(
+        runc_executable_pin=runc_pin,
+        state_root=state_root,
+        pid_file_path=pid_file,
+        **expected,
+    )
+
+    assert receipt.init_pid == 303
+    assert receipt.init_identity == "linux:303:1303"
+    assert receipt.launch_driver_pid == 404
+    assert receipt.launch_driver_identity == "linux:404:1404"
+    assert running_attestation_has_collector_provenance(receipt)
+    assert len(commands) == 9
+    assert {command[-1] for command, _kwargs in commands[1:]} == {
+        "acp-worker.service",
+        _LAUNCH_DRIVER_UNIT,
+        _ATTEMPT_SLICE_UNIT,
+        "acp-container.scope",
+    }
+    assert unit_read_counts == {
+        "acp-worker.service": 2,
+        _LAUNCH_DRIVER_UNIT: 2,
+        _ATTEMPT_SLICE_UNIT: 2,
+        "acp-container.scope": 2,
+    }
+
+
+def _write_cgroup_controls(
+    directory, *, memory=b"1073741824\n", cpu=b"100000 100000\n", pids=b"256\n"
+):
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "memory.max").write_bytes(memory)
+    (directory / "cpu.max").write_bytes(cpu)
+    (directory / "pids.max").write_bytes(pids)
+
+
+def test_cgroup_resource_reader_uses_exact_no_follow_cgroup_path(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(sandbox_attestation.sys, "platform", "linux")
+    cgroup_root = tmp_path / "cgroup"
+    scope = cgroup_root / _SCOPE_CGROUP.lstrip("/")
+    _write_cgroup_controls(scope)
+
+    assert (
+        sandbox_attestation.read_cgroup_resource_controls(_SCOPE_CGROUP, cgroup_root=cgroup_root)
+        == _valid_observations()["resource_control_files"]
+    )
+
+
+def test_cgroup_resource_reader_rejects_symlinked_scope_component(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(sandbox_attestation.sys, "platform", "linux")
+    cgroup_root = tmp_path / "cgroup"
+    parts = _SCOPE_CGROUP.strip("/").split("/")
+    parent = cgroup_root.joinpath(*parts[:-1])
+    parent.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    _write_cgroup_controls(outside)
+    (parent / parts[-1]).symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(SupervisorError, match="could not be read safely"):
+        sandbox_attestation.read_cgroup_resource_controls(_SCOPE_CGROUP, cgroup_root=cgroup_root)
+
+
+def test_cgroup_resource_reader_rejects_symlinked_control_file(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(sandbox_attestation.sys, "platform", "linux")
+    cgroup_root = tmp_path / "cgroup"
+    scope = cgroup_root / _SCOPE_CGROUP.lstrip("/")
+    scope.mkdir(parents=True)
+    external = tmp_path / "memory-control"
+    external.write_bytes(b"1073741824\n")
+    (scope / "memory.max").symlink_to(external)
+    (scope / "cpu.max").write_bytes(b"100000 100000\n")
+    (scope / "pids.max").write_bytes(b"256\n")
+
+    with pytest.raises(SupervisorError, match="could not be read safely"):
+        sandbox_attestation.read_cgroup_resource_controls(_SCOPE_CGROUP, cgroup_root=cgroup_root)
+
+
+@pytest.mark.parametrize(
+    ("mount_root", "filesystem", "accepted"),
+    [
+        (b"/", b"cgroup2", True),
+        (b"/", b"cgroup", False),
+        (b"/delegated", b"cgroup2", False),
+    ],
+)
+def test_cgroup_root_mount_must_be_cgroup_v2(
+    monkeypatch: pytest.MonkeyPatch,
+    mount_root: bytes,
+    filesystem: bytes,
+    accepted: bool,
+) -> None:
+    monkeypatch.setattr(
+        sandbox_attestation,
+        "_read_proc_file",
+        lambda _path: (
+            b"36 25 0:32 " + mount_root + b" /sys/fs/cgroup rw - " + filesystem + b" cgroup rw\n"
+        ),
+    )
+
+    if accepted:
+        sandbox_attestation._require_cgroup2_mount("/sys/fs/cgroup")
+    else:
+        with pytest.raises(SupervisorError, match="not mounted as cgroup v2"):
+            sandbox_attestation._require_cgroup2_mount("/sys/fs/cgroup")
+
+
+def test_default_cgroup_reader_rejects_non_v2_mount_before_open(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sandbox_attestation.sys, "platform", "linux")
+    opened: list[str] = []
+    real_open = sandbox_attestation.os.open
+
+    def record_open(path, *args, **kwargs):
+        opened.append(os.fspath(path))
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(
+        sandbox_attestation,
+        "_read_proc_file",
+        lambda _path: b"36 25 0:32 / /sys/fs/cgroup rw - cgroup cgroup rw\n",
+    )
+    monkeypatch.setattr(sandbox_attestation.os, "open", record_open)
+
+    with pytest.raises(SupervisorError, match="not mounted as cgroup v2"):
+        sandbox_attestation.read_cgroup_resource_controls(_SCOPE_CGROUP)
+    assert opened == []
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("memory.max", b"1073741825\n"),
+        ("cpu.max", b"100000 100001\n"),
+        ("pids.max", b"257\n"),
+    ],
+)
+def test_runtime_attestation_rejects_cgroup_control_mismatch(name: str, value: bytes) -> None:
+    observations = _valid_observations()
+    observations["resource_control_files"][name] = value
+
+    with pytest.raises(SupervisorError, match="exact OCI launch limit"):
+        validate_running_runtime_attestation(**observations)
 
 
 def test_unkeyed_digest_checks_consistency_but_not_receipt_provenance() -> None:
-    forged = replace(_validate(), init_pid=404, init_identity="linux:404:9999")
+    forged = replace(_validate(), init_pid=505, init_identity="linux:505:9999")
     payload = forged.audit_payload()
     payload.pop("evidence_sha256")
     recomputed = hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
     forged = replace(forged, evidence_sha256=recomputed)
 
     assert running_attestation_is_self_consistent(forged)
+    assert not running_attestation_has_collector_provenance(forged)
 
 
 @pytest.mark.parametrize(
@@ -304,6 +816,19 @@ def test_unkeyed_digest_checks_consistency_but_not_receipt_provenance() -> None:
         (
             "wrapper_properties",
             _properties(unit="different.service", invocation="1" * 32, cgroup=_WRAPPER_CGROUP),
+        ),
+        (
+            "wrapper_properties",
+            _properties(
+                unit="acp-worker.service",
+                invocation="1" * 32,
+                cgroup=_WRAPPER_CGROUP,
+                main_pid=202,
+            ),
+        ),
+        (
+            "wrapper_properties",
+            _properties(unit="acp-worker.service", invocation="1" * 32, cgroup=_WRAPPER_CGROUP),
         ),
         (
             "scope_properties",
@@ -363,6 +888,115 @@ def test_attestation_rejects_process_cgroup_escape_and_non_live_pid() -> None:
         validate_running_runtime_attestation(**observations)
 
 
+def test_attestation_rejects_units_outside_the_exact_attempt_slice() -> None:
+    observations = _valid_observations()
+    other_scope_cgroup = (
+        "/user.slice/user-1000.slice/user@1000.service/app.slice/"
+        "user-acp-unexpected.slice/acp-container.scope"
+    )
+    observations["scope_properties"] = _properties(
+        unit="acp-container.scope", invocation="2" * 32, cgroup=other_scope_cgroup
+    )
+    observations["expected_cgroup_path"] = other_scope_cgroup
+    observations["process_snapshots"][303] = replace(
+        observations["process_snapshots"][303],
+        cgroup=f"0::{other_scope_cgroup}\n".encode("ascii"),
+    )
+
+    with pytest.raises(SupervisorError, match="exact attempt slice"):
+        validate_running_runtime_attestation(**observations)
+
+
+def test_attestation_rejects_arbitrary_sibling_launcher_cgroup() -> None:
+    observations = _valid_observations()
+    sibling_driver_group = f"{_MONITOR_PARENT_CGROUP}/{_LAUNCH_DRIVER_UNIT}"
+    observations["launch_driver_properties"] = _properties(
+        unit=_LAUNCH_DRIVER_UNIT,
+        invocation="4" * 32,
+        cgroup=sibling_driver_group,
+        main_pid=404,
+    )
+    observations["process_snapshots"][202] = replace(
+        observations["process_snapshots"][202],
+        cgroup=f"0::{sibling_driver_group}\n".encode("ascii"),
+    )
+
+    with pytest.raises(SupervisorError, match="direct child of the exact attempt slice"):
+        validate_running_runtime_attestation(**observations)
+
+
+@pytest.mark.parametrize(
+    "monitor_cgroup",
+    [
+        f"{_ATTEMPT_SLICE_CGROUP}/acp-worker.service",
+        f"{_ATTEMPT_SLICE_CGROUP}/nested/acp-worker.service",
+        f"{_MONITOR_PARENT_CGROUP}/user-acp-{'f' * 64}.slice/acp-worker.service",
+        _MONITOR_PARENT_CGROUP,
+    ],
+)
+def test_attestation_rejects_monitor_inside_or_owning_worker_slice(monitor_cgroup: str) -> None:
+    observations = _valid_observations()
+    observations["wrapper_properties"] = _properties(
+        unit="acp-worker.service",
+        invocation="1" * 32,
+        cgroup=monitor_cgroup,
+        main_pid=101,
+    )
+    for pid in (101, 202):
+        observations["process_snapshots"][pid] = replace(
+            observations["process_snapshots"][pid],
+            cgroup=f"0::{monitor_cgroup}\n".encode("ascii"),
+        )
+
+    with pytest.raises(SupervisorError, match="separate cgroups"):
+        validate_running_runtime_attestation(**observations)
+
+
+def test_self_consistency_rejects_monitor_cgroup_moved_into_worker_slice() -> None:
+    receipt = _validate()
+    forged = replace(
+        receipt,
+        wrapper_control_group=f"{_ATTEMPT_SLICE_CGROUP}/acp-worker.service",
+    )
+    payload = forged.audit_payload()
+    payload.pop("evidence_sha256")
+    forged = replace(
+        forged,
+        evidence_sha256=hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest(),
+    )
+
+    assert not running_attestation_is_self_consistent(forged)
+
+
+def test_self_consistency_rejects_monitor_inside_sibling_attempt_slice() -> None:
+    receipt = _validate()
+    forged = replace(
+        receipt,
+        wrapper_control_group=(
+            f"{_MONITOR_PARENT_CGROUP}/user-acp-{'f' * 64}.slice/acp-worker.service"
+        ),
+    )
+    payload = forged.audit_payload()
+    payload.pop("evidence_sha256")
+    forged = replace(
+        forged,
+        evidence_sha256=hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest(),
+    )
+
+    assert not running_attestation_is_self_consistent(forged)
+
+
+def test_attestation_rejects_attempt_slice_invocation_reuse() -> None:
+    with pytest.raises(SupervisorError, match="invocation identity changed"):
+        _validate(
+            attempt_slice_properties=_properties(
+                unit=_ATTEMPT_SLICE_UNIT,
+                invocation="4" * 32,
+                cgroup=_ATTEMPT_SLICE_CGROUP,
+            )
+        )
+
+
 def test_attestation_rejects_duplicate_unified_cgroup_hierarchy() -> None:
     observations = _valid_observations()
     observations["process_snapshots"][303] = replace(
@@ -382,3 +1016,98 @@ def test_attestation_bounds_untrusted_observations() -> None:
     with pytest.raises(SupervisorError) as malformed:
         _validate(runc_state=b"[" * 200 + b"]" * 200)
     assert malformed.value.code == "sandbox_runtime_attestation_invalid"
+
+
+def test_launch_driver_start_redemption_binds_exact_current_service_and_slice() -> None:
+    attempt_id = "1" * 32
+    execution_id = "execution-123"
+    container_id = "acp-test-container"
+    service_unit = f"acp-launch-driver-{execution_id}.service"
+    slice_unit = _oci_worker_systemd_slice(container_id)
+    parent = "/user.slice/user-1000.slice/user@1000.service/app.slice/user-acp.slice"
+    slice_cgroup = f"{parent}/{slice_unit}"
+    service_cgroup = f"{slice_cgroup}/{service_unit}"
+    pid = 303
+
+    def properties(
+        *, unit: str, invocation: str, cgroup: str, slice_name: str, main_pid: int | None = None
+    ) -> bytes:
+        value = (
+            "ActiveState=active\n"
+            f"ControlGroup={cgroup}\n"
+            f"Id={unit}\n"
+            f"InvocationID={invocation}\n"
+            "LoadState=loaded\n"
+        )
+        if main_pid is not None:
+            value += f"MainPID={main_pid}\n"
+        value += f"Slice={slice_name}\n"
+        return value.encode("ascii")
+
+    service = properties(
+        unit=service_unit,
+        invocation="a" * 32,
+        cgroup=service_cgroup,
+        slice_name=slice_unit,
+        main_pid=pid,
+    )
+    attempt_slice = properties(
+        unit=slice_unit,
+        invocation="b" * 32,
+        cgroup=slice_cgroup,
+        slice_name="user-acp.slice",
+    )
+    inputs = {
+        "expected_identity": (attempt_id, 7, execution_id),
+        "expected_container_id": container_id,
+        "start_id": "c" * 32,
+        "start_digest": "d" * 64,
+        "service_unit": service_unit,
+        "attempt_slice_unit": slice_unit,
+        "service_properties": service,
+        "attempt_slice_properties": attempt_slice,
+        "expected_current_pid": pid,
+    }
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(
+            sandbox_attestation,
+            "verify_linux_process_membership",
+            lambda observed_pid, *, expected_cgroup, expected_identity=None: (
+                f"linux:{observed_pid}:123456"
+            ),
+        )
+        receipt = sandbox_attestation._collect_launch_driver_start_redemption_from_observations(
+            **inputs
+        )
+
+    assert sandbox_attestation.launch_driver_start_redemption_has_collector_provenance(receipt)
+    assert sandbox_attestation.launch_driver_start_redemption_is_self_consistent(receipt)
+    assert receipt.driver_pid == pid
+    assert receipt.driver_control_group == service_cgroup
+    assert receipt.attempt_slice_control_group == slice_cgroup
+
+    with pytest.raises(SupervisorError, match="MainPID is not the current service process"):
+        sandbox_attestation._collect_launch_driver_start_redemption_from_observations(
+            **(inputs | {"service_properties": service.replace(b"MainPID=303", b"MainPID=304")})
+        )
+    with pytest.raises(SupervisorError, match="identity is not active and exact"):
+        sandbox_attestation._collect_launch_driver_start_redemption_from_observations(
+            **(
+                inputs
+                | {
+                    "attempt_slice_properties": attempt_slice.replace(
+                        b"Slice=user-acp.slice", b"Slice=system.slice"
+                    )
+                }
+            )
+        )
+    with pytest.raises(SupervisorError, match="direct child of its exact attempt slice"):
+        sandbox_attestation._collect_launch_driver_start_redemption_from_observations(
+            **{
+                **inputs,
+                "service_properties": service.replace(
+                    service_cgroup.encode("ascii"),
+                    f"{parent}/sibling.slice/{service_unit}".encode("ascii"),
+                ),
+            }
+        )

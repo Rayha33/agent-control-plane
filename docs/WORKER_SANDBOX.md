@@ -1,12 +1,34 @@
 # Per-attempt worker sandbox decision
 
-**Status:** proposed end-to-end architecture. Standalone bounded snapshot and
-change-set primitives, exact host-side manifest replay validation, secure
-snapshot readback, an isolated-index candidate-tree builder, and a claim-fenced
-result-import journal/recovery path are implemented. The import API consumes
-host-captured `Snapshot` and `ChangeSet` objects; it is not wired into a worker
-executor, CLI transport, or the existing `run_worker` path. It writes a
-deterministic host-authored commit to an immutable per-attempt ref in
+**Current status (2026-10-22):** Provider-backed end-to-end acceptance remains
+incomplete. An explicit experimental, no-model `run_worker()` route now reaches
+the production launch driver, independent cleanup verifier, and host-side
+result-import path. It can carry an explicitly named UDS-only provider egress
+policy, but it does not provide a built-in provider-credential channel or generic
+TCP HTTP-proxy/SDK compatibility. Callers remain responsible for keeping secrets
+out of worker commands and workspaces. It does not enable the default OCI worker path. A live
+two-worker test on one shared repository recorded `/proc/self/mountinfo` from
+each worker and verified its `/workspace` mount root matched that attempt's
+exact workspace path, `/tmp`, `/dev`, and `/home/agent` were tmpfs, `/proc` was
+procfs, and no mount root from the shared fixture appeared outside `/workspace`.
+Direct lookups of host-absolute peer-workspace and shared-Git sentinel paths
+were not visible; the peer-workspace sentinel was also tested through symlink
+and `..` paths. Cleanup was verified for both attempts. This is specific-path
+and live-mount evidence on one disposable Linux
+guest, not a general kernel-isolation proof. Provider authentication,
+production egress enforcement, supervisor-daemon restart, logout/linger, and
+reboot recovery remain unproven.
+The dated entries below describe evidence and status as of their stated dates;
+the current summary above supersedes older integration-status statements.
+
+Standalone bounded snapshot and change-set primitives, exact host-side manifest
+replay validation, secure snapshot readback, an isolated-index candidate-tree
+builder, and a claim-fenced result-import journal/recovery path are implemented.
+The import API consumes host-captured `Snapshot` and `ChangeSet` objects; it is
+not wired into a general CLI transport or provider-backed executor. The
+experimental no-model `run_worker()` route reaches it only after exact-identity
+cleanup verification. It writes a deterministic host-authored commit to an
+immutable per-attempt ref in
 `refs/acp/worker-results/`, then uses ACP's ordinary submission checks. It does
 not mutate the registered attempt worktree or its real index. Its write-ahead
 record binds the attempt ID, claim token, worker PID plus kernel start identity,
@@ -18,14 +40,325 @@ constructed in bounded per-import private object stores; the prepared journal
 commits before ACP promotes exact object IDs into the common repository store.
 Unjournaled private stages and ambiguous promotions have scoped reconciliation;
 committed result refs remain retained pending a separate retention policy, and
-ACP does not run repository-wide GC. See
+ACP does not run repository-wide GC. A disposable-Linux integration fixture
+exercises production launch, cleanup verification, host-side capture/import,
+and pending-QC handoff through the explicit no-model `run_worker()` opt-in. A
+separate journal regression concurrently reserves two
+different attempts and binds disjoint baseline/workspace roots, proving unique
+execution/container identities and concurrent independent write sentinels at
+the filesystem/journal layer. Unlike the live concurrent probe described below,
+it does not run two live runc workers or prove cross-container kernel
+isolation. See the live evidence below and
 [`RESULT_IMPORT_OBJECTS.md`](RESULT_IMPORT_OBJECTS.md) for the current staging,
 retention, and cleanup contract. End-to-end worker isolation proof remains
 incomplete. The OCI policy compiler stages init behind fd 3, and a reusable
-launcher now starts the pinned runc client through a held executable FD while
-retaining that gate. No `run_worker` path yet connects launch to the durable
-journal, runtime attestation, cleanup verification, or result import. This
-record does not authorize `externalSandbox` for ACP workers.
+launcher starts the pinned runc client through a held executable FD while
+retaining that gate. The explicit route remains experimental and the default
+OCI `run_worker()` path remains disabled/fail-closed. This record does not
+authorize `externalSandbox` for ACP workers.
+
+**Test-only loopback TCP-to-UDS bridge probe (2026-10-22):** The opt-in
+`test_live_rootless_runc_mounts_attempt_proxy_socket_directory_read_only`
+passed 1/1 on the disposable Debian 12 ARM64 guest (`6.12.95+deb12-cloud-arm64`)
+with root-owned runc 1.5.2 (SHA-256
+`d10ecae898361832a059be2089bab92d158aec54661b18ed7346ed79628b46b0`) and
+libseccomp 2.6.1. GCC 12.2.0 targeting `aarch64-linux-gnu` built the pinned
+static bridge. The exact test module SHA-256 was
+`57d7b6b7488e5cb1f1a0e1f5846c5816c34c7ff98202596dfc2fee8a3b1950ae`.
+The test-only seccomp profile preserves the base denial of non-Unix
+`socketpair()` and permits `socket()` only for AF_UNIX/AF_INET stream sockets
+with protocol 0 or TCP; its live probes reject IPv4 UDP/raw/other protocols
+(including MPTCP 262), IPv6, packet, netlink, vsock, and a future family value
+300. It does not alter the production worker profile. The worker ran in a
+test-created network namespace with only loopback and no non-local routes;
+probes observed `ENETUNREACH` for `203.0.113.1:443` and `192.168.5.2:22`, and
+could not reach a host-loopback listener.
+
+The complete rootfs was content/inode-pinned. It contained a static TCP-to-UDS
+bridge pinned to SHA-256
+`c8956d969aaddf3e03b6afa6764ff815684cdd445cdab1fe7de8d96028759f33`; it bound
+only `127.0.0.1:18443` and connected only to the mounted
+`/run/acp/provider.sock`. The client was curl 7.88.1 pinned to
+`bf8f7fbd808dcdd8fc5e414ea69700643f66d6d95e709777548cd835cbcf98b4`. A local
+TLS mock returned a redirect to `blocked.example`; the second CONNECT was
+denied before resolver or dial, while only the two expected
+`api.example.com:443` mock resolver/dial operations were observed, with none for
+`blocked.example`. No external DNS, provider call, or real credential was
+used. Peer PIDFD, UID/GID, and exact-cgroup checks ran for both bridge
+channels, but collector-attestation issuance was mocked.
+The worker script explicitly stopped and waited for the bridge on this success
+path. This is one guest's test-only bridge/proxy proof, not production
+`run_worker()` integration, provider authentication, general egress policy,
+active-channel cancellation, or supervisor-crash recovery; the default OCI
+worker route remains disabled/fail-closed.
+
+**Registered UDS-only egress opt-in (2026-10-22):** The `acp run` command and
+`GitSupervisor.run_worker()` now accept an audit label and a caller-supplied
+`HOST:PORT` destination allowlist only with `--sandbox-experimental-opt-in`. The
+label does not select a central policy profile; the supplied destinations define
+the actual allowlist. ACP passes the validated values through the registered
+launch-driver request; the worker receives only the non-secret
+`ACP_PROVIDER_PROXY_UNIX_SOCKET` path. Omitting the policy keeps the no-provider
+path unchanged, and supplying any provider policy without the explicit sandbox
+opt-in fails before worker launch. ACP does not provision provider credentials
+through a built-in secret channel; callers must ensure commands and workspaces
+contain no secrets. The route does not set `HTTP_PROXY`, run the test-only TCP
+bridge, or claim that an SDK can speak directly to the UDS protocol. Unit tests
+cover CLI parsing, forwarding, and fail-closed opt-in/policy validation. A live
+provider-backed `run_worker()` composition test remains outstanding.
+
+**Live same-repository concurrent probe (2026-10-22):**
+`test_live_concurrent_attempts_use_distinct_scopes_and_clean_up` passed 1/1 on
+the disposable Debian 12 ARM64 Lima guest (Linux
+`6.12.95+deb12-cloud-arm64`, systemd 252.39, Python 3.11.2) with root-owned
+runc 1.5.2, SHA-256
+`d10ecae898361832a059be2089bab92d158aec54661b18ed7346ed79628b46b0`. Both
+workers used the same repository and pinned rootfs but separate attempts,
+workspaces, scopes, and runtime-port allocations. While both scopes were active,
+each worker wrote its own `/proc/self/mountinfo` into its assigned workspace.
+The parent test verified the exact per-attempt `/workspace` mount root, private
+tmpfs mounts at `/tmp`, `/dev`, and `/home/agent`, procfs at `/proc`, and no
+mount root from the shared fixture outside the assigned `/workspace`. The
+assigned copy contained no `.git`. Workers directly probed the host-absolute
+peer-workspace and shared-Git sentinel paths; they additionally probed the
+peer-workspace sentinel through an absolute symlink and a `..` path. Those
+tested paths were not visible. The host checked that all three external sentinels retained their
+original inode and bytes. Both attempts independently verified cleanup before
+the shared-repository reaper ran; each ended orphaned with its runtime
+allocation released. Postflight found no active ACP scope, runc
+process, launch root, shared fixture, or control directory. The VM was stopped,
+not deleted, and the temporary guest checkout and virtual environment were
+removed.
+
+This records the live mount roots and shows that those specific shared-repository
+paths were not visible through the tested lookups on this guest. It does not
+prove general cross-container kernel isolation, provider/model execution, broad
+network egress controls, another kernel/architecture, or the default OCI
+`run_worker()` path.
+No provider credential or model call was used, and task #2370 remains open.
+
+**Earlier live isolation and import probe (2026-10-21):** On exact
+source commit `a70eef36b1b90523be383598bc7d0e0501d710cf`, the opt-in
+`test_live_production_launch_driver_runs_exact_pinned_runc_request` passed in a
+disposable Debian 12 ARM64 Lima guest (Linux 6.1.187-1, Python 3.11.2, systemd
+user manager, cgroup v2). The trusted root-owned runc 1.5.2 executable matched
+the upstream ARM64 asset SHA-256
+`d10ecae898361832a059be2089bab92d158aec54661b18ed7346ed79628b46b0`.
+`ACP_LIVE_ISOLATION_PROBES=1` passed, and the combined
+`ACP_LIVE_ISOLATION_PROBES=1` plus
+`ACP_LIVE_IMPORT_RESULT_AFTER_CLEANUP=1` run also passed. These runs exercised
+the production launch driver with no model or provider credentials; the
+combined run verified a deterministic workspace edit/test, cleanup reaching
+`cleanup_verified`, and host-side import of only the expected paths. The
+isolation assertions denied base/harness/sibling/unrelated-project, home,
+config, credential, and host-temp sentinels; symlink and canonical-path
+escapes; access to the tested host controller PID and the two host/systemd
+socket paths; and a direct-IP network probe.
+An initial setup with a user-owned runc under `/tmp` was rejected before
+launch; installing the same hash-verified binary at root-owned
+`/usr/local/bin/runc` satisfied the trust pin without weakening it. The test
+verified its run root was gone and the exact attempt units were quiescent;
+post-run unit listing showed no `acp-*` entries. The VM was stopped, not
+deleted. Exact-head
+hosted CI for this source passed all four Ubuntu/macOS × Python 3.11/3.12 jobs
+([run 39522242994](https://github.com/Rayha33/agent-control-plane/actions/runs/39522242994)).
+Each isolation/import invocation above exercised one no-model launch-driver
+attempt. Separately, two concurrent invocations ran the same test with
+`ACP_LIVE_CANCEL_AFTER_START=1`; both exited 0. A systemd user-manager observer
+sampled two distinct active scopes,
+`acp-acp-23cea377914300d728f65ab9da3557bc3468d3f5e7dd62af2ff9774d309e.scope`
+and
+`acp-acp-29b16f93d8869373ac2605f07e23f563adc029db47af1e125fec293cc8fe.scope`,
+in consecutive samples at 2026-10-21 01:04:04 UTC. Each invocation created its
+own temporary repository, attempt, and private rootfs. The test cancellation
+path also verified lease renewal, rejection of a wrong runner credential,
+fresh-process cancellation, and `cleanup_verified`. This demonstrates
+simultaneous live no-model runc attempts on one guest, not same-repository
+concurrent-workspace or cross-attempt access isolation. Post-run unit listing
+had no `acp-*` entries, no test run roots remained, and the VM was stopped,
+not deleted. This earlier direct launch-driver probe did not prove
+`run_worker()` integration. The later explicit no-model `run_worker()` proof
+and its exact limitations are recorded in
+[`WORKER_LAUNCH_DRIVER.md`](WORKER_LAUNCH_DRIVER.md). Provider
+authentication/egress remain unproven, and the default non-opt-in OCI worker
+path remains fail-closed.
+
+**Cleanup-verification update (2026-10-16):** The supervisor-owned verifier is
+now implemented in source and wired into reaper recovery for eligible
+`cleanup_reported` attempts. Schema 33 stores a separate write-once receipt;
+the verifier checks the exact service invocations, process identities, cgroup
+trees, runc state entry, mount table, and inode-bound private paths, then
+rechecks process/cgroup/systemd state after deleting only the recorded bundle
+and state trees. Unit tests and a mocked OS/SQLite integration test pass. The
+exact production-launcher integration passed in both natural-completion and
+fresh-supervisor cancellation modes on disposable Debian 12 ARM64 / Linux 6.1 /
+systemd 252.39 with cgroup v2 and pinned runc 1.5.2. Each run now hands the
+durable `cleanup_reported` attempt to the real `reap_expired()` path with a
+synthetically expired lease; the reaper invokes the real verifier, reaches
+`cleanup_verified`, releases the runtime, and orphans the terminal attempt and
+resource fence. Both runs passed live process, unit, invocation, cgroup,
+runc-state, private-path, and monitor-socket checks. The cancelled run's
+nonzero runc exit remains ineligible for result import. The updated proof runs
+the producer in a spawned process that exits via `os._exit(73)` after the
+durable handoff receipt; fresh spawned supervisor processes then cancel (when
+requested) and run the real reaper. In both modes, a fresh producer retry of the
+same launch request was rejected before `systemd-run`; the durable start ID,
+digest, invocation ID, and driver PID remained unchanged. The original pytest
+harness remains alive. A separate opt-in manager-acceptance crash mode now
+exits the producer immediately after successful `systemd-run` return and before
+receipt propagation; on the same Debian 12/systemd 252.39 guest, it passed
+1/1, as did re-runs of natural completion and fresh-process cancellation (1/1
+each). A fresh producer retry was rejected before `systemd-run`, with zero
+second submissions and the durable start ID, digest, unit invocation, PID,
+process identity, and cgroup path unchanged. This proves the specific
+manager-accepted/pre-receipt crash boundary, not every possible handoff
+interruption or a full supervisor-daemon restart. The separate positive reaper
+regression continues to cover failed verification with deterministic mocked OS
+observations. Run 38875452816 exposed the `/private/tmp` cross-platform fixture
+defect; the correction passed the four exact-head Ubuntu/macOS × Python 3.11/3.12
+jobs for `0ce4dc4`. The producer-loss/no-replay increment then passed all four
+jobs in [exact-head run 38884017803](https://github.com/Rayha33/agent-control-plane/actions/runs/38884017803)
+on code-bearing commit `2383221c1a84cf52c08f42043465baea2ed4d487`.
+The manager-acceptance crash increment at code-bearing commit
+`e5f664f538996738cd310c482c778d08f9ee0440` passed
+[exact-head hosted CI run 38888249380](https://github.com/Rayha33/agent-control-plane/actions/runs/38888249380):
+all four Ubuntu/macOS × Python 3.11/3.12 jobs passed.
+Separately, `test_fresh_supervisor_contains_driver_crash_after_monitor_acceptance`
+now kills a spawned launch-driver after the fake monitor starter reports
+acceptance but before the journal's `launched` commit. Fresh-process recovery
+stops only the exact driver/monitor/slice units when observations are quiescent;
+an uncertain still-active driver fails closed, and both cases retain the
+ambiguous phase, cleanup fence, and one-shot submission. The exact test-module
+SHA-256 is
+`63829a2d83d66d08363061653722f32ba57771c33107a71cffedc97291f2203f`. This
+uses real spawned-process loss, SQLite, and process-shared locking, but
+synthetic systemd observations; it is not live manager/start-stop or full
+daemon-restart evidence.
+Cgroup absence is accepted only after mountinfo proves the complete cgroup-v2
+mount-root mapping, and cleanup removes only the exact execution-bound monitor
+socket beneath the verified private runtime directory. As of this
+2026-10-16 update, result import had separate opt-in live
+launch/cleanup/import evidence but was still unconnected to `run_worker()`.
+The later 2026-10-21 no-model opt-in connection is described in the current
+summary above and in `WORKER_LAUNCH_DRIVER.md`. This dated update superseded
+older statements below that no verifier implementation or reaper retry path
+existed; historical run results remain scoped to the source hashes actually
+tested.
+
+**Launch ownership decision (2026-10-16):** Use the two-service
+topology in [`WORKER_LAUNCH_DRIVER.md`](WORKER_LAUNCH_DRIVER.md): the exact
+launch-driver service sits inside the attempt slice and owns the process-local
+pinned-runc handle, gate, collector attestation, journal transition, wait/reap,
+and cleanup evidence. The authenticated recovery monitor stays outside and
+routes status/cancel over IPC; it never receives or reconstructs those
+process-local capabilities. The runc client remains in the driver's exact
+service cgroup, matching the existing attestation contract. Independent review
+rejected the earlier outside-monitor owner and PIDs-to-scope migration design.
+The PIDs attachment helper is an unselected experiment only; it does not itself
+prove or retain the private launcher's exec gate, which remains a caller
+precondition. Independent review gave the revised two-service ownership ADR
+**GO** on 2026-10-16; this is decision-level approval, not implementation or
+lifecycle acceptance. The production launch-driver producer, bounded
+pinned-runc path, producer-process loss/no-replay after durable handoff, and
+fresh-process cancellation branch have disposable Debian/systemd evidence. The
+live natural-completion and cancellation runs both exercise automatic reaper
+verification and runtime/fence release after a synthetic lease expiry, with
+the reaper running in a fresh spawned supervisor process. The test harness
+itself is not restarted, and there is no full supervisor-daemon restart proof.
+Exact-head hosted CI run 38884017803 passed all four Ubuntu/macOS × Python
+3.11/3.12 jobs for code-bearing commit
+`2383221c1a84cf52c08f42043465baea2ed4d487`.
+As of this ADR's 2026-10-16 status, full lifecycle proof and `run_worker()`
+integration were pending; the later no-model opt-in integration is recorded
+above. Provider-backed/default-path acceptance remains pending.
+
+## Codex adapter contract (2026-10-15; OpenAI Docs)
+
+OpenAI positions the Codex SDK for automated coding jobs and CI, and the App
+Server for custom clients that need authentication, conversation history,
+approvals, and streamed events. ACP's worker is an automated job, so the SDK is
+the default adapter to evaluate; choosing either interface does not provide
+the per-attempt isolation required here.
+
+The App Server's `sandboxPolicy.type = "externalSandbox"` explicitly tells
+Codex to skip its own sandbox because the server/command is already sandboxed.
+It is a delegation contract, not a sandbox implementation. ACP must put the
+agent process and all descendants inside its independently enforced namespace
+before opting into this mode. The App Server's `networkAccess` value is not
+packet-filter evidence. Likewise, Codex permission-profile domain rules only
+constrain command traffic when the network proxy is enabled; merely setting
+domains does not start that proxy. ACP must enforce and test provider egress at
+the outer boundary, fail closed when that policy is unavailable, and must not
+mount or copy the host's Codex auth/config directory into an attempt.
+
+The App Server API also exposes execution surfaces distinct from `command/exec`:
+`thread/shellCommand` is user-initiated and runs outside Codex's sandbox with
+full access, while experimental `process/spawn` (which requires
+`capabilities.experimentalApi`) starts a process outside that sandbox. Do not
+expose these capabilities to worker-controlled clients by default. Any future
+use needs explicit authorization and independent confinement of the App Server
+and spawned process tree inside the attempt boundary; a per-command sandbox
+setting alone is insufficient. The command network proxy filters programs
+inside the local command sandbox, not model/authentication requests or separate
+surfaces such as web search, apps/connectors, MCP, browser/Computer Use, and
+Codex cloud tasks ([App Server API overview](https://learn.chatgpt.com/docs/app-server#api-overview),
+[agent security guidance](https://learn.chatgpt.com/docs/agent-approvals-security#traffic-outside-the-command-network-proxy)).
+
+The documented interface split is in [OpenAI's Codex SDK
+guide](https://learn.chatgpt.com/docs/codex-sdk) and [App Server
+guide](https://learn.chatgpt.com/docs/app-server#command-execution). The
+external-sandbox contract is described under [App Server command
+execution](https://learn.chatgpt.com/docs/app-server#command-execution); the
+network-proxy requirement is in [Agent approvals & security](https://learn.chatgpt.com/docs/agent-approvals-security#network-isolation)
+and [Permissions](https://learn.chatgpt.com/docs/permissions).
+
+**Runtime security requalification (2026-10-10).** The implementation and prior
+live evidence were pinned to runc 1.3.5. Upstream lists `<=1.3.5`, `<=1.4.2`,
+and `<=1.5.0-rc.2` as affected by
+[GHSA-xjvp-4fhw-gc47](https://github.com/opencontainers/runc/security/advisories/GHSA-xjvp-4fhw-gc47),
+with fixes in 1.3.6, 1.4.3, and 1.5.0-rc.3. We evaluated the patched 1.3 and
+1.4 lines at source level and selected 1.5.2, the latest stable release at
+selection time (1.6.0-rc.1 is a prerelease). Both [1.4.3](https://github.com/opencontainers/runc/blob/v1.4.3/libcontainer/specconv/spec_linux.go#L2290-L2294)
+and [1.5.2](https://github.com/opencontainers/runc/blob/v1.5.2/libcontainer/specconv/spec_linux.go#L2290-L2294)
+retain the adapter's `rprivate` to `MS_PRIVATE|MS_REC` mapping. The
+[1.5.2 release](https://github.com/opencontainers/runc/releases/tag/v1.5.2)
+also includes a workaround for a cgroup-v2 device-rules kernel bug present in
+Linux 6.17. The adapter contract now targets exact runc 1.5.2 and its upstream
+`runc.amd64` digest
+`sha256:599f6f94ff8c5057241eff0d54c3c74f95c34935b6457b33fe545defc61e9488`.
+That upstream digest is verified when the dedicated CI job acquires its test
+binary. Production configuration validates the exact release string and pins
+the configured executable's observed bytes; it does not hard-code this upstream
+asset digest, so deployments remain responsible for sourcing and configuring
+their own trusted runc binary.
+The opt-in live boundary probe passed on 2026-10-10 in a disposable Lima VZ
+guest (Ubuntu 24.04.5 LTS, aarch64, kernel 6.8.0-142-generic), using the
+upstream `runc.arm64` asset with digest
+`sha256:d10ecae898361832a059be2089bab92d158aec54661b18ed7346ed79628b46b0`.
+It launched a bounded BusyBox payload through `spawn_pinned_runc()` and verified
+the read-only private root, expected mount policy, CPU/memory/PID cgroup
+readback, zero effective capabilities, `NoNewPrivs`, a loopback-only network
+namespace, and that a host-NIC listener was not reached. Checks confirmed that
+host checkout, sibling and unrelated project, home/config/credential, `/etc`,
+and `/tmp` file paths were denied; the exact host Unix-socket sentinel path was
+not visible; and absolute/relative symlink escapes were denied. The probe also
+passed the same-UID bundle/config and state/workspace path-replacement attacks;
+the exact runc scope, process, cgroup, and test-owned temporary paths were
+verified absent after teardown. BusyBox is installed as the dynamic package so
+the test can audit and copy its exact loader/library closure.
+
+This is primitive-level evidence, not end-to-end worker acceptance: it does
+not launch through `run_worker()`, supply model credentials, establish a
+provider egress policy, or test unattended supervisor-restart recovery and
+result import. `run_worker()` remains fail-closed as
+`sandbox_executor_unavailable`. This manual guest run is not exact-head hosted
+Actions evidence for the live probe. Any hosted job must install dependencies
+before relaxing Ubuntu's `kernel.apparmor_restrict_unprivileged_userns`, do so
+only on a secret-free disposable VM, install and verify its restore trap before
+the sysctl change, and fail on missing user-namespace or delegated-cgroup
+prerequisites rather than accepting a skip. Its archived checkout must carry a
+`.git` pointer to the real checkout gitdir so host-metadata denial is
+non-vacuous.
 
 **Descriptor transport primitive (2026-10-04; not integrated).** The trusted
 process trampoline now accepts an internal `fd3_source` and maps that open
@@ -108,7 +441,8 @@ with runc 1.3.5; Ruff format and lint also passed. The replay covered
 The full repository workflow passed on macOS/Python 3.12.8 after this handshake
 change: 1,161 tests passed, 57 platform/runtime-gated tests skipped, Ruff format
 and lint passed, and `uv build` produced both wheel and source distribution.
-Independent exact-hash QC and the hosted GitHub Actions matrix remain pending.
+At the time of this 2026-10-06 replay, independent exact-hash QC and the
+hosted GitHub Actions matrix had not yet run for this source snapshot.
 
 A subsequent exact-hash review found a P1 gap: the launch binding did not carry
 the operator's rootfs tree/closure pins from config compilation to spawn, so a
@@ -177,14 +511,21 @@ ACP-managed SQLite connections unless the journal activates the exact
 process-local capability for the registered runc handle. This is an
 application-integrity guard, not a security boundary against a privileged
 process with arbitrary write access to the SQLite database file: such a process
-can register a same-named SQLite function or remove/replace the triggers.
-Database-file writers are outside this slice's threat model. Migrated rows
-retain empty plan fields and an unattested marker; they cannot be advanced
-through a new launch, running, or successful exit transition and cannot
-authorize result import. This binds the
+can register a same-named SQLite function or remove/replace the triggers. The
+supervisor process and its Python modules are also trusted; arbitrary Python
+running inside that process can reach private store internals and is outside this
+guard's threat model. The connection facade is an application-integrity guard,
+not an in-process Python sandbox. Direct database-file writers are outside this
+slice's threat model. Migrated rows retain empty plan fields and an unattested
+marker; they cannot be advanced through a new launch, running, or successful
+exit transition and cannot authorize result import. This binds the
 caller-supplied bundle digest to observed launch inputs but does not independently
-prove the semantic correctness of that caller claim. The configured `run_worker`
-path remains fail-closed and this is not runtime isolation evidence.
+prove the semantic correctness of that caller claim. The OCI task-worker path is
+not yet integrated into `run_worker()`: when `sandbox.oci` is configured,
+`run_worker()` fails closed; without it, the existing host-process path can run
+with Linux child-subreaper containment but does not have OCI mount, environment,
+or file-descriptor isolation. This launch-driver slice is not runtime-isolation
+evidence for all task execution.
 
 This remains an implementation slice, not a complete security claim. On
 2026-10-05, two opt-in no-model tests passed on NAS Linux 6.18.15 with runc
@@ -319,8 +660,8 @@ ACP's worker boundary:
   experimental and unsupported for production workloads; do not select this as
   ACP's supported production worker path. If that status changes, the App Server
   process must still run inside ACP's independently enforced per-attempt
-  boundary, with a local stdio or Unix-socket control channel. See [Codex App
-  Server](https://learn.chatgpt.com/docs/app-server).
+  boundary, with a local stdio or Unix-socket control channel. See the [App Server
+  API overview](https://learn.chatgpt.com/docs/app-server#api-overview).
 - The Agents API self-hosted-environment path instead keeps OpenAI's harness
   outside and runs `codex exec-server` in the supplied environment. The
   executor receives a separate environment key as `CODEX_API_KEY`; generated
@@ -342,6 +683,761 @@ owned by ACP, separate from `NamespaceRuntimeDriver`'s resource lifecycle. The
 first OS-boundary proof should use a registered no-model fake worker; each
 provider adapter must then prove its own auth and egress contract before launch
 is enabled. No provider adapter or `externalSandbox` opt-in is selected yet.
+
+### Historical single-monitor ownership proposal (2026-10-10; superseded)
+
+The earlier single-service design is retained as history, not as the selected
+ownership model. The current decision is in
+[`WORKER_LAUNCH_DRIVER.md`](WORKER_LAUNCH_DRIVER.md): an exact launch-driver
+service inside the attempt slice owns the process-local launch handle, gate,
+attestation, journal transition, wait/reap, and cleanup evidence; a separate
+authenticated recovery monitor remains outside the slice and controls the
+driver through IPC. The runc client stays in the launch-driver service cgroup,
+matching the existing attestation contract. Do not move it into a sibling
+transient scope or give the outside monitor its process-local handle.
+
+Both services must be systemd-managed and bound to the exact attempt, claim
+token, and execution ID; a unit name alone is not enough. Adoption must match
+the exact invocation ID, control-group path, main-process start identity, and
+journaled fencing epoch. Missing or conflicting evidence means unknown; retain
+the attempt fence.
+
+The worker scope is a separate systemd object: launch rootless runc with the
+qualified systemd cgroup driver into the exact attempt slice, then independently
+reconcile/stop that scope and container. `KillMode=control-group` governs the
+processes in its own service unit; it is not evidence that a sibling runc scope
+was killed. A controller restart may reconnect to the still-active exact
+monitor service, but a new controller must never reconstruct the launch-driver's
+in-process runc handle or gate from a PID, path, or self-reported receipt. This
+only covers a controller-process restart while the system manager remains
+alive: a `systemd --user` manager normally terminates its services after the
+last login session ends unless lingering is enabled. The deployment preflight
+must therefore prove the chosen manager's lifetime (for example, require
+lingering for a user manager); this is not a reboot-survival claim. For this
+iteration, no trusted cleanup/reconciliation recovery path is implemented. If
+the launch-driver is gone before its required wait receipt and unverified cleanup
+report are durable, the execution remains ambiguous and fenced: no
+`cleanup_verified` transition, fence release, or result import is available.
+
+**Production monitor receipt codec (2026-10-11; identity primitive only).** The
+durable receipt codec and exact service-reconciliation checks now live in
+`supervisor/sandbox_monitor_receipt.py` and are consumed by the opt-in systemd
+integration probe. A receipt binds the monitor unit and worker slice to the
+full `(attempt_id, claim_token, execution_id)` tuple, plus InvocationID,
+ControlGroup, and the monitor PID start identity. Receipt files are bounded,
+canonical, no-follow reads from an owner-private directory and create-only
+writes; an exact replay is idempotent, while a conflicting replacement is
+rejected. Reconnect requires exact active service/slice properties and a fresh
+PID-start identity match. This is a reusable production identity primitive,
+not a monitor launcher or worker executor: the integration probe still uses a
+placeholder service, does not transfer a live runc handle, and does not attest
+cleanup or result import. `run_worker()` remains fail-closed.
+
+**Monitor control IPC slice (2026-10-11; not wired to the worker executor).**
+`supervisor/sandbox_monitor_ipc.py` adds a Linux Unix-domain server/client around
+the request codec. The server checks `SO_PEERCRED` UID and HMAC-fences the full
+execution tuple; the client checks peer UID against the configured service
+owner and pins PID plus fresh `/proc` start-time identity to the durable monitor
+receipt. Status/cancel responses are bounded, allow-listed,
+HMAC-authenticated values. The durable request ledger
+applies to cancellation only: it creates a mode-0600 acceptance record and
+fsyncs it before invoking the monitor-owned handler, then creates a signed
+response record. The controller can reuse the same cancellation request ID to
+retry; exact retries return the original response. An accepted cancellation
+without a durable response returns `unknown` and is never re-applied. Read-only
+status polling does not consume ledger capacity. Cancellation requires the
+caller to provide and retain a stable 32-hex request ID before sending, so an
+ambiguous timeout can be retried with the exact same ID; the client does not
+hide a generated ID that the caller could not recover. The ledger is bounded
+to 256 cancellation IDs per attempt. The socket and ledger require owner-private
+mode-0700 directories; a pre-existing socket path is not removed or replaced.
+The server rejects a second concurrent `serve_forever()` loop and cannot be
+restarted after its serving loop exits, including unexpected exits.
+
+The IPC permits only `status` and `cancel`: systemd starts the monitor service,
+so a controller request cannot ask an already-running service to launch a
+worker. Callers must first reconcile exact systemd service/slice properties
+against the receipt. The monitor-side cancel callback must act only on its
+retained execution handle and exact worker slice, and must be idempotent. The
+32-byte capability remains host-private and outside all worker mounts.
+
+This is now a concrete transport/replay primitive, not the production monitor
+service: it is not yet launched by systemd, connected to the runc handle or
+execution journal, provisioned with a durable capability, or used by
+`run_worker()`. It proves neither cancellation nor cleanup nor result import.
+`run_worker()` remains fail-closed, and the lifecycle acceptance criteria below
+remain open.
+
+**Systemd-owned monitor IPC live slice (2026-10-11; test-only monitor).** The
+opt-in `test_live_systemd_monitor_ipc_survives_controller_crash_and_cancels_exact_scope`
+now composes the production receipt codec, control-key store, and authenticated
+Unix-socket IPC with a real transient user-systemd service. That test-only
+monitor places a `/usr/bin/sleep` scope in the exact per-attempt worker slice,
+while its own service remains in the separate `user-acp.slice`. A separate
+controller writes and validates the durable service receipt, performs an
+authenticated status call, then is killed with `SIGKILL`. The fresh controller
+uses `reconnect_sandbox_monitor()` to reconcile the exact unit InvocationID,
+ControlGroup, MainPID/start identity, and sibling-slice placement before it
+reads the existing capability and obtains authenticated status; it then cancels
+the exact scope. Repeating the same cancellation request ID returns the
+original response; the worker PID and scope cgroup are absent while the monitor
+remains active. Status reports `unknown` for activation drift even when a
+same-name scope is inactive. Teardown snapshots each unit cgroup before
+placement assertions, verifies the original cgroups are empty, and retains the
+private fixture if a launched unit lacks a captured cgroup.
+
+The exact replay passed all five tests in
+`tests/test_systemd_slice_integration.py` (one identity-drift unit test and four
+opt-in live tests) and all twelve
+`tests/test_sandbox_monitor_ipc.py` tests on the dedicated no-host-share Lima
+guest `acp-sandbox-monitor-20261010`: Ubuntu 24.04.5 LTS ARM64, Linux
+`6.8.0-142-generic`, systemd `255.4`, Python `3.12.3`, cgroup v2, and an active
+user manager. The controller/monitor IPC test source SHA-256 is
+`5445863306b6c0eb04ea7ca6f45e1cc2e27722f5dc6df4409cbda71d7bc3809c`; the
+production IPC module is `72f7eea3f9cde1ffacd264465a2ac960f683f78d0279384fc5d797a18bc39a89`,
+and the receipt/key module is
+`9bb50e5c52fcfeffd494a7f0b7e1489e43b598c24a8542e0d0fa8131020dbe29`. Guest
+and checkout hashes matched. Postflight found zero failed units, zero probe
+units, zero runc processes, and zero temporary control directories.
+
+This is an IPC/service-lifecycle integration proof only. The monitor is still a
+test helper, and its owned process is not an OCI container. It does not prove a
+production launch-driver owning `RuncLaunchHandle`, journal-authorized gate
+release, OCI scope enforcement, `cleanup_verified`, result import, provider
+auth/egress, or the registered `run_worker()` path. `run_worker()` remains
+fail-closed.
+
+**Controller restart adoption helper (2026-10-11; production recovery primitive).**
+`supervisor/sandbox_monitor_lifecycle.py` now provides a controller-side
+reconnect path for an already-running monitor. The caller must supply the
+attempt/claim/execution tuple read from its durable execution journal; the
+helper requires it to match the immutable service receipt, then re-queries the
+trusted user-systemd manager for the exact active service and both sibling
+slice identities, including InvocationID, ControlGroup, MainPID, and fresh
+PID-start identity. Only after that proof does it read the existing per-execution
+control key and validate the monitor socket. Recovery never calls the key
+creator: a missing/corrupt key fails closed and leaves the execution fenced.
+The helper only reconnects for authenticated status/cancel; it cannot start a
+worker or reconstruct `RuncLaunchHandle`. Focused tests cover wrong-fence and
+same-name activation drift, exact unit queries, successful reconnect, and
+missing-key refusal. The live test above now exercises this production recovery
+helper against a placeholder monitor; this remains an adoption primitive, not
+an integrated OCI worker path, and `run_worker()` remains fail-closed.
+
+**Monitor producer at the launch-record boundary (2026-10-15; worker still
+disabled).** `sandbox_execution_journal._sandbox_execution_record_launch()` now
+starts or adopts `start_sandbox_execution_monitor()` only after binding the
+exact process-local runc handle, while holding the same per-execution launch
+gate lock used by the running transition and cancellation. It passes the
+reserved state directory and exact scope/slice identities, then sources the
+monitor PID, process-start identity, systemd unit, InvocationID and cgroup only
+from the authenticated typed service receipt. A status request must confirm
+the exact live scope before the journal records `launched`. Startup ambiguity
+leaves the row `reserved`, keeps the launch gate closed and retains its fences.
+The service persists its scope binding and control key in the execution's
+private monitor directory; adoption reuses the existing receipt and key, while
+partial, stale or ambiguous state refuses replacement. The control key is
+absent from argv, environment and receipt in the opt-in Linux integration
+proof.
+
+The production component, authenticated reconnect and exact-scope cancellation
+passed 134 focused tests on the disposable Ubuntu 24.04.5 ARM64 / Linux
+`6.8.0-142-generic` / systemd `255.4` guest with cgroup v2 and an active user
+manager. The live no-model OCI fixture now exercises this producer through
+`_sandbox_execution_record_launch()` while the exact runc init gate is held;
+candidate payload writes remain absent until the durable `running` transition.
+This is a fixture-driven trusted launch-record path, not a call from
+`WorkersMixin.run_worker()`, which remains fail-closed. Journaled termination
+`terminate_worker()` records stop intent and revokes the one-shot launch permit
+under the registered handle's gate lock. The original controller then closes
+an unreleased init gate under that same lock so its fixed trampoline exits on
+EOF, and reuses the exact authenticated startup client; it does not run restart
+reconciliation from the client-creating PID. If the gate has already been
+released, the monitor requests `systemctl stop --no-block` for the exact scope
+and only acknowledges a freshly observed `stopping` or `exited` state.
+Reconnected controllers use the authenticated recovery path; a supervisor
+without the exact process-local handle fails closed before monitor IPC because
+it cannot serialize against that handle's gate. Monitor clients bind to their
+creating PID and reject status/cancel calls from a forked child. The fork hook
+replaces inherited launch registries and global/handle/wait locks, clears
+cached key-bearing clients, and closes copied gate writers. Gate-pipe creation
+and close bookkeeping are serialized with fork, so a child also closes a
+tracked writer in the pre-handle-registration window and cannot delay gate EOF.
+
+A launch still in phase `launched` has no init PID, so its journal phase remains
+`launched`; the pre-init stop intent is an append-only hash-chained event rather
+than the row's `stop_reason` field. The running transition checks that event
+before and under the same lock. A successful monitor acknowledgement in this
+case is reported as `stop_pending`, not as a phase change or cleanup proof.
+Ambiguous responses retain the durable stop intent and resource fences;
+results report journal phase separately from monitor phase and do not infer
+`cleanup_verified`. Terminal journal responses reflect durable stop intent in
+`stop_requested` and leave `monitor_phase` unset when no monitor query was
+made.
+
+The opt-in live no-model OCI fixture passed both
+`test_live_monitor_journal_holds_payload_until_durable_running_transition`
+branches (`release` and `terminate`) on the disposable Ubuntu 26.04 ARM64 guest
+with pinned `runc-1.5.2`, dynamic BusyBox, systemd and cgroup v2. The terminate
+branch calls `WorkersMixin.terminate_worker()` after the durable `running`
+transition but before the one-shot init-gate release; it verifies the payload
+never ran, the exact runc client exited, and the journal records exit without
+claiming `cleanup_verified`. To permit this disposable-VM test, the
+unprivileged-user-namespace AppArmor sysctl was temporarily set to `0` and
+restored to `1` afterward; this is not evidence for operation under the
+original AppArmor restriction. Monitor IPC/service unit tests also passed on
+that Linux guest. This does not prove production worker integration, real-OCI
+cleanup verification, credential/egress policy, result import or
+`cleanup_verified`; #2370 remains open. Independent review is rechecking the
+final cancellation and fork-safety diff and found no P1/P2 blocker. The
+same-user systemd stop-by-name time-of-check/time-of-use race remains a
+separate hardening item.
+
+Do not add a lazy producer call to `terminate_worker()`: launch recording is
+the safe integration point because it runs with the registered handle and
+exact lock after scope creation but before the durable running transition and
+one-shot permit release. `run_worker()` still has no supported OCI launch
+caller and must remain fail-closed. Likewise, a monitor's `exited` status is
+not the journal's independent `cleanup_verified` proof; monitor retirement
+must follow that verifier and reconcile the exact unit activation. Those
+worker-path and cleanup requirements remain open.
+
+**Per-attempt coding-agent architecture decision (2026-10-11; NO-GO to wire
+unchanged).** Do not treat the existing namespace resource driver as the
+supervised coding-agent sandbox. [`WorkersMixin.run_worker()`](../src/agent_control_plane/supervisor/workers.py)
+launches the candidate through the process trampoline with the attempt worktree
+as `cwd` but does not enter the namespace resource-driver path or an outer
+filesystem/network namespace. When OCI is configured it refuses the launch
+rather than falling back to host execution. [`NamespaceRuntimeDriver`](../src/agent_control_plane/runtime_drivers.py)
+is a separate systemd resource-payload path: it requires rootless user/mount/PID
+namespaces (plus a network namespace for deny-egress), mounts `ACP_WORKTREE`
+read-only at `/workspace`, provides a separate writable `/work`, and currently
+bind-mounts host `/usr`, `/bin`, `/sbin`, and `/lib*` read-only. It now creates
+a minimal fixed `/etc/os-release` instead of mounting host `/etc` (2026-10-11;
+structural tests added and a disposable Ubuntu 26.04 guest probe passed;
+exact-head hosted CI for that revision was pending at the time, while later
+code-bearing commit `e5f664f538996738cd310c482c778d08f9ee0440` passed
+[exact-head CI run 38888249380](https://github.com/Rayha33/agent-control-plane/actions/runs/38888249380);
+target-host qualification remains pending). The
+remaining broad host `/usr` and toolchain exposure, read-only workspace, and
+lack of private Git metadata still fail the coding-agent contract. Reuse is
+rejected until those gaps are closed and measured.
+
+Codex's `externalSandbox` is not an enforcement mechanism: App Server
+documentation says to use it only when the server process is already
+sandboxed, because it skips Codex's own sandbox for the command. The supported
+boundary must therefore be independently enforced around each attempt before
+that policy is considered. In particular, if Codex App Server remains the
+trusted host-side harness, do not use `externalSandbox` on the assumption that
+it isolates only a child command; it disables Codex's own command sandbox and
+does not create the attempt boundary ([Codex App Server](https://learn.chatgpt.com/docs/app-server),
+[Agent approvals and security](https://learn.chatgpt.com/docs/agent-approvals-security)).
+The first architecture candidate is a provider-independent ACP executor
+contract running in a per-attempt Linux namespace, with the trusted harness,
+credential broker, and result importer outside that namespace. The worker gets
+only an attempt-private writable file tree, a minimal generated `/etc`, an
+audited read-only executable/library closure, and no host home, temp, socket,
+credential, or shared Git-object paths. Attempt egress is denied by default;
+trusted harness/model traffic remains outside the attempt namespace, and any
+worker-side provider access must go through an independently authenticated,
+narrowly scoped broker. This namespace candidate trusts the target host kernel:
+Linux namespaces isolate selected resources, not the kernel itself. If host
+kernel compromise is in scope, require a disposable VM/microVM (or another
+separate-kernel boundary) before accepting the design; namespace-only tests do
+not prove kernel-escape resistance. A snapshot/patch is validated and staged by the host-side
+supervisor; candidate processes never receive the shared checkout's `.git`
+pointer or object database. This is a hypothesis to prove, not implemented
+behavior. OpenAI's self-hosted executor is a provider-specific alternative:
+the harness remains outside the environment and the inside environment key is
+limited to environment-connection actions (not other API actions), but the key
+itself is readable by agent-generated code; the cited documentation does not
+establish that a key is restricted to exactly one environment ([Self-hosted
+sandboxes](https://developers.openai.com/api/docs/guides/agents-api/environments/self-hosted)).
+
+Current source-level constraints and deployment evidence:
+
+| Item | Current evidence | Required before launch |
+| --- | --- | --- |
+| OS/runtime | The target NAS is Debian 12 with systemd 252.38 and cgroup v2. Its `/usr/bin/runc` is root-owned mode 0755, version 1.3.5, SHA-256 `66a04d0424b03b65b9e5f4be1bc4c3090f5cf301b29866d5fe2d38d3bd0c443a`. The current registered-worker contract pins runc 1.5.2, so this host binary is not that tested runtime. | Qualify the exact pinned runc 1.5.2 and prove delegated cgroup, systemd-manager lifetime, and mount policy in a disposable/approved target-matching lane; do not replace the shared host binary as part of this task. |
+| Kernel/distribution | Read-only target probe (2026-10-21): Linux 6.18.15 x86_64; `userns_clone=1`, `max_user_namespaces=62761`; `unshare --user --map-root-user --mount --pid --net --fork true` passed. This proves only namespace creation, not rootless runc behavior or worker isolation. Namespace isolation also trusts the host kernel. | Prove cgroup delegation and manager lifetime, then exercise the pinned runtime and exact mount policy in a disposable/approved lane; use a VM/microVM if the host kernel is not in the trust boundary. |
+| Codex adapter | The repository has no pinned Codex CLI/App Server in this execution path. The current App Server docs describe stdio/Unix socket transports; WebSocket transport is marked experimental/unsupported. | Pin an exact binary/version and protocol schema, then test it inside the proven boundary without a model call. |
+| Authentication | No host Codex config, OAuth file, API key, or Git credential may be mounted into the candidate tree. | Prove a brokered/least-privilege auth path or reject the adapter; no credential material has been tested here. |
+
+**Provider-auth boundary update (2026-10-22).** Current [Codex App Server
+documentation](https://learn.chatgpt.com/docs/app-server) describes API-key and
+managed ChatGPT authentication, plus experimental `chatgptAuthTokens` supplied
+and refreshed by the host application. Those are auth/account mechanisms, not
+an outer sandbox: `externalSandbox` still tells Codex to skip its own command
+sandbox when a separate boundary already exists. OpenAI's [Codex security
+guidance](https://learn.chatgpt.com/docs/agent-approvals-security) warns that,
+when Codex's sandbox is bypassed inside a dev container, a malicious project can
+exfiltrate anything available there. Accordingly, ACP will not pass
+model/provider tokens through worker argv,
+environment, mounted host auth files, or shared user-readable state. Keep the
+App Server and model-auth lifecycle in the trusted host-side harness; the
+attempt worker remains no-provider. The current CONNECT proxy relays TLS
+unchanged and does not inject provider authorization, so it is not yet a
+credential broker. Provider execution stays fail-closed until a separately
+reviewed adapter proves host-owned token refresh/revocation, a worker-unreadable
+credential path, and exact destination/port enforcement. This is an
+architecture constraint, not evidence that such an adapter is implemented.
+The same [App Server docs](https://learn.chatgpt.com/docs/app-server) state that
+App Server authentication is not permitted for commercial or hosted services;
+any future hosted ACP deployment therefore needs a separately authorized
+sign-in path, not an assumption that local App Server auth can be reused.
+
+**Target NAS read-only compatibility probe (2026-10-21).** The Debian/kernel,
+systemd, cgroup-v2, user-namespace settings, and `/usr/bin/runc` identity above
+were read over SSH; a transient user/mount/PID/network namespace command
+completed successfully. A process-list check found no matching ACP or runc
+workers. The probe changed no files or services. It does not establish the
+user-manager lifecycle, cgroup delegation, rootless runc 1.5.2 behavior, mount
+policy, or any filesystem/network isolation claim. In particular, do not infer
+target qualification from the disposable 6.12.95/runc-1.5.2 guest result while
+the target's observed `/usr/bin/runc` is 1.3.5.
+
+**Evidence update (2026-10-15).** The primitive-level Linux boundary checks are
+now demonstrated by the opt-in
+[`test_live_rootless_runc_enforces_minimal_worker_boundary`](../tests/test_oci_worker_runtime.py),
+in a disposable Linux guest. The recorded Ubuntu 26.04 replay used test source
+SHA-256 `4942bff7abed3b4e9b65562711cb2c3847b09b766539825f4da9d718a0e34b7c`
+and `oci_worker.py` SHA-256
+`7d68fb55375ab167b73a6cf49ca86a30aa84933d7eb7ed2a9d590dafe78e8236` (PR-42
+snapshot `cedfecdaa59affb19edd68a2d8173be2b1f17b5d` with the test file
+overlaid; detailed receipt below). It audits the exact mount set and rejects
+broad `/etc` or `/usr` mounts; the compiled OCI `process.env` check asserts the
+enumerated credential/config variable names are absent (it is not a runtime
+`/proc/environ` readback). Current `oci_worker.py` also has a subsequent
+optional pre-exec submission callback; this direct probe does not supply it, so
+the callback is outside this live-runtime evidence. The payload cannot read the
+host checkout, sibling attempt, unrelated project, host-home path, synthetic
+config/credential sentinels, or host `/etc` and `/tmp` sentinels; separate
+probes deny writes to the checkout, the image's `/etc`, and host `/tmp`. It
+confirms the host Unix-socket sentinel path is absent. Absolute and relative
+symlink targets cannot be read, and the absolute host-`/tmp` symlink cannot be
+used for a write.
+The probe also checks the worker's namespace-relative `/proc` identity and
+proves loopback-only interfaces plus failure to reach a host-NIC listener. The
+markers are synthetic, not real credentials. This closes those direct-runc
+boundary checks only; it is not an exact-head hosted replay of the live probe
+and does not exercise the registered production worker lifecycle.
+
+The architecture decision remains **NO-GO for production worker integration**.
+Do not set `externalSandbox`, mount host credential/config paths, or change the
+fail-closed `run_worker()` behavior. Still open are a supervisor-owned
+`run_worker()` executor, least-privilege provider authentication and enforced
+provider egress, restart/cancellation recovery, action-bound cleanup proof,
+concurrent-attempt fencing, and validated isolated Git result transfer into
+the existing QC/submission path. Exact-head hosted CI is required for code
+changes, but it does not replace the separate live Linux boundary evidence.
+
+This choice is consistent with systemd's distinct transient service/scope
+lifecycles and unit-level cgroup controls ([`systemd-run(1)`](https://www.freedesktop.org/software/systemd/man/latest/systemd-run.html),
+[`systemd.kill(5)`](https://www.freedesktop.org/software/systemd/man/latest/systemd.kill.html),
+[`systemd.resource-control(5)`](https://www.freedesktop.org/software/systemd/man/latest/systemd.resource-control.html)).
+The opt-in [`test_systemd_slice_integration.py`](../tests/test_systemd_slice_integration.py)
+does prove that a systemd-owned monitor service can be reconciled after its
+controller is SIGKILLed and can survive a separate worker-slice stop. Its own
+module documentation correctly limits that evidence: it does not launch or
+attest the ACP OCI worker, recover its runc handle, exercise authenticated
+cancellation, or verify cleanup/result import. The service-owner pattern is
+therefore the integration direction, not a completed executor; `run_worker`
+remains fail-closed.
+
+New v6 launch plans derive the monitor unit name from the complete
+`(attempt_id, claim_token, execution_id)` identity; the journal rejects launch
+receipts that reuse a generic service name. Existing v5 plans retain their previous
+read/validation semantics. The unit name is only a collision-resistant
+lookup key: adoption still requires its exact systemd invocation ID, cgroup,
+and live monitor identity, plus the durable launch-plan binding. The monitor
+must load and revalidate operator configuration in its own process; serializing
+the caller's `_PinnedRuncWorkerConfig` or `RuncLaunchHandle` would not transfer
+their process-local provenance. This naming guard narrows one adoption/replay
+ambiguity but does not implement monitor startup, authenticated reconnect, or
+worker execution.
+
+**Write-ahead runc submission latch (schema v28; fail-closed primitive).** A
+supervised monitor must now commit a one-time receipt for the exact pinned
+private-bundle target immediately before the launcher's exec acknowledgement.
+The `reserved -> launched` journal transition requires that receipt, and the
+SQLite write guard prevents a second authorization for the same fenced
+execution. If the monitor dies after the latch but before it records the
+returned process handle, a restarted process cannot resubmit; it must reconcile
+the exact runtime state or retain the attempt fence. This deliberately favors
+duplicate-launch safety over automatic retry when the crash point is ambiguous.
+The callback returns a process-local capability that the private launcher
+stores in the registry record for the exact returned handle; journal recording
+checks object identity against that handle. Before sending the exec
+acknowledgement, the launcher rejects missing, unrelated, or differently
+targeted callback results. A capability minted after an unjournaled handle
+already exists cannot be paired with it. Unit coverage exercises
+commit-before-marker ordering, post-launch pairing rejection, invalid callback
+results, and cross-process at-most-once authorization. It does not substitute
+for a live Linux launcher test.
+The callback and journal primitive are not wired to `run_worker`, and no
+production launch-driver redeems the callback yet. They do not prove restart
+recovery, cleanup, cancellation, or worker isolation; OCI worker execution
+remains fail-closed.
+
+### Provider egress destination-policy primitive (2026-10-15; unit proof only)
+
+`supervisor/provider_egress.py` adds a provider-neutral exact host/port policy
+and destination resolver for a future supervisor-owned HTTPS CONNECT proxy.
+It accepts ASCII DNS names (including caller-supplied A-labels), rejects
+Unicode U-label input rather than applying IDNA2003 folding, accepts a single
+trailing dot, and rejects IP-literal authorities. Exact allowlist matching
+precedes an absolute-name system-resolver invocation. Every address returned
+by that resolver is classified; a mixed public and forbidden result fails as a
+whole. Private, loopback, link-local, multicast, reserved, unspecified,
+IPv4-mapped IPv6, and other non-global addresses are rejected. The policy-owned
+`connect_authority()` path resolves and classifies before dialing the numeric
+socket address, without a second hostname lookup. The original hostname is
+retained for the eventual worker client's TLS SNI and certificate validation.
+The public dial API accepts an authority, not a caller-supplied pin; its
+private helper is trusted process code, not an isolation boundary against other
+code running inside the same supervisor process.
+
+The explicit special-use network snapshot follows the [IANA IPv4 registry](https://www.iana.org/assignments/iana-ipv4-special-registry)
+and [IANA IPv6 registry](https://www.iana.org/assignments/iana-ipv6-special-registry),
+both last updated 2025-10-09. It deliberately rejects all listed special-use
+blocks, including a small number the registry marks globally reachable. Review
+and refresh the snapshot when the registries change; `ipaddress.is_global`
+alone is not sufficient for this deny policy.
+
+The 33 focused tests passed with `uv run --frozen pytest -q
+tests/test_provider_egress.py`; Ruff check and format checks passed. They cover
+authority normalization and exact matching, invalid policy, bounded port
+parsing, empty and mixed resolver results, special-use address rejection,
+A/AAAA pin construction, the trailing-dot resolver argument, and a fake-socket
+assertion that policy-authorized dialing uses the vetted numeric sockaddr with
+no second hostname lookup.
+
+The policy primitive alone does not prove worker reachability is restricted to
+a per-attempt proxy, same-UID denial in a disposable worker guest, socket-FD
+hygiene, TLS CONNECT behavior, redirect handling, real DNS resolver behavior,
+credential delivery, or provider authentication. A blind HTTPS CONNECT proxy
+gates only the requested authority and pinned IP. It cannot inspect encrypted
+SNI, HTTP `Host`, URL/path, API method, or redirects, nor stop exfiltration to
+an explicitly allowed provider hostname. A redirect destination requires a
+fresh CONNECT request and its own policy decision.
+The existing systemd `LoadCredential=` evidence establishes read-only
+per-unit visibility only, not secrecy from the host UID or root. No code here
+is wired to `run_worker()`, and configured OCI worker execution remains
+fail-closed.
+
+### Provider CONNECT handler primitive (2026-10-15; socketpair/TLS unit proof)
+
+`supervisor/provider_proxy.py` adds a one-CONNECT-per-channel handler and an
+`attempt_scoped_peer_authorizer()` callback factory. The factory requires a
+collector-issued, self-consistent runtime attestation; on Linux it checks the
+accepted Unix stream's `SO_PEERCRED` UID/GID against the supervisor's mapped
+host UID/GID, then verifies the peer PID's stable start identity and exact
+attempt cgroup through before/after `/proc/<pid>/stat` reads around
+`/proc/<pid>/cgroup`. Before resolving that numeric PID, it acquires Linux
+`SO_PEERPIDFD` (UAPI option 77) and holds the close-on-exec descriptor through
+the procfs check, preventing PID reuse between the `SO_PEERCRED` snapshot and
+the first `/proc` lookup. The Linux v6.5 UAPI header defines the option
+([source](https://github.com/torvalds/linux/blob/v6.5/include/uapi/asm-generic/socket.h#L128-L130));
+the kernel's coredump path documents using it to guard `/proc/<pid>` against
+PID recycling ([source](https://github.com/torvalds/linux/blob/master/fs/coredump.c)).
+Python need not expose a named constant; unsupported kernels or failed
+`getsockopt` probes deny authorization. The supervisor's `/proc` view must use
+the same PID namespace as `SO_PEERCRED`. A same-UID process outside the exact
+cgroup is denied. PID pinning does not make the cgroup observation atomic or
+prevent a process with sufficient cgroup permissions from moving after the
+check. This primitive does not bind or protect a listener, distribute its
+socket to the worker, or manage socket lifecycle. `SO_PEERCRED` and
+`SO_PEERPIDFD` identify the process that established the Unix connection, not
+a later process that receives the connected channel through `SCM_RIGHTS` or
+inherits its descriptor. Any worker integration must control channel
+distribution and clear unintended inherited descriptors before launch. The
+handler still requires the caller to install the callback before request
+parsing or dialing. It
+rejects malformed CONNECT requests, request bodies, proxy credentials, mismatching
+`Host` fields, tunnel bytes co-read with the CONNECT headers, and tunnel bytes
+already queued when a post-dial preflight runs before the 200 response. A byte
+that arrives after that check races acceptance and is relayed unchanged; the
+protocol handler cannot provide a strict temporal boundary on a TCP stream.
+After policy approval it relays raw TLS bytes bidirectionally with bounded
+buffers and idle timeout. A redirect therefore needs a fresh channel and a
+second independent authority decision.
+
+The local TLS mock test proves the handler can tunnel a TLS request, return an
+HTTP 302 received inside TLS, and reject the client's next CONNECT to a
+non-allowlisted host before DNS or a second dial. The test injects a dial to
+its loopback TLS fixture only through a private test monkeypatch; the
+production policy still classifies a public test address, and production code
+cannot select the local target through policy configuration. Linux unit tests
+exercise real `SO_PEERCRED` and `SO_PEERPIDFD` on a same-process socketpair,
+confirm the PIDFD fdinfo PID matches `SO_PEERCRED`, run the actual `/proc`
+membership verifier while that PIDFD is open, and verify it is closed on
+return. A separate child-process test terminates and reaps the peer immediately
+after PIDFD acquisition, confirms the pinned PIDFD reports an exited process,
+and verifies that the real proc check rejects it. This does not force numeric
+PID reuse; the no-reuse claim rests on the cited kernel PIDFD semantics. The
+tests also fail closed when the option is unavailable and deny a peer whose
+cgroup differs. This unit evidence alone does not prove provider-SDK
+compatibility, credential delivery, or authentication. The bounded live guest
+proof below covers one worker's socket reachability and the real peer
+authorizer, but not production listener lifecycle, descriptor hygiene, or
+provider protocol behavior.
+
+### Rootless per-attempt provider socket-directory feasibility (2026-10-15; superseded direct-runc guest probe)
+
+Historical evidence only: this earlier direct-runc probe was superseded by the
+rootless worker CONNECT test documented in the later subsection below. That
+CONNECT subsection is authoritative for the current live-test behavior and
+scope.
+
+The opt-in `test_live_rootless_runc_mounts_attempt_proxy_socket_directory_read_only`
+passed 1/1 in the disposable `acp-2370-live-sandbox-20261010` Lima VZ guest:
+Ubuntu 26.04.1 LTS, aarch64, Linux 7.0.0-38-generic, host UID/GID 501:1000,
+unified cgroup v2, and an active user systemd manager. It used the exact,
+root-owned `/usr/local/bin/runc-1.5.2` binary
+(`d10ecae898361832a059be2089bab92d158aec54661b18ed7346ed79628b46b0`), BusyBox
+1.37.0 (`c2f279d1d5640a0f327890d41cad594c0f059f3fed3f96dd72fdcc4f5e18ec02`),
+and a static Unix-socket probe client built by the root-owned GCC 15.2.0 compiler
+(`5b06a5b85cab901e2af3e8f351a6d4e8e6a93af24797bd8c01e5391ac6b4e63b`). The
+BusyBox binary is static. Both the provider-mount probe and the existing
+`test_live_rootless_runc_enforces_minimal_worker_boundary` passed 1/1 (2/2
+combined) from test source SHA-256
+`69c6b1f708e0fb9007ea0018ea0424556cf6eeb4fc28aeffa8e1a4b8526ea42c` and
+listener source SHA-256
+`c12e86847058a9082be3f9381050467e8bfabb33bfffa76e535681733e988ead`.
+Opting in requires a trusted C compiler (`ACP_OCI_TEST_CC`, default `cc`) to
+build that small static probe; BusyBox in this guest does not provide `nc -U`.
+
+The test manually assembled a minimal OCI bundle and launched it with rootless
+runc; it did not call the production worker executor or use a provider
+credential. `AttemptProviderProxyListener` validated the caller-created empty
+mode-0700 attempt directory, required trusted non-untrusted-writable parents
+(allowing sticky directories), bound a mode-0600 Unix socket, and retained its
+device/inode identity for exact cleanup. This primitive assumes exclusive
+ownership of the attempt directory; it does not defend against concurrent
+same-UID filesystem mutation, which this live test does not exercise. The test
+mounted that dedicated host directory at `/run/acp` with
+`ro,nosuid,nodev,noexec`, then inspected the live mountinfo record. The worker
+could connect and exchange the test-only
+`probe`/`proxy-ok` messages but could not create or unlink entries. The host
+accepted peer `SO_PEERCRED`, acquired the matching `SO_PEERPIDFD`, checked the
+live peer against the exact systemd attempt cgroup, and authorized it through
+`attempt_scoped_peer_authorizer()`. A same-UID host process outside that cgroup
+was denied. The test invokes authorization immediately after accept, before
+reading the worker's queued probe bytes, but does not call the production
+CONNECT handler. Accepted-channel handling and the full listener lifecycle
+remain caller-owned. For this isolated primitive test only, the two
+collector-attestation predicates were replaced with one test-owned receipt whose
+cgroup path was checked against the worker's procfs observation and exact
+systemd scope.
+
+The guest's `kernel.apparmor_restrict_unprivileged_userns` setting was changed
+from `1` to `0` only for the test and restored by an exit trap; postflight read
+it as `1`. The test finalizer and independent postflight found no remaining
+runc state, process, attempt scope/cgroup, attempt directory, or provider
+socket directory. This establishes feasibility for the tested direct-runc
+mount, exact-socket listener setup/cleanup, and peer-authorization primitives
+only. It does not qualify a default AppArmor profile, supervisor-to-worker
+lifecycle orchestration, mount setup/teardown, listener concurrency or recovery,
+the production CONNECT handler's before-parse/before-dial ordering, inherited or
+SCM_RIGHTS descriptor hygiene, HTTPS CONNECT, real DNS or provider egress,
+provider authentication, credential delivery, `cleanup_verified`, restart or
+cancellation recovery, result import, or registered `run_worker()` execution.
+Configured OCI worker execution remains fail-closed.
+
+### Supervisor restart: public cancellation and launch-gate fencing (2026-10-15)
+
+The public `terminate_worker()` path now survives loss of the supervisor's
+process-local launch handle without falling back to a host PID. Gate release,
+the launched-to-running transition, stop intent, exit, and ambiguity transitions
+share an exclusive advisory lock on the exact private execution state
+directory. The directory must still match its durable device/inode identity,
+owner, and `0700` mode, both before and immediately after lock acquisition. A
+busy lock or identity mismatch leaves the journal unchanged. The gate writer
+re-reads the matching attempt and execution under that lock and requires
+`working` + `running` with no durable stop intent before writing `go`; therefore
+a fresh supervisor's stop intent fences a still-live parent's delayed gate
+write. Fork children close inherited lock descriptors so they cannot retain the
+kernel lock after the owning process exits. This is cooperative lifecycle
+fencing, not protection from a hostile same-UID process that can mutate the
+supervisor-owned state directory outside this API.
+
+No-model regression coverage now includes a spawned fresh `GitSupervisor`
+calling public `terminate_worker()` twice, authenticating the exact execution
+and scope, checking status, and replaying the same deterministic cancel ID.
+Separate checks prove busy-lock non-mutation, wrong-state-root rejection, and
+fork-child lock-FD cleanup. A test double models only monitor IPC in this
+public-API regression; the disposable systemd producer/reconnect/cancel test
+above remains the independent real-service evidence. Cancellation returns
+`stopping` and retains cleanup/resource fences; it does not imply the vanished
+supervisor's runc `Popen` handle was recovered or cleanup verified. Configured
+OCI `run_worker()` remains fail-closed.
+
+After this fence change, the disposable Linux/systemd production monitor test
+was rerun on Ubuntu 26.04 ARM64, Linux 7.0.0-38-generic, Python 3.14.4,
+systemd 259.5, and cgroup v2: **1 passed, 7 deselected**. Host and guest
+SHA-256 matched for all eight copied production source/test files in the
+production-monitor section below. The exact monitor fixture and unit cleanup
+passed; postflight found the user manager running, no matching ACP test units,
+and no `acp-production-monitor-*` fixture roots. That live test validates the
+monitor producer/reconnect/cancel only; fresh `terminate_worker()` recovery is
+separately covered by the spawned no-model supervisor regression above.
+
+### Cleanup proof boundary (2026-10-11; architecture/QC decision)
+
+Do not add an observer that writes `cleanup_verified` from absence checks alone.
+The current cleanup observations are still null; an action receipt is not a
+post-stop absence proof. `runc --root` selects the runtime state
+store, while `runc state` and `runc list` are read commands; absence from a later query does
+not prove which actor performed deletion or that no actor can recreate state
+before the journal commit. The command semantics are documented by upstream
+[runc](https://github.com/opencontainers/runc/blob/main/man/runc.8.md) and
+[runc-delete](https://github.com/opencontainers/runc/blob/main/man/runc-delete.8.md).
+Bind the delete action, kernel wait result, and post-delete observations to the
+same fenced launch-driver execution; no observation-only receipt may release the
+attempt fence.
+
+Systemd absence checks must also be conjunctive. `systemctl show` can succeed
+for an unknown unit and report `LoadState=not-found`
+([systemd issue #1105](https://github.com/systemd/systemd/issues/1105)); an
+upstream edge report also demonstrates `LoadState=not-found` alongside
+`ActiveState=active`
+([systemd issue #43442](https://github.com/systemd/systemd/issues/43442)).
+Therefore `not-found` alone is not cleanup evidence. First bind the expected
+unit name, invocation ID, control group, and (for the monitor) main-process
+start identity to the durable launch receipt. Then query that exact unit name:
+if it is `not-found`, require the response to be internally consistent
+(`ActiveState=inactive`, empty `ControlGroup` and `InvocationID`; for the
+monitor service, `MainPID=0`) and independently verify the original PID-start
+identities are absent. Also verify the exact attempt cgroup subtree and private
+paths are empty/absent under their recorded root identities. Any command error,
+timeout, permission gap, reused/mismatched identity, or contradictory property
+retains the fence.
+
+Those checks are still point-in-time observations. The verifier may commit only
+after the monitor has durably recorded its exact delete/wait outcome and can no
+longer launch, stop, or recreate execution resources for that fencing epoch.
+Serialize final verification and the immutable proof-digest journal transition
+against that owner; inject crashes and state/unit ABA changes between delete,
+observation, and commit. The supervisor-owned verifier now provides this
+owner/serialization path and has passed a live disposable-systemd cleanup run.
+Keep OCI `run_worker` fail-closed: cleanup proof is not worker integration.
+This decision does not treat an absence snapshot as sufficient; action
+provenance and owner serialization are both required to close the
+probe-to-commit race.
+
+### Pinned-runc delete action, cancellation, and cleanup verification (2026-10-16)
+
+The production launch-driver now waits for the exact pinned-runc client to be
+reaped, then invokes the verified executable by held FD with the exact
+`--root <state> delete --force <container>` arguments. It records a v3
+`cleanup_reported` receipt only after bounded command wait succeeds and the
+container-state entry is immediately observed absent. Schema 32 scopes this
+receipt write to a process-local capability bound to the exact execution tuple,
+driver identity, executable digest/version, argv digest, and state-root inode.
+The report remains `verification_status=unverified`; the final observation
+fields remain null. It does not release fences or authorize result import.
+
+`test_live_production_launch_driver_runs_exact_pinned_runc_request` passed in
+both natural-completion and `ACP_LIVE_CANCEL_AFTER_START=1` modes (`1 passed`
+each) on disposable Debian 12 ARM64, Linux 6.1.0-53, systemd 252.39, Python
+3.11.2, cgroup v2, rootless pinned runc 1.5.2, and BusyBox 1.35.0. The
+cancellation mode used a spawned fresh controller (no process-local handle
+registry): an invalid runner credential was rejected before monitor contact,
+then the real reconnect path authenticated once, rejected any legacy PID
+fallback, and stopped the exact journal-bound scope. The driver waited/reaped
+and wrote `cleanup_reported`; the payload start marker existed and its
+completion marker did not. The independent verifier then checked process,
+unit/invocation, cgroup, runc-state, private-path, and monitor-socket absence
+and advanced the execution to `cleanup_verified`. Cancellation produced a
+nonzero runc exit, which remains ineligible for result import. No model/provider
+credential, network egress, or paid call was used. Host and guest hashes
+matched for the production/test sources listed in
+[`WORKER_LAUNCH_DRIVER.md`](WORKER_LAUNCH_DRIVER.md). Postflight found no active
+matching services or attempt slices, payload process, or
+`acp-live-launch-driver-*` fixture root. The test also read the persisted
+resource lease, runtime environment, and allocated test-port row before and
+after the real reaper path: it verified the lease was owned by the exact task
+and attempt with the attempt expiry, then unowned with expiry zero; the runtime
+was `released` and its allocation row was gone.
+
+The obsolete direct-monitor live fixture is skipped until it is rebuilt around
+exact launch-driver redemption. Crash-recovery/ABA injection remains pending.
+At this live-probe revision, exact-head hosted CI was pending; the later
+manager-acceptance increment at code-bearing commit
+`e5f664f538996738cd310c482c778d08f9ee0440` passed
+[exact-head CI run 38888249380](https://github.com/Rayha33/agent-control-plane/actions/runs/38888249380).
+Result import was out of scope for this pinned-runc probe; the separate explicit
+result-import probe follows. `run_worker()` remains out of scope and fail-closed.
+
+### Live cleanup-gated sandbox result import (2026-10-16)
+
+`ACP_LIVE_IMPORT_RESULT_AFTER_CLEANUP=1` passed the opt-in
+`test_live_production_launch_driver_runs_exact_pinned_runc_request` on the
+disposable Ubuntu 26.04.1 ARM64 guest (Linux `7.0.0-38-generic`, Python 3.14.4,
+systemd 259.5, cgroup v2) with pinned rootless runc 1.5.2
+(`d10ecae898361832a059be2089bab92d158aec54661b18ed7346ed79628b46b0`) and
+BusyBox 1.37.0 (`27b2daf105ab5e4d489456e99731b05884f6a95623d2d10b3eda6881ad380577`).
+The exact test file SHA-256 was
+`e4017ce22f120d729f239a960c0fc9fb8f4e3015931ad8f24af48acdf58d035e` for this
+run. With guest umask `0002`, the fixture made its disposable `.acp` and
+`sandbox-executions` directories owner-only (`0700`), retaining the launcher's
+private-ancestor checks. The production launch-driver ran the local marker-only
+payload to natural completion; the production verifier advanced it to
+`cleanup_verified`; then
+host-side capture/import created a submitted result in `pending_qc`. Assertions
+bound the source kind to the exact sandbox execution and cleanup receipt,
+verified the imported commit's base and both payload files, and confirmed the
+registered source worktree stayed clean.
+
+Before and after a fresh-process real reaper pass at the original synthetic
+lease expiry, the test checked the full two-resource lease set and allocated
+test port. Both leases remained owned by the task (with no attempt owner), their
+extended expiry and runtime allocation remained intact, and the task stayed in
+`qc_review`; the reaper neither orphaned the pending submission nor released
+its runtime. Postflight found no test-specific service/scope, runc process, or
+fixture root. A fresh supervisor reopened the state before and after the first
+reaper pass and observed the same pending-QC submission ID/commit, submitted
+attempt, `qc_review` task, and `cleanup_verified` execution. A second fresh
+supervisor reaped at the extended QC-reservation expiry: it changed the task to
+`conflicted`, retained the submitted attempt, pending-QC result, and verified
+execution record, released the runtime, cleared both resource leases and the
+port allocation, and reported no orphan. No model/provider credentials or
+outbound/provider network call were used. The guest's
+`kernel.apparmor_restrict_unprivileged_userns` value was
+temporarily changed from 1 to 0 to permit rootless user namespaces and restored
+to 1 by an exit trap; this run does not prove AppArmor confinement with that
+restriction enabled. It also does not wire this path into `run_worker()`,
+authorize a provider worker, or prove provider egress policy. Exact-head hosted
+CI for code-bearing commit
+`0a5583a79322bf52a29282a6c05a59710be655ac` passed run
+[38935890202](https://github.com/Rayha33/agent-control-plane/actions/runs/38935890202):
+all four Ubuntu/macOS × Python 3.11/3.12 jobs passed. The run includes the
+follow-on test change; it does not change the lifecycle or isolation limits
+above.
+
+**Systemd post-stop boundary (2026-10-11; disposable Linux probe).** Upstream
+systemd documents that `ExecStopPost=` also runs after unexpected service exit.
+In the task's disposable Ubuntu guest (kernel `6.8.0-142-generic`,
+systemd `255.4-1ubuntu8.17`), an exact `systemd-run --user --wait` probe observed
+the hook under `<unit-cgroup>/.control`; systemd may place delegated hooks there.
+Only after the hook and wait returned
+did `systemctl show` report `LoadState=not-found`, `ActiveState=inactive`,
+`MainPID=0`, and empty `ControlGroup` and `InvocationID`. Thus `ExecStopPost=`
+cannot certify that its own unit or cgroup is absent. The launch-driver process
+must durably persist an immutable receipt for its pinned `runc delete` action
+and wait result before exiting. A finalizer must run after the complete stop
+job (including any `ExecStopPost=`) returns, verify the pre-bound unit/process
+identities and empty cgroup/private paths, and require that action receipt as
+well as those fresh observations before committing `cleanup_verified`. The
+captured InvocationID must remain bound to the unique fencing-epoch unit name;
+a missing or contradictory live unit state is not, by itself, evidence of a
+matching stop. A crash before the action receipt is durable remains ambiguous;
+later `runc state` absence must not trigger a retry or release the fence. The
+opt-in regression is
+`test_exec_stop_post_is_not_final_unit_absence_evidence`; this is systemd
+lifecycle evidence only, not a cleanup verifier or integrated-worker proof.
+See upstream [systemd service lifecycle documentation](https://github.com/systemd/systemd/blob/main/man/systemd.service.xml)
+and [cgroup delegation documentation](https://github.com/systemd/systemd/blob/main/docs/CGROUP_DELEGATION.md).
 
 ## Threat model
 
@@ -550,22 +1646,33 @@ existence does not establish that it is executable. This removes the
 path-replacement window for the configuration probe. The following describes
 the earlier hold, superseded by the private-bundle implementation above:
 `spawn_pinned_runc()` originally refused to launch while bundle ownership was
-unproved. The current candidate path uses a private read-only tmpfs and
+unproved. The candidate path described here uses a private read-only tmpfs and
 descriptor-anchored `--bundle`. A direct exact-host adversarial replay for this
-handoff is recorded in the evidence history below. The current runtime/test
-sources passed the exact-host replay, and two independent reviewers gave GO for
-the bounded launcher and cleanup-guard slice. GitHub Actions run `37320832762`
-passed all four Ubuntu/macOS × Python 3.11/3.12 jobs on implementation/test-
-fixture commit `9a6368d`; this receipt does not cover later documentation-only
-commits. Task #2417 records the current PR head and its latest check. The
+handoff is recorded in the evidence history below. The source revision in that
+replay passed, and two independent reviewers gave GO for the bounded launcher
+and cleanup-guard slice. GitHub Actions run `37320832762` passed all four
+Ubuntu/macOS × Python 3.11/3.12 jobs on implementation/test-fixture commit
+`9a6368d`; this receipt does not cover later documentation-only commits. At the
+time of this note, task #2417 tracked the PR head and its latest check. The
 unisolated diagnostic helper remains unsafe and is not called by `run_worker`.
-No runtime path/digest is durably tied to the attempt journal before candidate
-exec, and the attempt journal still cannot reach `cleanup_verified`. When
-`[sandbox.oci]` is configured, `run_worker` continues to fail before heartbeat
-or process reservation with `sandbox_executor_unavailable`; it cannot silently
-fall back to host execution. The direct live test is not a
-supervisor-managed attempt and establishes no result-import or crash/cancel
-recovery claim.
+The earlier statement that no runtime path/digest was tied to the journal before
+candidate exec is superseded: the journal in this source revision commits a
+one-use `launch_submission_digest` over every descriptor-backed target field,
+including the verified pinned-runc path/digest, config digest, argv,
+bundle/rootfs/state/workspace path identities, and resource limits, before the
+private launcher's exec acknowledgement. This is a commitment to the launch
+target, not to every reservation field. After the returned handle is bound, the
+journal persists the canonical readable launch plan and the `launch_target`
+payload in `sandbox.execution_launched`. At this source revision, these records
+bound launch intent but did not prove successful production `run_worker()`
+execution; an ambiguous post-latch crash remained fenced and could not resubmit,
+and the attempt journal could not reach `cleanup_verified`.
+When `[sandbox.oci]` was configured at that stage, `run_worker` failed before
+heartbeat or process reservation with `sandbox_executor_unavailable` rather
+than falling back to host execution. The direct live test at that stage
+exercised a claimed attempt and journaled launch components through a test
+fixture, not the production `run_worker()` lifecycle, and established no
+result-import or crash/cancel recovery claim.
 
 The contained process trampoline now has an opt-in Linux `exec_fd` input: the
 trusted monitor passes a caller-held regular-file descriptor to its blocked
@@ -574,15 +1681,18 @@ monitor's copy and the descriptor across the final exec. A regression unlinks
 the opened interpreter before launch, successfully executes it despite the
 missing pathname and nonexistent `argv[0]`, and confirms the descriptor is not
 visible to the target.
-This closes the generic path-substitution gap for a future held-runc launch,
-but no current `run_worker` route uses the configured runc pin; OCI worker
-execution remains unavailable and fail-closed.
+This closed the generic path-substitution gap for a future held-runc launch.
+At the source revision covered by this dated entry, no `run_worker` route used
+the configured runc pin; OCI worker execution was unavailable and fail-closed.
 
 ### Durable execution-journal slice (2026-10-04)
 
 Schema 14 introduced a private, per-attempt `sandbox_executions` journal. Reservation
 binds the current claim token, an ACP-generated container ID, attempt-specific
 bundle/state paths, the bundle and rootfs digests, and exact runc/OCI versions.
+New container IDs are `acp-` plus a 240-bit SHA-256 prefix over the canonical
+full `(attempt_id, claim_token, execution_id)` tuple; they do not use a short
+execution-ID prefix as a cross-attempt discriminator.
 The transition contract keeps the ACP monitor, attached runc client, and
 container-init PID/start identities separate, and also records the wrapper and
 scope unit names plus InvocationIDs and exact cgroup path. SQLite prevents edits
@@ -607,11 +1717,18 @@ records `cleanup_verified`.
 This is only a fail-closed hold: the reaper does not stop a live container or
 perform cancellation/restart recovery for this journal-only slice. Ambiguous
 journal state moves the attempt to quarantine and extends its resource fences.
-No application method currently writes `cleanup_verified`, so this work cannot
-enable or complete an OCI worker sandbox; attempts with such journal rows remain
-intentionally fenced pending separate executor, targeted-stop, recovery, and
-verifier work. The legacy `attempts.pid` slot remains reserved for direct workers;
-a future sandbox monitor must use a distinct journal-backed registration path.
+At the time this historical entry was written no application method wrote
+`cleanup_verified`. Later updates at the top of this document add the
+supervisor-owned writer and record live Linux/systemd cleanup-verifier runs.
+The positive reaper retry/fence-release path has deterministic mocked
+OS/SQLite coverage. At the time this historical entry was written there was no
+live end-to-end reaper recovery result; the later pinned-runc launch-driver
+section above records the 2026-10-16 live reaper proof. At the time this
+historical entry was written, exact-head hosted CI remained a separate gate;
+the passing 2026-10-16 runs are recorded above. OCI worker execution remains
+fail-closed pending registered worker-path integration and the other open
+#2370 gates. The legacy `attempts.pid` slot remains reserved for
+direct workers; sandbox supervision uses a distinct journal-backed path.
 Result import, import recovery, and submission also fail closed for a journaled
 attempt unless the recorded runc exit code is zero and cleanup is independently
 verified. A caller-supplied cleanup report is not sufficient; legacy attempts
@@ -648,8 +1765,8 @@ same-UID process with raw database-write access. A future executor must keep the
 supervisor database outside the worker's mount namespace.
 
 **Versioned result-candidate evidence (schema 16; non-authorizing).** After a
-successful recorded runc-client exit and an exact `cleanup_reported` row, the
-host can reopen the durable workspace binding, scan the mutable tree through
+successful recorded runc-client exit and cleanup verification, the host can
+reopen the durable workspace binding, scan the mutable tree through
 `collect_changes` against the task's current write set, and recheck the saved
 workspace root device/inode. The write-once version-1 receipt binds the
 attempt, claim token, execution ID, baseline and workspace paths/device/inode,
@@ -661,12 +1778,42 @@ signature, independent attestation, or import authority. An identical retry is
 idempotent; a changed workspace result conflicts with the stored candidate
 instead of replacing it.
 
+**Candidate-capture quiescence gate (2026-10-10; fail-closed hardening).** The
+capture API now requires `cleanup_verified` both before scanning the mutable
+workspace and again before persisting the candidate; `cleanup_reported` alone
+is rejected without writing a receipt. This closes the supported-API path that
+could run while cleanup was still unverified and a surviving process might
+still mutate the workspace. Schema 27 migrates the write-once SQLite trigger
+to enforce the same `cleanup_verified` phase. At this historical point, no
+production writer existed. The supervisor-owned cleanup verifier/writer and
+exact launch-driver lifecycle were later exercised on disposable Debian
+12/systemd and accepted for #3142 on 2026-10-16: six distinct completion,
+timeout, cancellation, and crash-window modes are recorded in
+[WORKER_LAUNCH_DRIVER.md](WORKER_LAUNCH_DRIVER.md#live-monitor-accepted-pre-receipt-launch-driver-crash-2026-10-16).
+The code-bearing commit `29758f8f1455167877397334279a2df8e58d282f` passed
+exact-head CI run
+[38923445474](https://github.com/Rayha33/agent-control-plane/actions/runs/38923445474),
+and documentation head `47425327a85663e352da478e6880b75b66b40fe6` passed all
+four Ubuntu/macOS × Python 3.11/3.12 jobs in
+[run 38926750661](https://github.com/Rayha33/agent-control-plane/actions/runs/38926750661).
+This closes the verifier's live-Linux/CI gate for the launch-driver lifecycle;
+it does not establish a registered coding-worker result-import path. The
+downstream candidate/import tests below still synthesize `cleanup_verified` by
+dropping the transition trigger and remove the private bundle/state
+directories. They intentionally test import logic, not verifier provenance,
+live result capture/import, or registered `run_worker()` integration. The
+unkeyed cleanup-report digest alone remains insufficient; configured OCI
+`run_worker()` remains fail-closed.
+
 For journaled sandbox attempts, import, recovery, and submission require a
 matching candidate receipt in addition to the existing `cleanup_verified` gate.
-This schema adds no trusted cleanup verifier and no sandbox result-import route,
-so a journaled candidate still cannot create or submit a result. Direct-worker
-behavior remains unchanged. Same-UID raw database writers, workspace path
-races, and runtime cleanup are not proved safe by this receipt.
+At this historical schema-16 stage, neither a trusted cleanup verifier nor a
+sandbox result-import route existed, so a journaled candidate could not create
+or submit a result. The later schema-19 import route and 2026-10-16 verifier
+acceptance are recorded below; their end-to-end integration into a registered
+coding-worker path remains incomplete. Direct-worker behavior remains
+unchanged. Same-UID raw database writers, workspace path races, and runtime
+cleanup are not proved safe by the candidate receipt alone.
 
 **Runtime content-identity slice (schema 17; still not an executor).** New
 execution reservations now require the configured rootfs tree digest, the
@@ -719,13 +1866,14 @@ source binding, candidate digests, and the `cleanup_verified` eligibility gate.
 For a `cleanup_verified` row, workspace restore additionally requires the
 private bundle and runc state directories to be absent while the recorded
 execution-root identity and workspace/baseline bindings still match. The
-cleanup-report digest identifies the journaled report; it is not proof that the
-report is trusted or verified. No trusted cleanup verifier or production writer
-for `cleanup_verified` exists yet, so the new route still fails closed for real
-executions and `run_worker` remains fail-closed for configured OCI. The route's
-success/recovery test constructs synthetic already-verified journal state only
-to cover downstream import logic; it is not cleanup-verifier or live-runtime
-evidence.
+cleanup-report digest identifies the journaled report; it is not proof that
+the report is trusted or verified. A supervisor-owned verifier/writer now
+provides that separate evidence and passed the live launch-driver cleanup,
+fence-release, and exact-head CI gates for #3142. Earlier success/recovery tests
+construct synthetic already-verified journal state for downstream import
+coverage. The separate live integration evidence above now exercises host
+result capture/import after production launch and cleanup verification, but is
+still not invoked by registered OCI `run_worker()`, which remains fail-closed.
 
 **Runtime-attestation validator and partial host collector (2026-10-04; still
 no launcher).** The `sandbox_attestation` module binds bounded observations into
@@ -786,6 +1934,22 @@ independent runtime attestation. The low-level launcher tests keep their bypass
 inside test modules; it is not shipped as a production helper and is not
 evidence of a supervised worker path. `run_worker` remains fail-closed for
 configured OCI; no supervisor-managed runc launch or result import is claimed.
+
+**Release-time process/cgroup recheck (2026-10-09; guard hardening only).**
+Before the journal records `running` or authorizes the one-shot gate permit, it
+now re-reads `/proc/<pid>/stat`, `/proc/<pid>/cgroup`, and `/proc/<pid>/stat`
+for the recorded monitor, runc client, and container init while holding the
+exact launch-gate lock. Each process must retain its collected start identity
+and live state; monitor and runc client must remain in the wrapper cgroup, and
+init must remain in the recorded runc scope. The same release-locked path also
+re-reads the cgroup-v2 memory, CPU, and PID limits. Synthetic regressions cover
+PID reuse, process exit, cgroup movement, gate-lock ordering, and a shut gate on
+drift. These sequential reads narrow a stale-receipt window; they are not an
+atomic procfs/cgroup snapshot, and process exit or movement after the reads
+remains a race. At the time of this 2026-10-09 change, systemd invocation
+properties were not re-queried at release; the 2026-10-10 release-time identity
+gate below adds that check. No production worker calls this path: OCI
+`run_worker` remains fail-closed and end-to-end worker isolation is unproven.
 
    **Repeat fixture and exact cleanup (2026-10-03).** A separate no-model
    rootless OCI composition run on the NAS added runtime-only evidence. The
@@ -1287,6 +2451,494 @@ or egress, hostile long-running process behavior, cancellation/restart
 recovery, concurrent attempts, result transfer/QC, or end-to-end sandbox
 acceptance; task #2370 remains open.
 
+### Exact-head cleanup revalidation (2026-10-09; pass)
+
+The opt-in live test was rerun from exact PR #42 head
+`1d78813a96af210da4cf096053dff097c6b6e1a8` in a disposable Lima 2.2.1 VZ
+Ubuntu 24.04.5 ARM64 guest (kernel `6.8.0-142-generic`, uid 501) with no host
+mounts. The test file SHA-256 was
+`9a54375ea682aea68ee8ce9630da0b82c264dca89335edbc0abc5fb623487c95`; the
+unchanged OCI worker module was
+`5aed95084724828544b0c6f09ac17653983caff57f16498fd31950b5b42c4092`.
+Root-owned runc 1.3.5 was verified against the official ARM64 release asset
+SHA-256
+`bd843d75a788e612c9df286b1fa519a44fcbb7a7b8d01e2268431433cc7c718c`, with
+Ubuntu dynamic BusyBox 1.36.1. The single invocation of
+`test_live_rootless_runc_enforces_minimal_worker_boundary` passed.
+
+The live receipt reported `rootfsPropagation=rprivate`, the expected
+`memory.max=134217728`, `pids.max=16`, and `cpu.max=50000 100000`, all five
+capability sets zero, and `NoNewPrivs=true`. The candidate saw only `lo`; its
+probe could not reach the host-NIC listener. Checkout, sibling-attempt,
+unrelated-project, home/config/credential, host `/etc` and `/tmp` sentinels,
+and absolute/relative symlink targets were denied. Teardown removed the
+attempt tree and checkout canary; postflight found no runc process or ACP
+systemd scope. The guest-only
+`kernel.apparmor_restrict_unprivileged_userns` value was restored from `0` to
+its original `1`.
+
+This rerun exercises the changed test-harness cleanup on its successful live
+path; identity-replacement failures are covered by the focused regressions and
+exact-head CI. The receipt still reports `worker_executor_integrated=false`.
+It is not evidence of `run_worker` isolation, provider authentication or
+egress, result transfer, crash/cancellation recovery, or full task #2370
+acceptance.
+
+### AppArmor-gated OCI boundary replay on runc 1.5.2 (2026-10-10; pass)
+
+The exact `d22483ce6c566df514936c83f7bd500a7f1fb594` source and test were
+copied into the no-host-share Lima guest `acp-oci-qc-20261009` (Ubuntu 24.04.5
+ARM64, Linux `6.8.0-142-generic`, cgroup v2, active user manager, Python
+3.12.3, pytest 7.4.4). The 48-file package-source tree digest was
+`6f0c9f40249f42ffc22ad61274f8a0837c3d76b21a66da8be12f875bf83aaa1a`; the
+tested `oci_worker.py` SHA-256 was
+`d3891165e4ec1b11c4997188cfdea3108e3fb8edff17a0ec7f92f5d541d1991d`, and
+`test_oci_worker_runtime.py` was
+`697b39229d436cf65bf0984921ed4513e1d47d3fa324938d4af34317f177e824`. A
+separate root-owned `/usr/local/bin/runc-1.5.2` was installed from the
+[official runc v1.5.2 ARM64 release asset](https://github.com/opencontainers/runc/releases/tag/v1.5.2)
+only after its SHA-256 matched the GitHub release API digest
+`d10ecae898361832a059be2089bab92d158aec54661b18ed7346ed79628b46b0`;
+the pre-existing runc binary was not replaced. BusyBox was 1.36.1.
+
+With the guest's default `kernel.apparmor_restrict_unprivileged_userns=1`,
+the live integration attempt from an unconfined shell stopped before runc exec:
+the private bundle helper received `EPERM` at mount-namespace setup (phase 4).
+A direct `unshare` check also failed under that policy. The guest already had
+AppArmor 4.0.1's packaged `/etc/apparmor.d/runc` profile (SHA-256
+`e97400404d8b8e85ce3e458558105ec218276efab10b355c7a6086a90ad0b4c6`): it is
+`flags=(unconfined)` with an explicit `userns,` rule. The upstream AppArmor
+[user-namespace policy notes](https://gitlab.com/apparmor/apparmor/-/wikis/unprivileged_userns_restriction)
+describe this per-profile permission path. `aa-exec -p runc -- unshare
+--user --map-root-user --mount --fork -- /bin/true` passed while the sysctl
+remained `1`.
+
+The first profile replay exposed an unclosed `Popen` pipe when private-bundle
+setup failed before a launch handle could be returned. `_reap_failed_runc_launch`
+now closes the caller-unreachable stdin/stdout/stderr handles in `finally`, with
+a regression test. Only `oci_worker.py` and `test_oci_worker_runtime.py` were
+then overlaid into the same guest; their tested SHA-256 values were
+`60e5b1ef264de00be2c486a55f3db4eccd211a7b94fbe8207486e1688428778c` and
+`d15ff55c5f4202655f51158bf9a907588708df5b10457f8d5db54fe2da5a7d44`.
+With the sysctl still `1`, the exact live test
+`test_live_rootless_runc_enforces_minimal_worker_boundary` passed 1/1 under
+`aa-exec -p runc`, with resource warnings visible and none emitted. Postflight
+found no attempt tree, matching user slice, or runc process; the user manager
+remained active and the sysctl remained `1`. No host settings were changed.
+
+After that guest replay, the source received a compatibility-only adjustment:
+cleanup now uses `getattr(..., None)` for optional Popen stream attributes so
+structural process doubles without those attributes do not mask the bounded
+reap error. The final local source SHA-256 is
+`020f35c85285740fa0df6c78e05b12eae1c1860df01240a0bd99141ebe7faa7e`; it was
+not overlaid or replayed in the guest. The final source passed both focused
+cleanup tests locally, including
+`test_failed_runc_launch_cleanup_reports_bounded_unreaped_child`.
+
+This proves the low-level test can run with the default sysctl when its caller
+is assigned a profile granting user-namespace creation; it does not establish
+a production-ready profile. The packaged `runc` profile is unconfined apart
+from naming and its userns rule, and this replay placed the entire pytest
+controller and descendants under that label. It therefore does not prove the
+permission is restricted to the trusted setup helper or absent from the worker.
+The profile-separated prototype below addresses that low-level boundary, but
+does not provide a production profile or policy lifecycle. The executor is
+still not wired to registered `run_worker`; lifecycle ownership, cleanup
+verification, credential/provider egress, result import, and full task #2370
+acceptance remain open. Keep OCI `run_worker` fail-closed.
+
+### OCI helper/worker AppArmor profile separation (2026-10-10; bounded pass)
+
+The OCI compiler now optionally emits the standard `process.apparmorProfile`
+field. The [OCI Runtime Specification v1.2.1](https://github.com/opencontainers/runtime-spec/blob/v1.2.1/config.md)
+defines this as a Linux process profile name, and pinned [runc v1.5.2 applies
+the profile during init, before exec](https://github.com/opencontainers/runc/blob/v1.5.2/libcontainer/standard_init_linux.go#L1016).
+The compiler validates a single plain profile name; it does not load, verify,
+attest to, or audit the named policy. The name must refer to a profile already
+loaded by the host, and the actual runtime must still be independently checked.
+
+In the disposable no-host-share guest above, a temporary **confined** enforce
+profile named `acp-worker-qc` (flags `attach_disconnected,mediate_deleted`, no
+`userns` rule) was loaded from stdin. A direct probe without the worker's
+seccomp filter distinguished the profiles: `unshare --user --map-root-user`
+under the packaged `runc` profile succeeded, while the same command under
+`acp-worker-qc` failed with `Operation not permitted`. This is consistent with
+the [AppArmor user-namespace policy](https://apparmor.net/man/4.0/apparmor.d/).
+An earlier scratch profile using `flags=(unconfined)` but omitting `userns`
+unexpectedly still allowed the operation with the global restriction enabled;
+absence of a rule in an unconfined profile is not a worker denial. Do not use
+that profile shape for this separation.
+
+The exact `oci_worker.py` and `test_oci_worker_runtime.py` overlay passed the
+opt-in rootless live test using pinned `runc-1.5.2` and
+`ACP_OCI_TEST_APPARMOR_PROFILE=acp-worker-qc`. The host read
+`/proc/<init-pid>/attr/current` and asserted `acp-worker-qc (enforce)` before
+releasing the candidate-code gate; the payload independently read its own
+label. The guest test environment was Python 3.12.3 / pytest 9.1.1. Its
+user-namespace attempt was denied, though the worker seccomp policy
+also denies namespace syscalls, so that payload result alone cannot attribute
+the denial to AppArmor. The preceding direct no-seccomp contrast isolates the
+AppArmor result. Tested file SHA-256 values:
+
+- `src/agent_control_plane/supervisor/oci_worker.py`:
+  `1a5559be722334c5797e2d908621a289adea11e55e46c69b16c43cbfbcdeedfd`
+- `tests/test_oci_worker.py`:
+  `b53e107889dd984c5f279ead9f542a20d9aaa929c5571833f6ad9b006b3f15ec`
+- `tests/test_oci_worker_runtime.py`:
+  `40ed1181d28ca585907a52c555b353a8a768a95373f4f8728a6a1972011eeb17`
+
+`tests/test_oci_worker.py` was also overlaid (hash above), but its compiler
+unit tests were exercised by the local suite rather than this live runtime
+test. After the guest replay, the source docstring alone was clarified to state
+that the compiler does not provision or attest to the named profile. The final
+local source SHA-256 is
+`7d68fb55375ab167b73a6cf49ca86a30aa84933d7eb7ed2a9d590dafe78e8236`; these
+comment-only bytes were not recopied to the guest. The full local suite passed
+on the final source tree.
+
+Postflight confirmed `kernel.apparmor_restrict_unprivileged_userns=1`, removed
+the temporary profile, and found no matching runc/unshare processes, ACP systemd
+units, or live-attempt tree. This establishes optional OCI-field compilation
+and profile application for this pinned low-level replay—not production policy
+provisioning/discovery, integration with registered `run_worker`, complete
+cleanup/recovery, or result handling. The temporary profile was intentionally
+minimal for the experiment and is not production policy. Keep OCI `run_worker`
+fail-closed until those remaining boundaries are independently implemented
+and verified.
+
+### NamespaceRuntimeDriver live payload boundary (2026-10-09; pass)
+
+Added opt-in regression `test_live_namespace_runtime_hosts_payload_but_exposes_worker_boundary_gaps`
+and ran it against the unchanged `runtime_drivers.py` from PR #42 source commit
+`7b5c9acd787b4f946936ca8193d79b875567e788` (module SHA-256
+`20ab594a414574d8575c437be54821fe681b0dbe2749ebff089dccc2dcec2852`). The
+test file used for the run had SHA-256
+`a127d774dba706a7ebd1c7f04361e9dfa1af50200342421b83b790241736fad1`. The
+test ran rootlessly as uid 501 in a disposable Lima 2.2.1 VZ Ubuntu 24.04.5
+ARM64 guest (kernel `6.8.0-142-generic`, Python 3.12.3, pytest 7.4.4), using
+unified cgroup v2. `ACP_RUN_NAMESPACE_INTEGRATION=1` selected this single
+test; result: 1 passed, 101 deselected. The VM's
+`kernel.apparmor_restrict_unprivileged_userns` was temporarily set from 1 to 0
+for the run and restored to 1 by an EXIT trap; the test itself does not change
+host settings.
+
+The fake payload ran in the transient per-attempt user service: the test read
+its marker through `/proc/<host-pid>/root/work`, confirmed a distinct PID
+namespace, `HOME=/work`, and cwd `/work`. It also confirmed `/workspace` was
+read-only and that host `/etc/os-release` remained readable. `teardown()` plus
+the driver's independent postflight proved the exact unit absent; afterward
+the guest setting was restored, no matching service remained, and the unique
+fixture directory was removed only after positive cleanup proof and a
+device/inode identity check, using a parent-directory FD and fd-safe recursive
+removal. Fixture creation and driver setup are inside the cleanup guard; if
+cleanup cannot be proven, the test retains the fixture for inspection. The
+observed `/tmp` setup initially obscured a fixture placed under `/tmp`; the
+regression now keeps that disposable source outside `/tmp`, matching the
+driver's private-tmpfs mount sequence. Cgroup paths from the unit are checked
+for traversal and resolved
+beneath the cgroup-v2 root before their process list is read.
+
+**Follow-up hardening (2026-10-11; live probe passed; hosted CI was pending at
+that revision).**
+`NamespaceRuntimeDriver` no longer bind-mounts host `/etc`; it generates a
+fixed, read-only `/etc/os-release` inside the private root. The structural test
+rejects reintroduction of `/etc` into the host bind loop. The opt-in Linux test
+now checks the generated identity, requires representative host `/etc/passwd`
+to be unreadable, and compares generated `/etc/os-release` bytes with the
+host's current file. These checks do not create a unique sentinel or inspect
+the mount table, so they are narrower than full host-`/etc` isolation proof.
+The helper default now prefers `/usr/sbin/chroot` and falls back to
+`/usr/bin/chroot`, with either path still subject to trusted-binary validation.
+The exact source/test pair passed the opt-in probe rootlessly in Lima 2.2.1
+Ubuntu 26.04.1 ARM64 (kernel `7.0.0-34-generic`, systemd `259.5`, Python
+`3.14.4`, unified cgroup v2, uid 501): 1 passed. The test temporarily changed
+`kernel.apparmor_restrict_unprivileged_userns` from 1 to 0; the live-run wrapper
+restored it to 1 with an exit trap (the pytest test itself made no sysctl
+changes). Postflight found zero `acp-ns-it` units and zero test
+worktree fixtures. The first attempt surfaced the guest's `/usr/bin/chroot`
+layout; the final pass exercised the driver's adaptive default without a
+test-only path override. Local full pytest passed (1,377 passed, 78 expected
+platform/opt-in skips); Ruff format/check and package build passed. A later
+code-bearing commit `e5f664f538996738cd310c482c778d08f9ee0440` passed
+[exact-head CI run 38888249380](https://github.com/Rayha33/agent-control-plane/actions/runs/38888249380).
+The generated `/etc` also omits resolver and CA
+configuration: `egress=allow` does not guarantee DNS name resolution or HTTPS
+certificate validation. Broad `/usr` exposure and all registered-worker/Git,
+credential, egress, monitor, and cleanup integration gaps remain open.
+
+**Interpretation (historical source under test, 2026-10-09):** the recorded
+live run proves that the resource driver could host and clean up a generic
+no-model payload in that measured guest. At that tested revision, host
+`/etc/os-release` was readable. The 2026-10-11 source follow-up above removes
+that broad bind, and its opt-in probe passed the generated-identity and
+representative-file checks described above. At that follow-up revision,
+exact-head hosted CI was still pending; later code-bearing commit
+`e5f664f538996738cd310c482c778d08f9ee0440` passed
+[exact-head CI run 38888249380](https://github.com/Rayha33/agent-control-plane/actions/runs/38888249380).
+The read-only coding workspace and other gaps still disqualify this
+driver as the worker boundary.
+It does not exercise ACP's registered `run_worker` reservation, worker PID,
+cancel/recovery, Git transfer, or validated result import; it is not acceptance
+criterion #3 or end-to-end sandbox proof. The driver must remain disconnected
+from coding workers and task #2370 stays open.
+
+**AppArmor prerequisite and preflight hardening (2026-10-10; same disposable
+guest).** Before the change below, the guest's default
+`kernel.apparmor_restrict_unprivileged_userns=1` policy caused
+`unshare --user --map-root-user true` to fail with
+`write failed /proc/self/uid_map: Operation not permitted`; systemd then
+created a transient unit that failed before the payload. The kernel audit log
+attributed user-namespace creation to AppArmor's `unprivileged_userns` profile.
+This is a host prerequisite failure, not a successful runtime probe.
+
+`NamespaceRuntimeDriver.setup` now runs the exact required rootless namespace
+combination (`--user --map-root-user --mount --pid --fork`, plus `--net` when
+egress is denied) with a trusted no-op command before invoking `systemd-run`.
+A nonzero or timed-out preflight raises typed `namespace_unavailable`; no
+transient unit is started. Opt-in live test
+`test_live_namespace_runtime_refuses_unit_when_rootless_namespaces_are_unavailable`
+passed under the guest's default policy and verified positive
+`systemd-unit-not-found` absence afterward. To recheck the supported positive
+path, the sysctl was temporarily changed to `0` only inside this no-host-share
+VZ guest; the live generic-payload test passed, and an EXIT trap restored the
+original value `1`. The full `tests/test_runtime_drivers.py` module passed on
+Linux with live opt-in unset (the two live tests were explicitly skipped).
+Postflight found no matching systemd unit or fixture worktree, and the guest
+policy still read back as `1`.
+
+The driver now also accepts an optional `apparmor_profile` name. When set,
+preflight and the service's actual namespace command are both wrapped with the
+trusted `/usr/bin/aa-exec` (or configured trusted `apparmor_exec_path`) and the
+same named profile. This intentionally does not use systemd's
+`AppArmorProfile=` unit property: systemd documents mandatory-access-control
+properties as unavailable to per-user service managers
+([systemd.exec(5)](https://manpages.ubuntu.com/manpages/noble/man5/systemd.exec.5.html)),
+while ACP launches transient user services. The profile is not invented or installed by ACP; it
+must already exist and be administrator-reviewed. Names are restricted to a
+single plain token. This lets a host grant the namespace helper an explicit
+user-namespace policy without turning off Ubuntu's global AppArmor restriction.
+Do not copy the disposable test profile into production without independent
+review: the Ubuntu `lxc-unshare` profile used for local validation is an
+`unconfined` profile with a `userns` rule, not a complete ACP confinement
+policy. A missing or insufficient profile fails closed: a missing profile
+fails preflight before unit launch; a profile that permits preflight but not
+the full mount sequence can still make unit setup fail, after which normal
+teardown and positive-absence verification remain required.
+
+**AppArmor-profile live recheck (2026-10-10; pass).** Exact source SHA-256
+`e4a0cd58f8f6f5bf4491febe88926ac31586b21ee88c9f1c5643a79e18bf8aeb` and test
+SHA-256 `398950fd966a202e06a21de1b888b970969e2259fde89c0762fbb03445b9b588`
+were copied into the no-host-share Lima 2.2.1 VZ Ubuntu 24.04.5 ARM64 guest.
+With `ACP_RUN_NAMESPACE_INTEGRATION=1`,
+`ACP_NAMESPACE_TEST_APPARMOR_PROFILE=lxc-unshare`, and
+`ACP_NAMESPACE_TEST_APPARMOR_EXEC=/usr/bin/aa-exec`, the exact live test passed
+(`1 passed, 107 deselected in 0.12s`) and the full Linux `tests/test_runtime_drivers.py` module
+passed (`106 passed, 2 opt-in integration tests skipped`). The guest remained
+rootless (uid 501), on kernel `6.8.0-142-generic` / systemd 255.4, with unified
+cgroup v2 and `kernel.apparmor_restrict_unprivileged_userns=1` before and after;
+no global AppArmor setting was changed. The live test reads
+`/proc/<host-pid>/attr/current` for the process holding the payload marker and
+asserts that its effective label matches the configured profile name; the guest
+reported `lxc-unshare (unconfined)`. Postflight found no matching ACP unit,
+fixture worktree, or worker service. The payload again confirmed
+`workspace_write=denied` while host `/etc/os-release` remained readable.
+
+This proves the named profile transition reaches the payload process under this
+Ubuntu policy; it does not establish that the selected profile is restrictive
+or suitable for production. It also does not make the workspace mutable or hide
+the host's enumerated `/etc`, and it does not exercise registered `run_worker`,
+cancellation/recovery, Git transfer, or result import. The feature therefore
+improves platform compatibility only; #2370 remains open and OCI worker
+execution remains fail-closed.
+
+For the earlier sysctl-based live run, the tested source and test SHA-256 values are
+`66e937ec6cc2a4b11bd6c8f526695a7c94dc45d642865391355418f72e4e5ba3` and
+`2a6afa465ece4426b8f599dac8be59426454228d82c6b9358b98ecadfd8b2e38`.
+Environment: Lima 2.2.1 VZ, Ubuntu 24.04.5 ARM64, kernel `6.8.0-142-generic`,
+systemd 255.4, uid 501, Python 3.12.3, pytest 9.1.1, unified cgroup v2; the
+guest had no host-shared folders. The test venv used the project's declared
+development extras, not the exact `uv.lock` environment; hosted CI remains the
+locked-dependency matrix. Never relax this AppArmor setting on a shared host
+to make a test pass.
+
+**Ubuntu 26.04 rootless OCI boundary recheck (2026-10-11; pass).** To avoid
+the active NAS I/O alert and leave the two existing ACP VMs untouched, the
+source was copied into a new Lima 2.2.1 VZ `--plain` guest with no host mounts
+or port forwards. The tested snapshot was based on PR-42 commit
+`cedfecdaa59affb19edd68a2d8173be2b1f17b5d`, with only
+`tests/test_oci_worker_runtime.py` overlaid; `oci_worker.py` SHA-256 was
+`7d68fb55375ab167b73a6cf49ca86a30aa84933d7eb7ed2a9d590dafe78e8236`, and the
+tested file SHA-256 was
+`4942bff7abed3b4e9b65562711cb2c3847b09b766539825f4da9d718a0e34b7c`. The
+guest was Ubuntu 26.04 ARM64, kernel `7.0.0-34-generic`, systemd 259.5, uid
+501, Python 3.14.4, pytest 9.1.1, and unified cgroup v2. The installed
+`runc.arm64` came from the [official runc v1.5.2 release](https://github.com/opencontainers/runc/releases/tag/v1.5.2)
+after its SHA-256 matched the release-asset digest
+`d10ecae898361832a059be2089bab92d158aec54661b18ed7346ed79628b46b0`.
+Dynamic BusyBox 1.37.0-7ubuntu1 was separately extracted from the signed
+Ubuntu package so the test could audit and copy its loader/library closure.
+
+With `ACP_RUN_OCI_INTEGRATION=1`, runc 1.5.2 explicitly pinned, and the test's
+normal bounded fake payload (no model or provider credentials),
+`test_live_rootless_runc_enforces_minimal_worker_boundary` passed 1/1. The
+Ubuntu image labels device-node bind mounts' devtmpfs source as `devtmpfs`
+and omits `relatime`; the validator now accepts only the source labels
+`udev`/`devtmpfs` and only the exact `rw,nosuid` option set with optional
+`relatime`. It rejects unapproved source labels and every other per-mount
+option set. This exact allowlist applies to mountinfo's per-mount options; for
+these device binds the validator separately requires `rw` and rejects `ro` in
+`super_options`, but does not exact-allowlist other superblock options. It also
+checks the root/filesystem, filesystem device identity, shared devtmpfs
+identity, device numbers, read-only proc masks, cgroup limits, PID namespace,
+and bundle/path replacement attacks. The default guest AppArmor userns
+restriction was `1`; a 10-minute systemd restore timer was armed before a
+temporary guest-only change to `0`, and a shell exit trap restored and read
+back `1`. At the end of this focused run, independent postflight confirmed the
+setting was `1`, the live attempt tree absent, no runc process, and the user
+manager active; its fallback timer remained armed to repeat the same safe
+restore. Neither the Mac host nor NAS policy was changed.
+
+As a follow-up on the same guest snapshot and exact source hashes above, the
+entire `tests/test_oci_worker_runtime.py` module was run with
+`ACP_RUN_OCI_INTEGRATION=1`: **47 passed in 5.67 seconds**, including the live
+rootless-runc test (not skipped). For this run, two 10-minute fallback restore
+timers were armed before the guest-only sysctl change; the shell exit path
+restored and read back `1`, and both timers were stopped only after that
+readback. Postflight found the user manager active and no runc process. The
+live test's exact pytest directory
+`/tmp/pytest-of-rayha/pytest-7/test_live_rootless_runc_enforc0` had no
+`live-oci-attempt` child. A read-only scan of `/tmp/pytest-of-rayha/pytest-7`
+found four adversarial pytest fixtures that intentionally retained their
+markers: `test_checkout_write_probe_clea1/checkout-write-probe`,
+`test_private_attempt_tree_clea1/live-oci-attempt`,
+`test_private_attempt_tree_clea2/live-oci-attempt`, and
+`test_private_attempt_tree_fina0/live-oci-attempt`. Their unexpected or
+replacement marker entries remain by design; these fixture directories are
+distinct from the live test's attempt tree and were preserved, not deleted.
+
+**Ubuntu 26.04 systemd 259 monitor/attestation primitive recheck (2026-10-11; pass).**
+In the same no-host-mount Lima guest (Ubuntu 26.04 ARM64, Linux
+`7.0.0-34-generic`, systemd 259.5, Python 3.14.4, pytest 9.1.1, cgroup v2),
+the exact `tests/test_systemd_slice_integration.py` SHA-256
+`94eb48cc486c1e174d697ec01767701576a257f52a7a52bb74359773fbbba7e9` was run
+with `ACP_RUN_SYSTEMD_SLICE_INTEGRATION=1`; the two selected live tests passed
+(2 passed, 3 deselected, 0.48 seconds). The first test killed its creating
+controller, reconciled the exact service receipt from a fresh controller, and
+verified the monitor service survived stopping the worker slice while the scope
+cgroup emptied. The second verified that the live systemd attestation rejects
+a restarted wrapper. The imported `sandbox_attestation.py` and `oci_worker.py`
+SHA-256 values were `c64ef56def1dc4cd9fc58c2db62560b6f1da33076483c2b460dee78ad3044b22`
+and `7d68fb55375ab167b73a6cf49ca86a30aa84933d7eb7ed2a9d590dafe78e8236`.
+Postflight found the user manager running, no matching `acp-live-*` or
+`user-acp-*.slice` units, and no `/usr/bin/sleep 90` or `runc` process.
+
+These systemd tests use placeholder sleep processes, and their scope is started
+by an external controller; they do not test a monitor that owns the runc client
+and its wait/reconciliation. This extends primitive-level coverage to systemd
+259.5 only; it is not durable monitor integration, supervisor-restart recovery,
+or registered `run_worker()` acceptance.
+
+This is a successful low-level OCI-boundary probe on a second Linux/kernel
+profile, not end-to-end supervised-worker acceptance. It does not connect the
+container launch to registered `run_worker`, provide least-privilege provider
+authentication/egress, or demonstrate supervisor-crash recovery, cancellation,
+and result import. `run_worker()` therefore remains fail-closed with
+`sandbox_executor_unavailable`; task #2370 remains open.
+
+**Target NAS capability spot check (2026-10-10; no unit or worker started).**
+From the regular uid-1000 account on `DXP4800PLUS-RING` (`Linux 6.18.15
+x86_64`), the exact default-deny namespace flags, including `--net`, ran a
+trusted `/bin/sh -c "exit 0"` no-op and returned exit 0. The user's
+`default.target` was active. The AppArmor userns sysctl path was absent on this
+host (unlike the disposable Lima guest); `/sys/fs/cgroup/cgroup.controllers`
+listed `cpuset cpu io memory hugetlb pids rdma misc`. This was a direct
+capability probe, not `NamespaceRuntimeDriver`, `systemd-run`, or `run_worker`.
+The root controller list does not prove per-user delegation or limit
+enforcement, and this probe establishes no workspace, credential, egress,
+cleanup, or worker-isolation property.
+
+**Credential and host-socket isolation gate.** Namespace and cgroup capability
+checks do not establish which Unix socket paths a worker can reach. The
+integrated no-model probe must capture the worker's effective uid, gid,
+supplementary groups, and open descriptors; it must hide or deny host
+container-engine, system/user D-Bus, SSH-agent, and credential-agent sockets,
+then prove those endpoints are unavailable while any explicitly supplied
+test-only socket remains usable. Environment-variable filtering and a socket
+path's filesystem mode are not substitutes for this negative runtime test.
+Do not enable the OCI worker path until the integrated executor proves this
+boundary together with the other gates below.
+
+This preflight proves namespace creation prerequisites and prevents the
+measured failed-unit case; it does not verify the later mount/chroot prelude or
+establish a coding-worker boundary. Separately, `run_worker` still refuses any
+OCI-configured worker before heartbeat, reservation, or `Popen`; focused test
+`test_oci_configured_worker_fails_closed_before_host_fallback` passed on this
+source. That proves refusal rather than a working OCI worker executor.
+
+### NAS-host rootless-runc boundary probe (2026-10-09; partial pass)
+
+The opt-in `test_live_rootless_runc_enforces_minimal_worker_boundary` passed
+once in 7.7 seconds on the NAS (`Linux 6.18.15` x86_64, uid 1000, rootless
+runc 1.3.5, BusyBox 1.35.0, unified cgroup v2). The source branch was verified
+at exact public head `18de1e32c96dd2dc5c319549c349b2a30bc58266`; the test file
+SHA-256 was
+`9a54375ea682aea68ee8ce9630da0b82c264dca89335edbc0abc5fb623487c95` and
+`src/agent_control_plane/supervisor/oci_worker.py` was
+`5aed95084724828544b0c6f09ac17653983caff57f16498fd31950b5b42c4092`. The
+rootless user-namespace preflight succeeded. The no-model invocation cleared
+its environment and used Python 3.11 / pytest 9.1.1; no provider credentials
+or model call were used.
+
+The test observed only `lo`, no IPv4 default route, and one TCP probe that did
+not reach its test-owned host-NIC listener. It denied the specified source
+checkout (including `.git`), sibling worktree, unrelated project, home,
+synthetic config/credential markers, host `/etc/os-release`, `/tmp`, and
+absolute/relative symlink targets. Its FD check asserted exactly descriptors
+0, 1, and 2, with no additional or socket descriptors; pipe targets were
+observed but not asserted. The process had zero capability sets and
+`NoNewPrivs=true`; read-back limits were `cpu.max=50000 100000`,
+`memory.max=134217728`, and `pids.max=16`. The test and separate postflight
+found the attempt tree, `/dev/shm` anchor, exact scope cgroup, and checkout
+canary absent, with no runc process or matching scope remaining.
+
+Pytest emitted a nonfatal warning because the optional Starlette dependency
+was absent, so this invocation did not validate that warning filter or the
+full suite. More importantly, the test used a test-only unjournaled gate
+release. This is partial direct-runc runtime evidence, not a journal-authorized
+launch or registered `run_worker` acceptance. It is not general egress proof,
+provider-authentication evidence, `cleanup_verified` evidence, result-import or
+crash/recovery proof, or a pass of task #2370's integrated-worker criteria;
+`worker_executor_integrated=false`. Keep OCI fail-closed and task #2370 open.
+
+### Trusted runtime-attestation source boundary (2026-10-09; code-only)
+
+`collect_running_runtime_attestation()` no longer accepts caller-provided
+`runc state` or systemd property bytes when issuing the collector provenance
+that the journal requires. It revalidates the configured root-owned runc pin,
+executes `runc state` through the held executable descriptor, resolves only a
+root-owned non-replaceable host `systemctl`, and queries the exact wrapper,
+attempt-slice, and scope units with a fixed property set. Both command paths
+use the existing bounded guardian (three-second deadline and 64 KiB output
+ceiling); the systemd bus path is fixed to the current user's private runtime
+directory. Each collector-issued receipt also binds the state-root
+path/device/inode, exact PID-file path, and pinned runc digest. Under the
+launch-gate lock, the journal compares every source-binding field with the
+durable plan and rechecks the state-root identity before authorizing release.
+Unit names and invocation IDs are validated before commands run. The internal
+observation normalizer can still validate fixture/supplied bytes, but it cannot
+mint journal-accepted collector provenance.
+
+Focused tests exercise command construction, descriptor-bound runc execution,
+source-output parsing, wrong-state-root, wrong-PID-file, and wrong-executable
+rejection, plus the provenance boundary with a fake bounded-command runner.
+They do not prove a live systemd bus, a production monitor service, or restart
+reconciliation. The bus check validates path ownership/type but does not
+authenticate the D-Bus peer or exclude a hostile same-UID host process; the
+future worker boundary must keep the host bus inaccessible. These observations
+are sequential, not a durable monitor. The collector is not wired into
+`run_worker`; the registered OCI path remains fail-closed, and task #2370
+remains open.
+
 ### systemd/runc cgroup composition probe (2026-10-03)
 
 The first wrapper-only test used rootless runc under a transient service with
@@ -1317,6 +2969,358 @@ incomplete. The separate repeat fixture above records an explicit delete and
 positive state-root, PID-identity, and systemd-scope absence checks. This is
 cleanup evidence for that disposable fixture only, not supervisor-managed
 crash/cancel recovery or release of an ACP execution fence.
+
+**2026-10-09 wrapper and parent-slice follow-up (architecture evidence only).**
+The exact-source opt-in test was rerun under a transient user service with
+`Delegate=yes`, `KillMode=control-group`, and a 90-second runtime bound. It
+passed once on the NAS using source snapshot `f9de9b16b06cc776565192f71a7117b234daf883`
+(test SHA-256 `9a54375ea682aea68ee8ce9630da0b82c264dca89335edbc0abc5fb623487c95`)
+and the committed `uv.lock` (`uv --frozen`). Host: Linux 6.18.15 x86_64,
+systemd 252, uid 1000, rootless runc 1.3.5, BusyBox 1.35.0. The service got a
+sanitized environment and no provider credentials. The emitted evidence again
+reported `worker_executor_integrated=false`; this remains the test-only,
+unjournaled direct-runc gate, not a registered worker lifecycle.
+
+The new evidence also sharpens the containment gap: the runc scope was reported
+under `user@1000.service/user.slice/`, whereas a separate ordinary transient
+user service was under `user@1000.service/app.slice/`. `Delegate=yes` on that
+wrapper therefore does not make its `KillMode=control-group` cover the
+systemd-created runc scope. This matches runc's documented
+`linux.cgroupsPath=[slice]:[prefix]:[name]` placement contract and the current
+compiler's fixed `user.slice:acp:<container-id>` value
+([runc systemd cgroup documentation](https://github.com/opencontainers/runc/blob/main/docs/systemd.md)).
+
+A bounded no-model `sleep` probe then placed both a transient service and a
+transient scope beneath one unique `user-acp-…slice`; their reported cgroup
+paths were descendants of that slice. Stopping the parent slice transitioned
+both units to inactive. This validates a possible per-attempt containment
+mechanism, not process-absence proof, OCI cleanup, crash recovery, or ACP
+integration. The policy compiler now binds each runc scope beneath a unique
+parent slice, but neither the supervisor wrapper nor a journal-authorized
+launch is placed there. The executor still needs a restart-safe lifecycle that
+proves all attempt descendants and runtime state absent before writing
+`cleanup_verified`. Keep OCI fail-closed and task #2370 open.
+
+**2026-10-09 exact-source per-container slice binding and teardown (not worker integration).**
+Commit `fbb205e3d714f9e7bcd73a3e1026d5a8338d412a` makes the policy compiler emit
+`linux.cgroupsPath=user-acp-<sha256(container-id)>.slice:acp:<container-id>`.
+The complete-policy validator and private-bundle launch check require that exact
+deterministic slice, rejecting the former shared `user.slice` parent and a slice
+derived from another container ID. The opt-in test at that exact commit has
+source SHA-256 `8770605a9dd64ecdd5a167b619462c349d53aae0b7bb59ad08688e202ca0011c`
+and test SHA-256
+`93656c531a20a517a829b1249950107323921dd6e324ff69e58c266f67c6731a`.
+
+On 2026-10-09, the opt-in test passed once on that exact snapshot; the bounded
+systemd service ran for 6.997 seconds under a transient user service
+with `Delegate=yes`, `KillMode=control-group`, a 300-second runtime bound,
+sanitized environment, no provider credentials, `uv run --frozen`, and runc
+1.3.5 pinned. Host: Linux 6.18.15 x86_64, systemd 252, BusyBox 1.35.0. The
+runtime receipt reported
+`user-acp-55dc0feb0b79615c6d1288993f4427ce709c4f84413b457ae7050b71c054936e.slice`
+and asserted that the exact runc scope
+`acp-acp-live-28cbdd46b9ed4876b63220b5d90c501f.scope` `ControlGroup` was a
+descendant of that slice. The receipt again reported
+`worker_executor_integrated=false`.
+
+The test teardown performed a sequential, point-in-time scan requiring
+`cgroup.events populated=0` and empty `cgroup.procs` throughout the exact slice
+subtree, then requested stop of that slice; if the observed state was
+ambiguous, it preserved the attempt evidence. The scan and stop are not atomic
+against a concurrent same-UID systemd actor adding a unit between them, and
+this test did not exercise or exclude that race. After this run, the transient
+service and runc scope were `not-found`; the parent slice was loaded but
+inactive with an empty `ControlGroup`, and its cgroup path was absent.
+The test attempt root was absent. Its 4,415-node source snapshot was removed
+only after matching the recorded device/inode and owner/mode, finding no process
+cwd/open-fd/mapped-file references or mountpoints, and using descriptor-relative
+symlink-safe removal. This proves scope placement and test teardown for the
+compiled policy on one NAS host only. It does not place the supervisor inside
+the slice or prove journal authorization, full attempt descendant containment,
+cancellation/crash recovery, result import, provider egress, or registered
+`run_worker` behavior. Keep OCI fail-closed and task #2370 open.
+
+**2026-10-09 systemd ownership and restart decision (research; not integration).**
+The supported-host assumption is systemd 252, so this check used the v252
+interface docs rather than relying only on current `main`. systemd documents a
+single-writer rule for cgroup v2. In v252, the manager D-Bus interface exposes
+`StartTransientUnit`, `GetUnitByInvocationID`, and `GetUnitByControlGroup`; the
+systemd control-group API documents the unit's `ControlGroup` property. Resolve
+exact unit/invocation identities and read reported properties instead of
+deriving cgroup paths from unit names. `systemd-run` is a wrapper for
+transient-unit creation, not a separate lifecycle owner. Sources:
+[systemd v252 D-Bus interface](https://github.com/systemd/systemd/blob/v252/man/org.freedesktop.systemd1.xml),
+[systemd control-group API](https://systemd.io/CONTROL_GROUP_INTERFACE/), and
+[systemd v252 cgroup delegation guide](https://github.com/systemd/systemd/blob/v252/docs/CGROUP_DELEGATION.md).
+
+The v252 D-Bus XML declares `GetUnitByInvocationID` and
+`GetUnitByControlGroup`, but comments that both methods are not documented; it
+also marks the `InvocationID` property undocumented. Do not treat these
+declarations as compatibility guarantees. The monitor should query the
+durable exact unit name and compare the returned `Id`, `InvocationID`,
+`ControlGroup`, `Slice`, and state with its receipt; any unavailable or
+mismatched identity keeps the attempt fenced. Required property readback must
+be tested for each supported systemd version, and reverse-lookup methods need
+an explicit version/behavior test before use.
+
+The recovery design must not use `systemd-run --scope` as a durable service: in
+v252 the command remains a child of the `systemd-run` client and the client
+waits synchronously for it. The selected two-service model is described in
+[`WORKER_LAUNCH_DRIVER.md`](WORKER_LAUNCH_DRIVER.md): the authenticated recovery
+monitor stays outside the exact attempt slice, and the launch-driver service
+inside the slice retains the local handle while its runc client remains in the
+driver cgroup. Runc creates the worker scope and container init inside the same
+attempt slice. The monitor routes authenticated cancellation to the driver and
+does not own or reconstruct its handle. No end-to-end lifecycle is yet
+integrated with `run_worker()`. The monitor and driver are intended to outlive
+an ACP supervisor-process restart while the same user manager remains active;
+that recovery property is not yet proven. For the user-manager deployment,
+verify the host's logout/linger and manager-restart behavior rather than
+assuming persistence across logout or reboot.
+The untrusted worker must never receive the host systemd bus socket or a route
+to the control API.
+
+`KillMode=control-group` covers one unit's control group, not an runc scope in
+the attempt slice; stopping the recovery-monitor service alone is therefore
+insufficient. The launch-driver must serialize launch, gate release,
+cancellation, wait/reap, and cleanup; authenticated monitor IPC may request
+status or cancellation but cannot replace the driver's local handle. The
+driver stops only the exact worker scope, never the enclosing attempt slice
+that contains the driver itself. An owner restart, missing or reused
+invocation, unexpected cgroup ancestry, or ambiguous cleanup must leave the
+execution fence held and prohibit result import. A sequential cgroup scan
+followed by stop is still only point-in-time evidence, not an atomic cleanup
+proof. The systemd recovery-monitor primitive and scoped IPC exist; launch-driver
+service-placement attestation has component and disposable live coverage. A
+production driver producer, monitor-before-launch wiring, driver/monitor IPC,
+and integrated worker lifecycle remain unimplemented. The earlier same-slice
+probe below is historical; the split-placement probe uses `/usr/bin/sleep` and
+does not prove driver-owned runc wait/reconciliation. Manager-restart recovery
+remains untested and OCI remains fail-closed. Sources:
+[systemd v252 `systemd-run`](https://github.com/systemd/systemd/blob/v252/man/systemd-run.xml),
+[systemd v252 unit dependencies](https://github.com/systemd/systemd/blob/v252/man/systemd.unit.xml),
+[systemd v252 resource control](https://github.com/systemd/systemd/blob/v252/man/systemd.resource-control.xml),
+and [systemd v252 `systemd.kill`](https://github.com/systemd/systemd/blob/v252/man/systemd.kill.xml).
+
+**Version-5 placement contract (2026-10-10; source tests only).** The running
+attestation and launch-plan version 5 now require the trusted wrapper/monitor
+cgroup to be disjoint from the exact per-attempt slice; only the runc scope is
+required to be a direct child of that slice. This rejects both a monitor inside
+the worker slice and a monitor cgroup that would own the worker slice. Older
+launch-plan versions remain readable for audit, but cannot enter the running
+phase under the new contract. Unit tests verify the accepted split and reject
+wrong-slice nesting. The opt-in disposable-VM probe below also validates the
+split cgroup placement and monitor survival at the systemd primitive level.
+There is still no integrated service launcher or production monitor, and the
+public `run_worker` OCI route remains fail-closed.
+
+**Per-execution monitor control-key storage (2026-10-11; code-only).** The
+receipt/control-codec module now provides an atomic, durable 32-byte key store
+whose filename is derived from the full attempt, claim-token and execution
+identity. It rejects non-private directories, symlinks, unsafe metadata and
+malformed keys. A per-key advisory lock serializes cooperating callers, while
+the published secret remains bound to the exact attempt, claim token and
+execution identity. This is only a prerequisite: no monitor service or
+controller calls it yet, the worker-mount exclusion is a caller obligation, a
+same-host-UID process remains in the trust boundary, and lifecycle key cleanup
+is not integrated. It does not establish monitor-owned runc execution,
+reconnect, authentication delivery, or cleanup.
+An abrupt exit after the temporary key is fsynced but before publication can
+leave a private temporary key file. A subsequent helper call acquires the
+per-key lock, removes only a safe private single-link temp for that identity,
+and then loads an already-published key or creates one. A published two-link
+orphan is preserved for the existing same-inode recovery path. The empty
+mode-0600 lock file remains until lifecycle cleanup is wired.
+
+**Historical same-slice stop propagation probe (2026-10-09; opt-in regression).**
+The systemd v252 resource-control contract says units assigned with `Slice=`
+automatically acquire `Requires=` and `After=` dependencies on that slice;
+systemd v252 says a unit with `Requires=` is stopped when its required unit is
+explicitly stopped. Therefore stopping only the wrapper service is insufficient,
+but stopping the exact attempt slice is expected to stop both its monitor service
+and sibling runc scope. This is dependency propagation, not `KillMode=` reaching
+across unit cgroups. Sources:
+[v252 resource control](https://github.com/systemd/systemd/blob/v252/man/systemd.resource-control.xml),
+[v252 unit dependencies](https://github.com/systemd/systemd/blob/v252/man/systemd.unit.xml),
+and [v252 kill behavior](https://github.com/systemd/systemd/blob/v252/man/systemd.kill.xml).
+
+A bounded probe in the task-owned, no-host-mount Lima VM (Lima 2.2.1 VZ,
+Ubuntu 24.04 ARM64, Linux 6.8.0-142, systemd 255.4, active user manager,
+cgroup v2) started a transient service and sibling scope using the candidate
+`user-acp-<sha256>.slice` name. Before stop, systemd-reported `Slice=` values
+matched exactly and both `ControlGroup` paths were direct children of the slice
+`ControlGroup`; each had a non-empty `InvocationID`. Stopping that slice returned
+success. In the recorded opt-in test run, all three units became inactive, each
+recorded cgroup was empty or absent, and the `systemd-run --scope` client exited
+with `-15` (SIGTERM). The regression requires the client to exit before its
+timeout but does not require a particular exit code. It does not assert that
+post-stop `InvocationID` or `ControlGroup` properties are cleared or that the
+cgroup directories are removed. The test-only processes were `/usr/bin/sleep`
+with a 45-second runtime ceiling; exact units were explicitly stopped in a
+finally cleanup as well.
+
+**Split monitor/worker slice probe (2026-10-10; opt-in regression).** The
+updated opt-in test assigns the transient trusted service to `app.slice` and a
+separate transient scope to the generated `user-acp-<sha256>.slice`. The
+service's exact `InvocationID`, `MainPID`, and `ControlGroup` were durably
+recorded; a fresh controller reconciled those values after the creating
+controller received `SIGKILL`. On the disposable no-host-mount Lima VM (Lima
+2.2.1 VZ, Ubuntu 24.04 ARM64, Linux 6.8.0-142, systemd 255.4, Python 3.12.3,
+active user manager, cgroup v2), the opt-in test passed (3 passed). Systemd
+reported the service directly under `app.slice` and the scope directly under
+the exact attempt slice. Stopping the attempt slice made the scope inactive
+and emptied its cgroup while the monitor service remained active with its
+recorded identity and a populated cgroup; explicitly stopping the monitor then
+emptied its cgroup too. In the recorded run, the scope client exited `-15`
+(SIGTERM); the test requires exit before timeout, not that exact code. The
+service and payload are still `/usr/bin/sleep`, and the controller starts the
+scope independently: this proves cgroup placement, controller-crash receipt
+reconciliation, and slice-stop survival only—not monitor-owned wait/reaping,
+OCI enforcement, production cleanup verification, supervisor recovery, or
+result transfer.
+
+`tests/test_systemd_slice_integration.py` records this as an opt-in regression
+(`ACP_RUN_SYSTEMD_SLICE_INTEGRATION=1`). It is not part of default CI and does
+not by itself prove runc-created scope behavior, race-free cleanup,
+manager-restart recovery, or `run_worker` integration.
+
+**Exact-floor follow-up (systemd 252.39; 2026-10-09).** The same opt-in probe
+was run from the exact test file in a disposable Lima 2.2.1 VZ Debian 12 ARM64
+guest with `mounts: null` (no host-shared mounts), Linux 6.1.0-53-cloud-arm64,
+cgroup v2, and an active user manager. The guest reported
+`systemd 252 (252.39-1~deb12u2)`. Before stopping the candidate slice, the test
+observed the service and sibling scope assigned to that slice, direct-child
+`ControlGroup` paths, invocation IDs, and populated cgroups. After the stop, the
+slice, service, and scope were inactive; all three recorded cgroups were empty
+or absent; and the scope client exited `-15` (SIGTERM). A separate post-run
+check found the service and scope not loaded, the slice inactive, no
+`/usr/bin/sleep 45` process, and no cgroup directory for the probe slice. The
+guest copy matched the host test SHA-256
+`50198c007b9354dc18f9e2cd75d994d51ca5528e2d8f0cb27d76c7f8fd9cd28f` and
+`oci_worker.py` SHA-256
+`8770605a9dd64ecdd5a167b619462c349d53aae0b7bb59ad08688e202ca0011c`.
+
+This adds live coverage of the unit-dependency/teardown behavior on systemd 252
+as well as 255. It still does not prove runc-created scope behavior, race-free
+cleanup, manager-restart recovery, or `run_worker` integration. After any stop
+request, the integrated executor must independently confirm the exact attempt,
+service, and scope invocation identities and prove their cgroups empty before
+recording `cleanup_verified`.
+
+**Controller-crash receipt reconciliation probe (systemd 255; 2026-10-09).**
+The opt-in test was extended and run from an exact file copy in the disposable
+Ubuntu 24.04 ARM64 Lima guest above (Linux 6.8.0-142, systemd 255.4, active user
+manager, cgroup v2; no host-shared mounts). A short-lived controller started a
+systemd-owned transient service running only `/usr/bin/sleep 45` in a unique
+attempt slice, then atomically persisted and `fsync`ed a private receipt with
+the exact unit, `InvocationID`, service and slice `ControlGroup`, `MainPID`, and
+controller PID. The parent waited for the post-directory-`fsync` acknowledgment,
+required that PID to match the process handle, then sent `SIGKILL` to that
+controller. A fresh Python process reconciled the receipt against systemd's
+reported unit properties,
+including the unchanged `InvocationID`, `ControlGroup`, `Slice`, and `MainPID`,
+and verified the service cgroup was a direct child of the recorded slice and
+the recorded PID still existed. The probe next started a sibling scope and
+stopped the exact attempt slice; all three units became inactive, all recorded
+cgroups were empty or absent, and the scope client exited `-15` (`SIGTERM`).
+The guest test file matched host SHA-256
+`3d37f45f1b83c9be338f8869280b09c3813d899c55903992732c0561f3123670`. A
+post-run inspection found no probe service/scope, `/usr/bin/sleep 45` process,
+or hashed attempt-slice cgroup. The test finalizer also checks each exact unit's
+non-active/absent state and any recorded cgroup; inability to prove cleanup
+fails the probe.
+
+This demonstrates only that this systemd-owned placeholder service and its
+exact receipt survived abrupt exit of a separate controller process without
+intentionally restarting the user manager, and that stopping the recorded slice
+tears down its service and sibling scope in this test environment. The test
+checks manager availability before launch and uses it again for reconciliation;
+it does not independently attest manager identity across those steps. It does
+not test ACP supervisor restart, a monitor daemon that owns/waits for runc,
+systemd manager restart/logout/reboot, a concurrent cleanup race, runc-created
+scope behavior, or `run_worker` integration. The opt-in test is not default CI
+and does not authorize setting `cleanup_verified`; OCI remains fail-closed.
+
+**PID-start-identity receipt revalidation (2026-10-10; exact-source replay).**
+Receipt schema v3 records the Linux process identity
+`linux:<MainPID>:<starttime>` using ACP's PID-reuse-resistant process helper.
+Receipt parsing rejects malformed or PID-mismatched identities, and a fresh
+reconciler compares the current process start identity after checking the
+systemd-reported unit identity. A deterministic regression keeps all mocked
+systemd properties, including `MainPID`, unchanged while changing the start
+identity; reconciliation rejects it. This simulates PID reuse at the identity
+boundary, not actual kernel PID reuse.
+
+The exact updated test file and package wheel were replayed in the disposable
+no-host-mount Lima guest above (Ubuntu 24.04.5 ARM64, Linux 6.8.0-142,
+systemd 255.4, Python 3.12.3, active user manager, cgroup v2). The test file
+SHA-256 was
+`282427fbbe67345ee3d8c404c35a110ce3cc55c7cbe7344e2469fe76e1f966f0` and the
+package wheel SHA-256 was
+`b285d3c387b36acb05652d63b331f2e27f40d5ac57e679607cf336fb68a82134`; both
+matched between host and guest. The opt-in pytest passed (1 passed), and a
+direct script replay returned `monitor_reconciled_after_controller_sigkill`,
+`monitor_survived_worker_slice_stop`, and `cgroups_empty` as true. The unique
+service and scope became `not-found`/`inactive`, the attempt slice became
+`inactive`, their three recorded cgroup paths were absent, the recorded monitor
+PID was absent, and the scope client exited `-15` (`SIGTERM`). The host's exact
+commit `ad63e2d` also passed all four Ubuntu/macOS × Python 3.11/3.12 CI jobs
+(run `38085103683`). This is still a `/usr/bin/sleep 45` placeholder and
+controller-process recovery only: it does not prove kernel PID reuse,
+fencing-epoch binding, an ACP monitor owning runc, cleanup/result-import
+integration, manager restart/logout/reboot recovery, or `run_worker`; OCI
+remains fail-closed.
+
+**Systemd monitor MainPID binding (2026-10-10; source-level gate).** The
+trusted runtime collector now requests `MainPID` for the wrapper service and
+requires it to equal the expected monitor PID. Existing procfs observations
+then bind that PID to its kernel start identity and the service cgroup; absent
+or mismatched `MainPID` fails attestation. Slice and scope queries do not ask
+for the service-only property. Unit regressions cover missing and mismatched
+values and verify the collector requests it only for the wrapper. This closes
+the attestation ambiguity where another process in the same wrapper cgroup
+could be passed as the monitor. The collector re-queries all three exact units
+after process and cgroup sampling, requires systemd properties to be byte-identical,
+then rechecks process membership and resource controls before issuing collector
+provenance. At the journal's gate-release boundary, the same launch-gate lock
+now protects another exact wrapper/slice/scope property read, including wrapper
+`MainPID`; drift leaves the row at `launched` and the one-shot gate closed.
+Systemd, procfs, and cgroup reads remain sequential, not an atomic snapshot; an
+ABA transition or change after the final read is not ruled out. This narrows the
+observation window, not a kernel-level race. It does not establish that a
+production launch-driver owns or waits for runc, that the recovery monitor is
+crash-recoverable, or that either service is connected to `run_worker`; OCI
+remains fail-closed.
+
+**Gate-release systemd identity recheck (2026-10-10; exact-source live replay).**
+The journal now re-reads the exact wrapper service, attempt slice, and runc
+scope while holding the launch-gate lock, immediately before the durable
+`launched` to `running` transition and one-shot gate authorization. A new
+opt-in regression starts unique transient units under the disposable user
+manager, builds a self-consistent test receipt from their live unit properties
+and process snapshots, accepts the original identities, restarts the wrapper,
+and requires the old receipt to fail with `sandbox_runtime_attestation_stale`.
+Its runc-state and resource-limit bytes are fixtures: this proves the trusted
+`systemctl` observation path and replacement rejection, not a live runc launch
+or resource enforcement. The test's `finally` gate stops the exact scope,
+attempt slice, and wrapper and verifies their cgroups empty or absent.
+
+The exact test and source copy ran in the no-host-share Lima 2.2.1 VZ guest
+`acp-sandbox-monitor-20261010` (Ubuntu 24.04.5 LTS ARM64, Linux 6.8.0-142,
+systemd 255.4, Python 3.12.3, active user manager, cgroup v2). The live test
+alone passed (`1 passed, 4 deselected`) in 0.18 seconds; the complete opt-in
+systemd test file passed (`5 passed`) in 0.50 seconds. The test file SHA-256 was
+`94eb48cc486c1e174d697ec01767701576a257f52a7a52bb74359773fbbba7e9`; the
+48-file `src/agent_control_plane` Python-source manifest SHA-256 was
+`d59e1d78a9150a5c2a962831b4d35aef9d82bfb5f34e88f0b2c5d6cdf24ab710` on both
+host and guest. The test cleanup asserts that each exact unit is no longer
+active/activating/deactivating and each recorded cgroup is empty or absent. A
+separate postflight `systemctl --user list-units --all` query found no loaded
+probe service or scope; that loaded-state observation is not an assertion in
+the test. This remains a test of the systemd verifier in isolation: it does
+not establish durable monitor recovery, production cleanup verification, real
+runc scope behavior, result import, or `run_worker` integration. OCI remains
+fail-closed.
 
 **OCI policy compiler slice (2026-10-04; not integrated).** The new
 `supervisor/oci_worker.py` compiles an OCI 1.2 config and an attached `runc`
@@ -1428,15 +3432,19 @@ unique state root listed no container, both sampled init PIDs were absent, and
 the leased scratch tree was removed. This paired observation attributes that
 single listener socket-creation denial to the generated profile in this setup;
 it does not establish broader egress control, other syscall rules, cgroup or
-device enforcement, or worker isolation. The integrated-worker and per-rule
-runtime gates below remain open.
+device enforcement, or worker isolation. At this point in the record
+(2026-10-04), the integrated-worker and per-rule runtime gates were still
+open; later scoped evidence and the current status are noted below.
 
 This does not prove that ACP persists either systemd invocation, captures an
 attached runc exit receipt, coordinates cancellation/recovery across supervisor
 restart, or safely releases its execution/result-import fences. It also does
-not prove credential or provider egress policy. Worker execution is still
-direct-host with bounded log capture only; no OCI filesystem isolation is
-integrated, and `externalSandbox` remains disabled.
+not prove credential or provider egress policy. At the time this paired probe
+was recorded (2026-10-04), worker execution was still direct-host with bounded
+log capture only; OCI filesystem isolation had not yet been integrated into
+`run_worker()`, and `externalSandbox` remained disabled. The later experimental
+no-model `run_worker()` isolation/result-import proof is recorded in
+[`WORKER_LAUNCH_DRIVER.md`](WORKER_LAUNCH_DRIVER.md).
 
 ## Required proof gates
 
@@ -1458,9 +3466,12 @@ integrated, and `externalSandbox` remains disabled.
   for the same fencing epoch and refused for a later one. Only a valid bounded
   diff may reach the existing QC path.
 - **Lifecycle:** test cancellation, abrupt supervisor restart, timeout,
-  failed systemd setup, stale unit, and concurrent attempts. A missing or
-  ambiguous unit identity is `unknown` and retains the fence; it is not cleanup
-  proof. After a stopped container, explicitly run `runc delete` and verify
+  failed systemd setup, stale unit, and concurrent attempts. Separately test
+  controller death while the system manager stays live and the selected
+  `systemd --user` manager's logout/linger lifecycle on a disposable host; a
+  manager shutdown or vanished unit is not proof of worker cleanup. A missing
+  or ambiguous unit identity is `unknown` and retains the fence; it is not
+  cleanup proof. After a stopped container, explicitly run `runc delete` and verify
   that its exact ID is absent from the configured runc state root and its
   cgroup/unit is absent before releasing the fence. Preflight every required
   cgroup controller and verify configured resource limits by reading them back
@@ -1471,12 +3482,22 @@ integrated, and `externalSandbox` remains disabled.
   can be contacted. Do not make a paid inference call for this no-model proof.
 - **Release gate:** independent criterion-level adversarial QC, focused and full
   supported test suites, lint/format/package build, and exact-head Linux/macOS
-  CI must pass. Keep the feature disabled by default and do not claim worker
-  read isolation until every gate is met.
+  CI must pass. Keep the experimental OCI route disabled by default and do not
+  claim worker read isolation until every gate is met.
 
-Until then, the supported claim is narrower: ACP's resource driver can create a
-constrained systemd unit around a configured payload on the measured NAS; the
-supervised coding worker still executes directly in its registered worktree.
+**Current status (2026-10-22):** an explicit
+`sandbox_experimental_opt_in=True` route has been exercised through
+`WorkersMixin.run_worker()` and the OCI launch driver with a no-provider/no-model
+task and the required resource limits and pinned runc/rootfs inputs; scoped
+exact-host isolation probes and validated result-import evidence are recorded in
+[`WORKER_LAUNCH_DRIVER.md`](WORKER_LAUNCH_DRIVER.md). This remains an
+experimental, scoped capability, not provider-ready or general sandbox proof.
+Omitting the opt-in while `sandbox.oci` is configured remains fail-closed. When
+OCI is not configured, the pre-existing direct-host worker path can still run
+on Linux with process-tree containment but without OCI filesystem isolation.
+Provider authentication/destination-restricted egress and broader
+supervisor-daemon crash/restart recovery, logout/linger, and reboot acceptance
+remain open; do not mark the parent task complete.
 
 ### Pinned runc recursive-propagation adapter (2026-10-05)
 
@@ -1514,3 +3535,940 @@ for explicit no-model host-path diagnostics and is not a safe worker launch
 path. Do not connect either low-level launcher to `run_worker`: lifecycle,
 runtime attestation, cleanup, result-import, credential, and provider-egress
 safety remain separate open gates.
+
+### Exact-source rootless OCI boundary recheck (2026-10-11; pass)
+
+On the dedicated Lima VM `acp-oci-qc-20261009` (Ubuntu 24.04.5 LTS ARM64,
+Linux 6.8.0-142-generic, systemd 255.4, Python 3.12.3, cgroup v2), the
+current opt-in `test_live_rootless_runc_enforces_minimal_worker_boundary`
+passed (`1 passed`) against the copied ACP Python-source manifest at test time
+`ebbd1b29e845c1b5fbd5556624d02d846a2caf09f1f9a4c3d7b11ed3468ab5e8` and
+test-source hash `4942bff7abed3b4e9b65562711cb2c3847b09b766539825f4da9d718a0e34b7c`.
+The test used BusyBox 1.36.1 and rootless runc 1.5.2. The upstream ARM64
+release binary matched SHA-256
+`d10ecae898361832a059be2089bab92d158aec54661b18ed7346ed79628b46b0`
+([runc v1.5.2 release](https://github.com/opencontainers/runc/releases/tag/v1.5.2)).
+An initial 1.3.5 run was rejected by ACP's version guard before worker launch;
+the existing runc binary was left untouched, and the test used a separate
+versioned executable. The VM denies unprivileged user namespaces when
+unconfined, but its already-loaded `lxc-unshare` AppArmor profile permits the
+namespace preflight; the opt-in test ran under that profile. The test's
+assertions covered the bounded no-model payload, mutable workspace, host/base
+and credential sentinels, symlink/path attacks, mount policy, process
+visibility, network isolation, cgroup controls, and cleanup. A separate exact
+`NamespaceRuntimeDriver` fake-agent integration also passed (`1 passed`): the
+payload ran in the private root, could not write its read-only workspace, and
+could still read host `/etc/os-release`, confirming that this resource driver
+is not itself the worker-read-isolation boundary; its test-source hash was
+`c6efabd7ecafde1691ad35e53f938c2bb176d436218c3bb6c7dac92c3d36622c`.
+The extra versioned runc executable and scratch checkout/venv were removed
+afterward; the VM's original runc 1.3.5 remained unchanged. The monitor-key
+hardening added after this run is outside the OCI fixture's exercised code.
+
+These are low-level OCI and resource-driver proofs, not registered-worker
+integration. The OCI test does not exercise `run_worker`, monitor ownership,
+durable journal transitions, provider authentication, Git/result transfer, or
+supervisor-restart cancellation/recovery. The configured-OCI `run_worker`
+route remains fail-closed, and the broader proof gates above remain open.
+
+### Explicit process and Git-metadata visibility follow-up (2026-10-15; pass)
+
+The direct-runc no-model fixture now starts a live host-only process with a
+unique command-line marker, verifies the marker through host `/proc` before
+launch, captures the candidate-visible `/proc/*/cmdline` entries inside the
+fresh PID namespace, and has the trusted test harness verify that a known
+in-container process-table control was captured, that the host marker is
+absent, and that the marked host process is still alive with the marker after
+the snapshot. Failed reads of extant `/proc` entries fail the probe; only
+entries that disappear during enumeration are skipped. The marker is not
+passed to the worker. The candidate-facing `/workspace` also fails closed if
+any `.git` file, directory, or symlink is present at launch; this establishes
+that the mounted file snapshot does not present shared Git administration or
+object metadata. This remains a primitive-level visibility proof, not an
+integrated result-transfer proof. The exact test passed twice (`1 passed` each)
+on the disposable Lima guest `acp-2370-live-sandbox-20261010` after the process
+assertions were added. After adding the `.git` visibility assertion, the full
+opt-in runtime-test module passed `47 passed in 5.69s`; the exact test-source
+hash is recorded below:
+Ubuntu 26.04.1 ARM64, Linux `7.0.0-38-generic`, Python 3.14.4, systemd 259.5,
+cgroup v2, rootless runc 1.5.2 (SHA-256
+`d10ecae898361832a059be2089bab92d158aec54661b18ed7346ed79628b46b0`). The
+audited toolchain was Ubuntu BusyBox 1.37.0 from package
+`1:1.37.0-7ubuntu1` (package SHA-256
+`ce7930cba8ab534f67e64229287863ba6c8f35a28831b5d6a8b2a5b81bdc480d`); the
+fixture copied only its executable and resolved loader/library closure into
+the private rootfs.
+
+Exact hashes for the exercised source are:
+
+| File | SHA-256 |
+| --- | --- |
+| `tests/test_oci_worker_runtime.py` | `7c311fa94b9a9ac7aebcdfacbceb25c8f50b0e201167b040e08ab152a6cfb857` |
+| `src/agent_control_plane/supervisor/oci_worker.py` | `bcd015a23f3bbd0293d6d8fc864f31e5add53bfad33c592588c3f6ce1191a90d` |
+| `src/agent_control_plane/supervisor/sandbox_attestation.py` | `f842834dfd47ac1bd124c36604e8124fc9f9b8e747128bc4cd6671d7f4afa9f0` |
+| `src/agent_control_plane/supervisor/sandbox_workspace.py` | `793ab9000dadd310af81867395f476bb69e7cb2e64d923f1b542277c992ce188` |
+| `src/agent_control_plane/runtime_drivers.py` | `ade6bbbec9bfdaaf3043a46e9957dba7692afd29421d3ebe9c1e70b62621c46c` |
+
+For this disposable guest only, rootless user-namespace creation required
+temporarily setting `kernel.apparmor_restrict_unprivileged_userns` from `1` to
+`0`; an exit/signal restore trap was installed first, and postflight confirmed
+the value returned to `1`. No AppArmor profile was applied, so this is not
+AppArmor-confinement evidence. The systemd user manager remained running. After
+the full module replay, postflight found no runc or host-marker process and no
+ACP test unit; the live test's own attempt tree was removed by its verified
+finalizer. Other synthetic roots left by the module's
+`test_private_attempt_tree_*` unit cases are not live attempts and were left
+untouched. No model, provider credential, paid inference, or NAS host was used.
+This adds explicit process-visibility evidence to the primitive-level probe
+only: it does not exercise `run_worker()`, monitor-owned cleanup, provider
+authentication/egress, crash recovery, or result import; configured OCI worker
+execution remains fail-closed.
+
+### systemd credential handoff primitive (2026-10-11; opt-in proof only)
+
+The supported systemd 252 contract provides `LoadCredential=`: a service reads
+the credential from a read-only file under `$CREDENTIALS_DIRECTORY`, with
+access limited to that unit's UID and root. The same version's documentation
+explicitly warns that unit environment variables are not a secret channel
+because they are exposed through D-Bus and propagated down the process tree.
+This makes `LoadCredential=` a viable *monitor-service handoff primitive*; it
+does not isolate secrets from other trusted processes running as the same host
+UID, and it does not permit the worker to inherit the credential directory or
+descriptor. See the pinned [systemd v252 execution
+contract](https://github.com/systemd/systemd/blob/v252/man/systemd.exec.xml#L2259-L2266)
+and [credential contract](https://github.com/systemd/systemd/blob/v252/man/systemd.exec.xml#L2717-L2735).
+
+`test_live_systemd_loadcredential_is_read_only_and_not_environment` now
+performs an opt-in no-model test with a randomly generated fake value in the
+dedicated disposable VM. On Ubuntu 26.04.1 ARM64, Linux 7.0.0-34, Python 3.14.4,
+systemd 259.5, cgroup v2, and a running user manager, the exact copied test
+source (SHA-256
+`d086b4de4ad7b6916b0c5d657c829fe4808993d9d94d8bf87a599bffcf62740f`) passed
+(`1 passed in 0.10s`). The child read the credential, verified the per-unit
+file was read-only and user-owned, and returned only its digest and boolean
+checks; the test also checked that the value was absent from the child
+environment and `systemd-run` output. It captures the exact live unit,
+invocation, process identity, and cgroup before stopping the service; cleanup
+requires the exact transient unit to become `not-found`, the captured process
+identity to be absent, and captured cgroups to be empty. The private fixture is
+retained if any of those checks fail. Post-run inspection found no transient
+unit, process, cgroup, or fixture directory. This proves systemd's
+credential-file transport only—not provider authentication, worker access
+separation, secret rotation, or the production monitor path, which does not
+yet use `LoadCredential=`.
+
+Do not equate `Restart=on-failure` with ACP recovery. systemd documents restart
+as a stop followed by a start and subjects it to start-rate limits; the monitor
+must re-read the exact journaled fencing epoch and reconcile the exact units
+before it can observe or cancel a worker. A service restart must never blindly
+repeat the launch request. The service's credential-source lifetime and
+restart behavior is now tested on exact systemd 252.39 below. Monitor-owned
+`RuncLaunchHandle` lifecycle and registered-worker integration remain open.
+See the pinned [systemd v252 service restart
+semantics](https://github.com/systemd/systemd/blob/v252/man/systemd.service.xml#L493-L495)
+and [restart rate-limit behavior](https://github.com/systemd/systemd/blob/v252/man/systemd.service.xml#L818-L823).
+
+**Credential source lifetime and restart fail-closed proof (2026-10-11; systemd
+252.39).** The opt-in
+`test_live_systemd_loadcredential_restart_requires_source_again` ran twice in a
+new no-host-share Lima 2.2.1 VZ Debian 12 ARM64 guest: kernel
+`6.1.0-53-cloud-arm64`, systemd `252.39-1~deb12u2`, Python 3.11.2, pytest 9.1.1,
+and cgroup v2. The exact test-file SHA-256 was
+`de735a8d37a8b6c5a8cd3e636285474c03bfd58b5d5a17022d48da435c447930`; both
+opt-in runs passed. It used only a random fake value and a private mode-0700
+fixture. After the first service process was active, the test unlinked the
+identity-checked source, let that process read the same credential copy again,
+and then forced an exit to exercise systemd's automatic restart. The child
+reported only the digest and boolean checks: its credential stayed unchanged
+and read-only and the fake value was absent from its environment. systemd
+recorded an automatic restart and failed at `CREDENTIALS` (`243/CREDENTIALS`)
+before a second worker process ran; the fixture's process-start marker contained
+exactly one activation. This matches systemd's contract that credentials are
+acquired at activation, immutable while the service runs, and released on
+deactivation ([systemd v252 service credentials](https://github.com/systemd/systemd/blob/v252/docs/CREDENTIALS.md#system-and-service-credentials)).
+
+Post-run checks found no transient unit, populated cgroup, original process
+identity, or fixture directory. This closes only the systemd credential
+transport/lifecycle primitive: ACP's production monitor still does not use
+`LoadCredential=`, and this does not isolate credentials from other trusted
+processes under the same host UID, prove provider authentication, or wire the
+monitor into `run_worker()`. Keep configured OCI worker execution fail-closed.
+
+### Namespace resource payload receives a scoped fake credential (2026-10-15; opt-in proof)
+
+The opt-in `test_live_namespace_runtime_hosts_payload_but_exposes_worker_boundary_gaps`
+passed 1/1 on disposable Lima guest `acp-2370-live-sandbox-20261010`:
+Ubuntu 26.04.1 ARM64, Linux `7.0.0-38-generic`, Python 3.14.4, systemd
+259.5, and cgroup v2. The exact test source SHA-256 was
+`3c2f970b21a45893acc9b7dab4288af32955dceca27deda5f2e077bd627f3203`; its
+shared test helper was `25e1516836fb491e0723d6cfb23edd672bbb2f97c0dc534bedbe98dffb9a253d`,
+and the unchanged `runtime_drivers.py` loaded in the guest was
+`ade6bbbec9bfdaaf3043a46e9957dba7692afd29421d3ebe9c1e70b62621c46c`.
+
+Using a random fake pgpass value and the existing `CredentialRegistry`, the
+real `NamespaceRuntimeDriver` materialized a descriptor-backed credential for
+systemd `LoadCredential=` and bind-mounted only `/credential` read-only into
+its private namespace root. The test removed the source after unit activation;
+the delayed payload still read the matching digest. A write attempt failed,
+the credential path was the only worker-visible channel, and
+`CREDENTIALS_DIRECTORY` was absent from the payload environment. The raw fake
+value was absent from launch argv/environment, the process argv/environment,
+captured launch/probe output, the worktree/runtime fixture, and the scoped
+temporary tree after teardown. Exact unit absence and cleanup were verified;
+the test does not inspect systemd's internal credential backing path directly.
+The guest's `kernel.apparmor_restrict_unprivileged_userns` setting was
+temporarily changed from 1 to 0 for this disposable run and restored to 1;
+this is not AppArmor confinement evidence. Postflight found no matching ACP
+units or `unshare` processes, no worktree fixture, and no D-state processes.
+
+This proves the resource-driver credential handoff primitive only. It does not
+prove provider authentication, secrecy from same-host-UID or root actors,
+production `run_worker()` integration, or result/recovery lifecycle. A separate
+unit test deletes the retained credential source and confirms setup fails before
+any systemd worker unit is submitted. No real provider secret, model inference,
+or paid call was used; configured OCI worker execution remains fail-closed.
+
+### No-model sandbox output collection gate (2026-10-15; opt-in proof only)
+
+The exact test source SHA-256
+`be106719ac42c9f87f187072b570513e888ca63098253f17bce56d2b2ceedc5e`
+passed the complete `test_sandbox_worker_lifecycle_integration.py`
+module (3/3) on the dedicated disposable Lima guest: Ubuntu 26.04 ARM64,
+kernel 7.0.0-38-generic, Python 3.14.4, systemd 259.5, cgroup v2, BusyBox
+1.37.0, and rootless runc 1.5.2 (SHA-256
+`d10ecae898361832a059be2089bab92d158aec54661b18ed7346ed79628b46b0`).
+No model, provider, or credential was used.
+
+The worker checked that `/workspace/.git` and its HEAD were absent,
+then wrote two disposable result paths declared by the persisted task. The
+host collector derived its write-set matcher from that persisted task,
+validated the exact output bytes, and produced a bounded change-set digest. A
+separate undeclared-output probe was rejected with `undeclared_write` and
+removed. After the run, a fresh safe snapshot of the registered source
+worktree matched the baseline manifest for all non-root-`.git` entries. The
+journal remained at `exited`; after candidate capture was rejected with
+`sandbox_result_evidence_unverified` because trusted cleanup had not been
+recorded, a second journal read confirmed phase `exited` and no stored result
+candidate. `cleanup_verified_written` remains false. This demonstrates
+bounded output scanning and preserves the import fence; it does not
+demonstrate successful result import, `run_worker()`, monitor-owned cleanup
+verification, cancellation/restart recovery, or provider credentials/egress.
+
+The guest's `kernel.apparmor_restrict_unprivileged_userns` was 1 and
+initially denied namespace creation. For this disposable test only, it was
+temporarily set to 0 and restored to 1 by an exit trap; postflight confirmed the
+restored value, no remaining ACP test units or fixture roots, and zero
+D-state processes. This run had no AppArmor profile applied to the monitor and
+is not evidence of AppArmor confinement or a production prerequisite policy.
+Keep configured OCI worker execution fail-closed.
+
+### Launch-driver-service cgroup attestation (2026-10-16 source contract)
+
+The current two-service architecture places the runc client in the deterministic systemd service
+`acp-launch-driver-{execution_id}.service`, derived from the reserved durable
+execution ID. The service must be active with a valid invocation ID, and its
+cgroup must be a direct child of that attempt's exact slice. The runc client
+PID/start-time identity is checked in the same cgroup. This is separate from
+the monitor's wrapper service/cgroup and the container init's runc scope.
+
+The collector reads the launch-driver service identity along with the wrapper,
+attempt slice, and runc scope, then re-reads them to reject drift. The journal
+compares the collector-issued service name against the durable execution ID
+both before and while holding the launch-gate lock; it rechecks process
+membership and all four systemd identities immediately before recording the
+running transition and authorizing the one-shot gate. A valid receipt for a
+different reserved-prefix service is stale and cannot release the gate.
+
+Schema 29 durably records the launch driver's PID and kernel start identity,
+unit, systemd invocation ID, and exact cgroup path on the `launched -> running`
+transition. The fields are write-once and must be complete before the phase can
+become `running`; the generic transition helper rejects that phase change.
+`record_running()` holds the launch-gate lock while rechecking live resource,
+process-membership, and systemd identities, then opens the SQLite transaction to
+recheck durable row and receipt bindings before writing the phase and event. It
+authorizes the one-shot gate only after that transaction commits. Legacy rows
+are not backfilled and do not become qualified by migration alone. At the
+source revision tested for this dated entry, these durable process-local
+integrity checks did not prove that `run_worker()` launched all task code
+inside the OCI boundary described here.
+
+The opt-in live runc lifecycle test passed on the disposable Ubuntu 26.04
+ARM64 / Linux 7.0.0-38 / Python 3.14.4 / systemd 259.5 / cgroup v2 guest with
+rootless runc 1.5.2 and BusyBox 1.37.0. The complete opt-in systemd slice
+integration module passed 8/8 on the same guest. SHA-256 of the exact source
+and test files copied to and run in that guest:
+
+| File | SHA-256 |
+| --- | --- |
+| `sandbox_attestation.py` | `f842834dfd47ac1bd124c36604e8124fc9f9b8e747128bc4cd6671d7f4afa9f0` |
+| `sandbox_execution_journal.py` | `cae1b00f54032fe334d50bc696c30d1fe7b0a670bde1efceca8f785e7f217c96` |
+| `sandbox_monitor_service.py` | `90f42cc0191845465d65acc3d1a6e441ca3dc85fa1b3d966466706383b4c3e20` |
+| `test_sandbox_worker_lifecycle_integration.py` | `3aa8bddfd31344d20e19ff72b4f95bf90c40de505e1c9e0c2cdaa6982514625f` |
+| `test_systemd_slice_integration.py` | `2cff01f66464fd6ad9d966fb5b9c67887f4c690a9b4edf417f1b124a481601d8` |
+
+Postflight confirmed the guest manager remained running, the temporary
+`kernel.apparmor_restrict_unprivileged_userns` change was restored to `1`, and
+no fixture roots, ACP test units, or D-state processes remained. These live
+tests prove the attested systemd/runc launch boundary and its negative cases;
+they do not qualify `run_worker()`, which remains fail-closed.
+
+This records the current attestation contract and closes the arbitrary-sibling-
+cgroup gap for the launch client. Separate live production-launch-driver tests
+exercise the real start API at two crash points: after the gated runc scope
+exists but before monitor activation, and after monitor acceptance but before
+the durable `launched` receipt. The first proves the monitor unit remains
+`not-found` before and after fresh reconciliation; the second verifies the
+exact monitor unit/process/cgroup becomes quiescent as part of fail-closed
+containment. These cases do not establish
+general or reaper-driven monitor cleanup, recovery after arbitrary driver
+crashes, worker registration through `run_worker()`, provider isolation, or
+end-to-end `run_worker()` acceptance. Configured OCI worker execution remains
+disabled; both crash cases keep cleanup verification absent and fences
+retained (see
+[WORKER_LAUNCH_DRIVER.md](WORKER_LAUNCH_DRIVER.md#live-monitor-accepted-pre-receipt-launch-driver-crash-2026-10-16)).
+
+### Production monitor producer and controller reconnect (2026-10-15)
+
+The opt-in
+`test_live_production_monitor_service_survives_controller_crash_and_cancels_exact_scope`
+passed (`1 passed`) on the dedicated disposable Lima guest: Ubuntu 26.04 ARM64,
+Linux 7.0.0-38-generic, Python 3.14.4, systemd 259.5, cgroup v2, and a running
+user manager. The test started the in-repo monitor service for a unique,
+no-model `/usr/bin/sleep` scope; checked exact scope/slice invocation and cgroup
+identity plus key-file permissions and absence from the receipt, monitor
+command line, and environment; killed the starting controller; reconnected
+through the durable receipt; observed the exact running scope; canceled it;
+replayed the same cancellation ID; and verified the scope and cgroup were
+inactive/empty. The fixture's `finally` path verified the exact unit
+activations and removed its private temporary directory. No model, provider,
+paid call, or external credential was used.
+
+The source files copied into the guest matched the host worktree byte-for-byte:
+
+| File | SHA-256 |
+| --- | --- |
+| `oci_worker.py` | `bcd015a23f3bbd0293d6d8fc864f31e5add53bfad33c592588c3f6ce1191a90d` |
+| `sandbox_execution_journal.py` | `1e74e092d316bd4c3eac4553c25e668d521a87d042142f2e83a5a6a56f876258` |
+| `sandbox_monitor_ipc.py` | `b9147858a1cd30f04bb9273f6f26b9382970414366f929cb526525941b48fead` |
+| `sandbox_monitor_service.py` | `2bdc15107039447422c5d24f5970eb7a651d59f58f04a4d48ae511ca6aaf1058` |
+| `sandbox_monitor_lifecycle.py` | `b00dd5c714890aee467f6a2ab187ae1b12847780eaf5c004532dbd17fe4fb5db` |
+| `sandbox_monitor_receipt.py` | `ce03104fd7132baf8c8b34e5d45421c8dd899ac7bc35a60373191b3d1810af66` |
+| `workers.py` | `4a9dc7c87c351dbbe2c62e0964627096f2f33182136d8a14bbe353cec856d92e` |
+| `test_systemd_slice_integration.py` | `2cff01f66464fd6ad9d966fb5b9c67887f4c690a9b4edf417f1b124a481601d8` |
+
+Postflight found the AppArmor user-namespace setting restored to `1`, no
+failed or active ACP units, no ACP monitor processes or sockets, and no
+`acp-production-monitor-*` fixture. This proves the in-repo monitor producer,
+authenticated durable-receipt reconnect, exact-scope cancellation, and
+idempotent cancel replay. It does not prove the supervised worker boundary,
+provider credential/egress policy, validated result import, or production
+`run_worker()` integration; configured OCI worker execution remains
+fail-closed.
+
+### Rootless worker CONNECT, direct-egress denial, and hidden host Unix socket (2026-10-15; pass)
+
+The focused opt-in live test passed 1/1 on the disposable Lima guest
+`acp-2370-live-sandbox-20261010`: Ubuntu 26.04.1 ARM64, Linux
+`7.0.0-38-generic`, systemd 259.5, Python 3.14.4, pytest 9.1.1, cgroup v2,
+and rootless runc 1.5.2. The full opt-in `tests/test_oci_worker_runtime.py`
+module passed **48/48** on the same test source in 11.11s. The runc executable
+was the preinstalled root-owned `/usr/local/bin/runc-1.5.2` release binary with SHA-256
+`d10ecae898361832a059be2089bab92d158aec54661b18ed7346ed79628b46b0`.
+
+The worker connected to the attempt's mode-0600 Unix proxy socket through a
+read-only `nosuid,nodev,noexec` bind mount and issued a syntactically valid
+HTTP CONNECT for `api.example.com:443`. The production CONNECT parser, exact
+host/port policy, numeric-address classifier, and peer authorizer handled that
+request. The test-only resolver returned the public numeric address
+`8.8.8.8`; a test-only dial hook redirected that vetted endpoint to a local TCP
+fixture that exchanged opaque sentinel bytes with the worker. The loopback
+fixture is not selectable by production policy, and the sentinel exchange is
+not a TLS handshake or provider-SDK test. A same-UID host peer connected to the
+same socket but fell outside the exact worker cgroup; the real peer-PIDFD,
+UID/GID, and cgroup checks rejected it with HTTP 403 before resolver or dial
+invocation. The recorded resolver/dial call counts contained only the worker's
+single approved CONNECT.
+
+The same live worker reported `Seccomp: 2`. Its `/proc/<pid>/net/route` and
+`ipv6_route` contained no usable route beyond loopback; this kernel emitted an
+IPv6 `::/0` sentinel on `lo` with the UAPI `RTF_REJECT` and `RTF_NONEXTHOP`
+flags, which the test accepts only as an explicit reject route. Before using
+the proxy, the worker attempted to create IPv4 and IPv6 TCP and UDP sockets;
+all four returned the configured `EPERM` and emitted required test markers.
+Blocking both UDP families prevents a direct DNS transport, while blocking TCP
+prevents direct host-loopback/service connections. No direct DNS query or host
+service connection was attempted. Before creating its proxy connection, the C
+probe enumerated `/proc/self/fd` and found no inherited socket descriptors. The
+worker's subsequent AF_UNIX CONNECT exchange succeeded. A separate live,
+mode-0600 host Unix socket was created outside the only bind-mounted socket
+directory; a host control client connected to it successfully. Inside the
+worker, the same absolute path was checked with `lstat` and `connect`; both
+returned `ENOENT` because the worker's private `/tmp` tmpfs did not expose that
+host path. The probe then completed the designated proxy CONNECT. This proves
+that this exact fixture hides an active, unmounted host socket while allowing
+the approved path. It does not prove AF_UNIX is denied (it is intentionally
+permitted for the proxy), that a future executor cannot expose another socket
+by mounting it, or the full production "only this capability" gate. This is a
+single-tenant test: its private host fixture paths and path-based teardown
+assume no concurrent same-host-UID process mutates those paths. Hostile same-UID
+filesystem isolation is not established.
+
+The encrypted-redirect regression was separately replayed in this same guest:
+`tests/test_provider_proxy.py::test_tls_redirect_requires_a_second_connect_and_only_that_authority_is_denied`
+passed 1/1 in 0.04s. The test client validates a generated local TLS certificate,
+receives a `302` for `https://blocked.example/redirected` inside TLS from the
+allowed `api.example.com:443` tunnel, and then explicitly sends a second CONNECT
+for `blocked.example:443`. The proxy returns 403 for that second authority
+before DNS or dial; the only resolver/dial calls are for the first allowed
+CONNECT. DNS and the numeric dial are test-injected, with the dial redirected
+to the local TLS fixture. The worker-facing side in this test is a socketpair,
+not an OCI worker process: this demonstrates the proxy/client CONNECT contract,
+not an application's redirect-follow behavior in the sandbox or provider
+authentication. It does not imply that the proxy inspects redirects inside TLS.
+
+The deterministic production-policy tests also check final IPv4/IPv6 resolver
+answers and numeric pinning. In
+`tests/test_provider_egress.py::test_connect_uses_vetted_numeric_sockaddr_without_second_dns_lookup`
+(source SHA-256 `1d384fba0ebb116cb2e19c466e67bde1a3922f94ad9f2569fbe00891c4fec042`),
+the fake resolver returns `8.8.8.8` first and would return `127.0.0.1` if called
+again; the test asserts one absolute-host `getaddrinfo` invocation and a fake
+socket `connect()` receiving the first numeric sockaddr. This is a deterministic
+no-second-lookup regression trap, not a live DNS-rebinding test.
+The companion
+`test_connect_fallback_uses_only_prevalidated_numeric_pins` test makes the
+first fake socket fail, then verifies the next attempt uses the previously
+validated IPv6 sockaddr, closes the failed socket, and does not invoke the
+resolver again (whose hypothetical next answer is loopback). Both tests use
+fake sockets and prove no provider connection or network reachability.
+
+The opt-in `test_system_resolver_follows_cname_and_policy_pins_a_and_aaaa` was
+also run in this disposable guest, root-owned inside private mount and network
+namespaces. Its isolated `resolv.conf` and `nsswitch.conf` point `getaddrinfo`
+only at a loopback DNS fixture. Each `api.example.com` response contains the
+CNAME to `gateway.test` and, in that same DNS answer, the matching target
+record: A `8.8.8.8` for an A query or AAAA `2606:4700:4700::1111` for an AAAA
+query. The same fixture resolves `mixed.example.com CNAME mixed-gateway.test`
+with A `8.8.8.8` and AAAA `::1`; the real guest resolver path reaches the
+production policy, which rejects that mixed answer with
+`destination_address_denied`. This proves fail-closed behavior for this
+resolver fixture, not resolver portability or packet-level completeness. The
+same fixture returns public A/AAAA answers on the first
+`rotating.example.com` lookup and `127.0.0.1`/`::1` on the next lookup, with
+zero TTL. The first production-policy `connect_authority` uses only the vetted
+`8.8.8.8` sockaddr through a fake socket; a second call rejects the changed
+answer before constructing another socket. The test confirms two queries per
+address family and performs no provider connection. This demonstrates a
+controlled answer-change case through this guest's system resolver, not
+external or authoritative DNS rebinding behavior. The production policy
+returned the exact numeric pins for the all-public case; the
+guest's resolver stub SHA-256 was
+`6096beac5979f1791fb0a4d089735e267936a9fce82717078a12eeb499e24b38` both
+before and after the test, and no temporary fixture directories remained. The
+policy module passed 35/35 tests in this guest. The test exercises one Linux
+system-resolver implementation in this guest, not macOS or every resolver
+implementation, and performs no outbound DNS or provider connection. Neither
+the one-call assertion nor the fixture bounds authoritative DNS wire queries.
+
+Both accepted proxy channels remain tracked through teardown. The test's
+finalizer shuts down and closes them, bounded-joins every started handler, and
+fails cleanup if a handler remains alive.
+
+SHA-256 values for the exact files run in the guest (matching the host
+worktree):
+
+| File | SHA-256 |
+| --- | --- |
+| `test_oci_worker_runtime.py` | `c74906a0e78ba3d34a1379eae1d52921cc26914450fe36fecdd52d09ebc1aaab` |
+| `test_provider_proxy.py` | `aff9efbdf1a7a9e261141cbc86680c454047db7bfd256a092a14420083ec5837` |
+| `test_provider_egress.py` | `1d384fba0ebb116cb2e19c466e67bde1a3922f94ad9f2569fbe00891c4fec042` |
+| `provider_proxy.py` | `c12e86847058a9082be3f9381050467e8bfabb33bfffa76e535681733e988ead` |
+| `provider_egress.py` | `72ffe5cca88a24ba298c3d68a684e35ace711f53c4e0b8faaef929b2f56e8009` |
+
+For the separate live OCI probe, the guest's
+`kernel.apparmor_restrict_unprivileged_userns` value was 1 before the run; it
+was set to 0 only for that disposable test and restored by an exit
+trap. Postflight confirmed the value was 1 again, no matching ACP units or live
+probe processes remained, and there were no attempt roots, host proxy sockets,
+or host-only socket fixtures. This does not prove AppArmor confinement. No real
+provider credential, endpoint, TLS session, model inference, or paid call was
+used. The collector-issued receipt predicates were replaced with a test-only
+receipt; process identity, peer PIDFD, UID/GID, and exact cgroup checks were
+real. Together, these tests prove the live worker-to-socket CONNECT path,
+same-UID peer rejection, and the separate proxy rule requiring a new CONNECT
+for a TLS redirect target. Together with the host-side resolver tests, they
+also prove that the policy passes its vetted numeric sockaddr to `connect()`
+without a second system-resolver call (the socket itself is mocked). The
+rotating-answer case is limited to this controlled guest resolver and does not
+prove authoritative/external DNS rebinding behavior or resolver portability.
+These proofs do not establish provider authentication, the application
+following redirects inside the OCI worker, credential handoff, crash recovery,
+cleanup verification, result transfer, or production `run_worker()`
+integration. Provider-boundary subtask #3112 is complete; parent task #2370
+remains open, and configured OCI worker execution remains fail-closed.
+
+### Generic provider-proxy integration design gate (2026-10-22)
+
+Independent architecture review of follow-up #3441 returned **NO-GO for direct
+integration as currently specified**. The existing live socket probe proves
+that this exact rootless OCI policy allows AF_UNIX to the one bind-mounted
+attempt socket while seccomp denies AF_INET/AF_INET6 TCP and UDP socket
+creation. It does not prove a normal agent HTTP client can use a TCP
+`HTTP_PROXY`; the probe's static C client speaks CONNECT directly over AF_UNIX.
+The documented guest observation is that BusyBox 1.35 lacks `nc -U`; the live
+probe therefore compiled a test-only C client. This is an environment
+observation, not an automated assertion or a production bridge.
+
+The minimally supportable direction is a separate, explicit experimental
+provider-egress mode, staged behind independent gates:
+
+1. Keep the host-side attempt proxy as the policy authority. Its exact
+   normalized host/port allowlist, full DNS-answer classification, pinned
+   numeric dialing, and exact worker-cgroup peer authorization stay mandatory.
+   The client-side bridge must forward only HTTP CONNECT authority and opaque
+   tunnel bytes; it must not resolve names or choose an upstream destination.
+2. Retain AF_UNIX as the sole host capability, mounted read-only from one
+   private per-attempt directory. Verify the canonical directory and socket
+   inode before bind, at mount/readback, and during teardown. Do not describe
+   the mount as defending against hostile concurrent same-UID mutation.
+3. If generic TCP-proxy clients are required, pin and review a tiny
+   production bridge binary as trusted sandbox content; do not rely on an
+   unpinned BusyBox command or caller-provided executable. The bridge may
+   listen only on loopback in the worker's private network namespace and
+   connect to the mounted AF_UNIX channel. A separate opt-in seccomp policy
+   must permit only the TCP socket families/types required for that bridge,
+   while denying UDP, raw/packet sockets, and other unnecessary network APIs.
+   Keep the namespace without an external interface or non-loopback route,
+   with no network capabilities, and live-test non-loopback connection denial.
+   If that bounded policy cannot be demonstrated on a supported guest, refuse
+   generic `HTTP_PROXY` and retain the UDS-only capability.
+4. Treat the complete attempt cgroup as the egress principal: any process in
+   that cgroup can reach the mounted socket. PIDFD/UID/GID/cgroup checks reject
+   same-UID peers outside it; the bridge itself is not an authorization
+   boundary. Do not claim process-only access control.
+5. Give the fake credential only through a private read-only execution-scoped
+   channel. This intentionally makes the fake value readable to worker code;
+   it does not protect a real secret from that code, root, or hostile
+   same-host-UID activity. A real provider credential remains out of scope and
+   needs a brokered design. ACP must not inject the canary into launcher or
+   supervisor arguments, environment, receipts, or supervisor-authored log
+   metadata. A malicious worker can deliberately print or copy the readable
+   fake value into stdout/stderr; captured worker output and results are not
+   confidential. Tests must separate ACP-side leak assertions from
+   worker-controlled output and must not claim the latter can never contain
+   the canary.
+6. Make the supervisor own bridge, accepted channels, and upstream tunnels as
+   one attempt lifecycle. Cancellation must close active channels, reap the
+   bridge, verify socket/credential teardown, and only then permit the existing
+   independent `cleanup_verified` and result-import gates.
+
+The broker policy authorizes only the CONNECT hostname and port. TLS bytes stay
+opaque: it cannot inspect TLS SNI, redirects, URL paths, HTTP methods, or API
+semantics. A redirect to another authority is blocked only when the client
+opens a new CONNECT and that authority is not allowlisted; no TLS-path or
+redirect-inspection claim is warranted. Plain HTTP forward-proxy requests are
+not supported by the current CONNECT handler and must not be implied by
+`HTTP_PROXY` compatibility claims.
+
+Before integration, split and prove these stages on the disposable supported
+Linux guest: (a) production listener ownership plus exact directory bind-mount
+and teardown lifecycle; (b) a reproducibly built and pinned bridge with the
+separate loopback-only seccomp/network policy; and (c) fake-credential
+visibility/leak tests. Then exercise the composition through registered
+`run_worker()`, including cancellation and crash recovery. The current direct
+OCI test, test receipt, and injected resolver/dial hooks are not production
+integration evidence. No provider policy, worker seccomp rule, mount policy,
+or configured-OCI default was changed by this design review.
+
+### Attempt-scoped provider UDS lifecycle (2026-10-22; source, unit, and live guest proof)
+
+The first implementation stage now connects the production launch-driver
+service to the existing provider-neutral CONNECT handler, but only through the
+explicit no-model sandbox composition and a separately named destination
+policy. The authenticated launch request contains the normalized policy and
+binds it into the one-shot request digest. Without that field, the existing
+request shape and default OCI config remain unchanged. `run_worker()` has no
+general provider-credential delivery channel and no provider-backed worker
+mode. A separate opt-in, test-only fake-canary path exercises fd 4 with
+synthetic bytes; it is not a production credential API or provider integration.
+
+For an opted-in request, the launch driver derives a short deterministic
+directory name from the exact execution identity beneath the already-private
+`XDG_RUNTIME_DIR`; it refuses collisions instead of taking over an existing
+path. It binds one AF_UNIX listener and adds only that directory as a
+read-only `ro,nosuid,nodev,noexec` mount at `/run/acp`, with the socket path
+passed as a fixed worker environment value. The listener service starts only
+after collector-issued runtime attestation and the durable `running` record,
+but before the inherited runc gate is released. The existing peer authorizer
+still treats the exact worker cgroup as the principal and fails closed when
+kernel PIDFD or proc/cgroup checks are unavailable. After the exact runc wait,
+the normal path closes tracked channels and tunnels and joins handlers, but
+closing the listener does not itself authorize deleting its directory. Once
+launch submission may have begun, the driver retains that directory for the
+independent cleanup verifier unless an exact durable reread proves the same
+execution is still `reserved` with no submission latch. If the submission
+callback never began, the driver may remove its exact empty directory after
+closing the proxy; if the callback began but returned no receipt, removal
+requires that exact reread. A returned launch-submission receipt or
+failed/uncertain reread leaves the directory retained. For a new verification,
+the verifier accepts only the exact `cleanup_reported` execution with kernel
+`waitpid` evidence and a self-consistent cleanup receipt; an
+already-`cleanup_verified` execution is returned idempotently only when its
+stored verification receipt is self-consistent. Under the execution fence it
+checks the recorded systemd units and processes, runc-state absence, and cgroup emptiness, removes only
+identity-bound paths and the provider proxy directory, then rechecks process,
+cgroup, and unit state before recording verification. Proxy close/drain
+failure is reported as unverified and is not cleanup proof; when a launched
+handle exists, the error path attempts exact-monitor stop/cancel and retries
+proxy shutdown after the worker stops. If shutdown remains unverified, the
+driver withholds the cleanup report and leaves the execution fenced. On restart,
+the reaper records the execution phase and launch-submission latch state; any
+provider artifact remains quarantined with resource fences until independent
+verification succeeds. Unknown entries, identity changes, or failed rechecks
+remain fenced.
+
+**Scoped live guest qualification (2026-10-22):** The opt-in production
+launch-driver test passed once in natural-completion mode and once in
+cancellation mode on disposable Debian 12 ARM64 (Linux
+`6.12.95+deb12-cloud-arm64`, systemd `252.39`, Python `3.11.2`) with root-owned
+runc `1.5.2`, SHA-256
+`d10ecae898361832a059be2089bab92d158aec54661b18ed7346ed79628b46b0`. The
+natural run checked the read-only `/run/acp` mount and fixed socket path,
+denied IPv4/IPv6 TCP and UDP socket creation, exercised a malformed in-cgroup
+request (400), rejected a disallowed destination (403), and observed a
+same-UID outside-cgroup peer rejected (403) while the exact durable execution
+row was still `running`. The cancellation variant held a connected/open
+partial UDS request while the production cancellation/cleanup path ran. Its
+marker proves the client connection was open, not that the handler had
+accepted that specific partial request; accepted-channel drain and join remain
+covered by `test_attempt_proxy_service_cancels_and_joins_active_channel`.
+Both modes required exact workspace/cgroup identity, completed cleanup
+verification, and removed only the execution-scoped socket directory. The
+harness asserted exact attempt-unit cleanup; a separate postflight queried all
+user units and scanned `/tmp`, finding no ACP-named unit or
+`acp-live-launch-driver-*` fixture root. The test source file SHA-256 was
+`c439b9d23b168e595800683aa83051c1a9873fd9ced5e1987bf1d0ce6545962c`.
+
+This is scoped UDS lifecycle evidence, not end-to-end provider qualification.
+The probe sent only a disallowed hostname, which the policy rejected before
+DNS resolution; it made no allowed-host connection, provider request, TLS
+handshake, model call, or paid call. No provider credentials were configured
+or used (the harness used its local ACP control-plane credential). No
+TCP-to-UDS bridge, seccomp relaxation, general provider-credential channel, or
+default-path enablement was added. A separate test-only fake-canary FD4 path is
+qualified below.
+The general provider-enabled `run_worker()` composition, bridge/credential
+stages, and full task #3441/#2370 acceptance remain open.
+
+### Test-only fake-canary FD4 transport (2026-10-22; live guest pass)
+
+The private test seam stages synthetic bytes through systemd `LoadCredential`,
+then through a bounded read-only pipe inherited as worker fd 4. The existing
+launch gate remains fd 3. Only the opted-in test launch preserves two
+descriptors; the production default remains fd 3 only. Durable launch-plan v7
+binds `worker_credential_transport` as `test_canary_fd4` or `none`; legacy
+plans remain FD3-only. This does not add a general provider-credential API.
+
+On the disposable Debian 12 ARM64 guest (kernel
+`6.12.95+deb12-cloud-arm64`, systemd `252`, Python `3.11.2`, pinned runc
+`1.5.2`), the exact production launch-driver lifecycle test completed natural
+worker execution, pinned-runc deletion, and a `cleanup_reported` receipt. Its
+static C worker read the expected byte count from fd 4, required EOF, computed
+SHA-256, and persisted only the digest. The host compared it with the digest of
+the synthetic canary; no raw canary value appeared in the launch argv or
+environment, event metadata, SQLite database bytes, or systemd service log.
+The test reached natural worker completion, pinned-runc deletion, and a
+`cleanup_reported` receipt. This canary mode intentionally did not exercise the
+separate `cleanup_verified` transition or validated result importer. Postflight
+found no ACP service unit or `acp-live-launch-driver-*` fixture root.
+No real provider credential, DNS/network request, provider/model call, or paid
+call was used. The worker controls its own output and can expose any readable
+value; this test proves transport, not confidentiality from worker code or
+same-UID actors. It does not close the provider-backed `run_worker()` or broader
+#3441/#2370 acceptance gates.
+
+The six guest source/test files matched the local checkout byte-for-byte:
+
+| File | SHA-256 |
+| --- | --- |
+| `oci_worker.py` | `9731bedf92ffc0d6e0f368e23db722bc66d358f9cc025926154eb8c2f2f4f134` |
+| `sandbox_execution_journal.py` | `0000645f92f783fc45cd86b3d5da9d28e56da261f44e84f17391eafea474f70a` |
+| `sandbox_launch_driver_service.py` | `d68c16bbdf0ad86fbbdc6fb6df6bca07db399fa9c61214f159d5e3e867820865` |
+| `test_sandbox_execution_journal.py` | `48c3c4305b7f212c01e1fe117e80b1953351377e3dbc84fddb53ea0fd2df5306` |
+| `test_sandbox_launch_driver_service.py` | `bfc223cfa187d19e1b7e9767cdeef4f6e19e007b43f06910b7f4bb8f7aa07178` |
+| `test_sandbox_worker_lifecycle_integration.py` | `243fe2709284f509b0bec5bde2522c0569f6bf965f3ee4a3edf575d2b771dc84` |
+
+These are the hashes from the guest run. Afterwards, the host-only
+`test_sandbox_execution_journal.py` gained v6 legacy-plan and v7 canary/FD-count
+mismatch regression assertions; that file was not invoked by the guest test.
+Its current checkout SHA-256 is
+`b61edb7dcf5d921e4c7a271f25639b6a15139493d10af6617da1e20c5574cf8d`.
+
+The pinned guest runc binary SHA-256 was
+`d10ecae898361832a059be2089bab92d158aec54661b18ed7346ed79628b46b0`.
+
+### Single-SDK proxy compatibility prototype (2026-10-22; not production evidence)
+
+Independent architecture QC returned **NO-GO for implementing a generic
+TCP-to-UDS bridge next**, but **GO for a bounded, opt-in compatibility proof
+against one pinned SDK/runtime**. Official docs show materially different proxy
+configuration paths: [OpenAI Python 3.35.1](https://github.com/openai/openai-python/blob/v3.35.1/httpx2.md)
+uses an HTTPX2 client; [OpenAI Node](https://github.com/openai/openai-node/blob/main/docs/configuration.md)
+uses custom `fetch` with Undici's `ProxyAgent`; [Anthropic Python](https://github.com/anthropics/anthropic-sdk-python/blob/main/MIGRATION.md)
+uses a custom HTTPX2 client; and [Google Gen AI Python](https://github.com/googleapis/python-genai)
+documents `HTTPS_PROXY` environment configuration and HTTP client arguments for
+SOCKS5. A claim of generic `HTTP_PROXY` support would overstate what has been
+validated. OpenAI Python was selected as a protocol test vector, not as a
+provider preference or a commitment to support every SDK.
+
+On the disposable Debian 12 ARM64 guest (kernel
+`6.1.0-53-cloud-arm64`, root-owned runc `1.5.2`), a transient Python prototype
+ran inside `unshare --user --map-root-user --net` after bringing up `lo` and
+dropping all capabilities. It used OpenAI Python `3.35.1` with HTTPX2 `2.16.0`
+and the SDK's documented `DefaultHttpx2Client(proxy="http://127.0.0.1:<port>")`
+configuration. The client used a fake local API key and a local TLS mock; its
+`GET /v1/models` returned an empty model list. The prototype loopback TCP bridge
+forwarded the request to a local AF_UNIX mock broker, which accepted only
+`CONNECT api.test:443` and tunneled to the local TLS mock. The exact CONNECT
+request was observed at both the bridge and UDS endpoint. A resolver guard
+rejected every non-loopback hostname, and proxy-related environment variables
+were removed so the explicit client configuration was the only proxy path.
+
+The private network namespace exposed no non-loopback interface or external
+IPv4/IPv6 route. With `CapEff=0`, loopback TCP and the SDK request succeeded;
+direct TCP connect attempts to `203.0.113.1:443` and the guest host gateway
+`192.168.5.2:22` returned `ENETUNREACH` (errno 101). This is a compatibility and
+network-namespace feasibility result only. A separate no-capabilities probe
+showed UDP socket creation still succeeds and raw socket creation fails with
+`EPERM`; this prototype did not load the required TCP-only seccomp policy.
+
+The transient prototype is not committed or content-pinned. It did not use the
+production provider handler, exact `/run/acp` bind mount, cgroup peer
+authorization, registered OCI `run_worker()`, production cleanup/recovery, a
+real provider, or provider credentials. It therefore does not qualify a
+production bridge or provider egress. It supports only the narrow statement
+that this pinned OpenAI Python/HTTPX2 client configuration used HTTPS CONNECT
+through a loopback TCP proxy to a local mock. It does not validate default
+environment proxy discovery, plaintext HTTP forwarding, WebSockets, aiohttp, or
+all SDKs. Before any production bridge work, retain the concrete use case and
+SDK/backend/runtime pin, then independently prove the separate opt-in
+TCP-only seccomp, no external interface/route/capabilities, direct off-net
+denial, exact worker-cgroup-to-UDS authorization, and full cancellation,
+recovery, and cleanup gates. Keep the bridge disabled by default.
+
+### Provider-proxy inode recovery fence (2026-10-22; unit + scoped live evidence)
+
+For provider-enabled launches, the one-use pre-runc submission transaction now
+stores the exact attempt-bound state-root, provider-directory, and socket
+device/inode identities, and includes their digest in the immutable launch
+submission. The independent cleanup verifier removes the directory only when
+the durable identity matches; an unrecorded artifact or replaced directory or
+socket remains untouched and the attempt stays quarantined with its resource
+fences. The no-provider launch behavior is unchanged; its durable metadata
+records the empty sentinel.
+
+Deterministic coverage checks the one-way journal binding and launch digest, plus
+refusal to remove unbound, replaced-directory, and replaced-socket artifacts.
+The reaper now also reconciles the narrow post-wait, pre-`cleanup_reported`
+boundary when the exact durable launch-submission latch is present: it verifies
+the recorded systemd activations, process identities, cgroup trees, pinned
+runtime and state-root identity; if the exact state entry remains, it invokes
+only the pinned `runc delete` for that container. A version-4 recovery receipt
+binds the attempt, claim, execution, launch submission and provider-artifact
+digest, after which the ordinary independent cleanup verifier still performs
+the inode-bound path removal. Missing or ambiguous submission evidence, an
+identity mismatch, or any live/unknown process, unit or cgroup remains
+quarantined with fences held; recovery never infers cleanup from the kernel
+wait result alone.
+
+Local deterministic tests use synthetic Linux/systemd observations and a real
+filesystem UDS socket. They inject interruption after pinned-state deletion but
+before the cleanup-report commit and after that commit but before independent
+verification, then confirm retry behavior, exact artifact removal, and receipt
+tamper rejection.
+
+For the exact launch-driver post-wait/pre-report crash boundary with a provider
+artifact, combine `ACP_LIVE_PROVIDER_PROXY_UDS=1` and
+`ACP_LIVE_CRASH_AFTER_EXIT_BEFORE_CLEANUP_REPORT=1`. The opt-in test wrapper
+exits after the durable kernel-wait transition and provider-proxy shutdown, but
+before pinned-runc deletion or `cleanup_reported`; a fresh reaper must recover
+the exact launch latch and state-root identity, write the recovery report, run
+the independent verifier, and release resources only after verification. This
+crash-only branch creates and checks the exact provider socket/directory
+identities but sends no provider-proxy request, performs no DNS lookup, uses no
+provider credentials, and makes no model/provider call.
+
+One live run passed on 2026-10-22 in the disposable Debian 12 ARM64 guest
+`lima-acp-2370-live-sandbox-20261021` (Linux
+`6.1.0-53-cloud-arm64`, Debian kernel package `6.1.187-1`, active systemd user
+manager, pinned root-owned runc `1.5.2`). The test advances the supplied reaper
+epoch to one second after the later of the current time and durable lease expiry,
+so it exercises the expired-attempt branch without waiting in wall-clock time.
+At the injected crash, the execution was `exited`, its exact stopped runc state
+entry still existed, and the provider socket was absent while its empty
+directory still matched the durable device/inode identity. A fresh
+`reap_expired()` recovered a v4 report whose runc action matched the pinned
+binary and exact container; independent cleanup then removed the provider
+directory, state root, and bundle, and released the runtime. The run used no
+provider credentials or model/provider calls.
+
+The separate live guest evidence below covers the already-reported cleanup
+handoff and provider-proxy request/mount path. This evidence contributed to
+#3447's later closure after its focused review and CI gates passed. Parent #2370
+remains open because its broader per-attempt sandbox acceptance criteria are
+still outstanding.
+
+The opt-in `test_live_production_launch_driver_runs_exact_pinned_runc_request`
+also passed once in natural-completion mode and once in cancellation mode on
+the disposable Debian 12 ARM64 guest (Linux
+`6.12.95+deb12-cloud-arm64`, systemd user manager, pinned root-owned runc
+`1.5.2`) with `ACP_LIVE_PROVIDER_PROXY_UDS=1`. Before recovery, it verified
+that the provider socket was absent while the empty directory still matched
+the durable device/inode identity in `cleanup_reported`. A fresh supervisor
+then invoked the production reaper, advanced the execution to
+`cleanup_verified`, and the test verified the exact directory was absent.
+The cancellation run opened a partial UDS probe before cancellation; this
+proves the client connection was open, not that the handler had accepted that
+specific partial request. Neither run used provider credentials or called a
+model/provider.
+Those natural/cancellation runs cover the reported-cleanup handoff and the
+provider-proxy request/mount path. Together with the post-wait crash run above,
+they do not prove a full daemon restart, the registered `run_worker()` path,
+provider authentication, model calls, or end-to-end provider egress. Parent task
+#2370 and full acceptance remain open.
+
+### Recovered cleanup receipts in result evidence (2026-10-22)
+
+Result-candidate capture and result-import validation previously accepted
+version-1/version-2 receipts and the self-consistent version-3 action receipt,
+but rejected a valid version-4 crash-recovery receipt. Commit `95156f7e` routes
+both result readers through one exact-receipt validator, which adds the
+recovery-specific structural checks without weakening tamper rejection. The
+regression exercises the persisted recovered receipt through result import,
+checks that its exact receipt digest is retained, and rejects mutated and
+unexpected fields.
+
+Validation for that exact commit: full local `pytest` passed with 92
+platform/opt-in skips; Ruff check and format plus `uv build` passed; independent
+exact-diff QC returned GO with no P1/P2 findings; hosted CI run
+`39844524279` passed all four Ubuntu/macOS and Python 3.11/3.12 jobs. QC noted a
+non-blocking distinction: historical version-4 validation binds to the
+persisted launch plan, execution row, and pinned executable digest rather than
+requiring today's configured executable path/runtime version. This preserves
+historical receipt import across path/runtime-label changes when the pinned
+executable digest is unchanged; no cleanup action is performed by the result
+readers. This increment does not enable the provider route or prove registered
+provider-backed `run_worker()` execution. PR #42 remains draft/open, and
+#2370/#3441 remain open for their broader acceptance.
+
+### Registered no-provider `run_worker()` completion and result import (2026-10-22)
+
+At commit `0698ceddc6cb4ae0d5be5155270897efcb998272`, on the same disposable
+Debian 12 ARM64 guest (kernel
+`6.12.95+deb12-cloud-arm64`, systemd `252.39`, Python `3.11.2`, rootless
+runc `1.5.2`), the exact pinned-runc lifecycle test passed **1/1 in 2.24s**
+with `ACP_LIVE_SUPERVISED_RUN_WORKER=1` and
+`ACP_LIVE_IMPORT_RESULT_AFTER_CLEANUP=1`. The opt-in path entered registered
+`GitSupervisor.run_worker()`, returned `status=pending_qc` with
+`sandbox_cleanup_verified=true`, then passed the host-side result importer.
+Assertions verified the cleanup receipt and empty runtime state before import,
+that the submitted commit was based on the task's exact base and contained only
+the expected coding-task/driver outputs, and that the source worktree remained
+clean. The test used a cleared environment with only the live-test settings;
+there was no provider proxy, FD4 canary, real provider credential, DNS/network
+request, model call, or paid call. Its generated local ACP control-plane
+credential is not a provider credential.
+
+The guest and host matched these exact source/test SHA-256 values:
+
+| File | SHA-256 |
+| --- | --- |
+| `oci_worker.py` | `9731bedf92ffc0d6e0f368e23db722bc66d358f9cc025926154eb8c2f2f4f134` |
+| `sandbox_execution_journal.py` | `0000645f92f783fc45cd86b3d5da9d28e56da261f44e84f17391eafea474f70a` |
+| `sandbox_launch_driver_service.py` | `d68c16bbdf0ad86fbbdc6fb6df6bca07db399fa9c61214f159d5e3e867820865` |
+| `test_sandbox_worker_lifecycle_integration.py` | `243fe2709284f509b0bec5bde2522c0569f6bf965f3ee4a3edf575d2b771dc84` |
+
+Postflight found no test-specific driver/monitor unit, matching process, or
+`acp-live-launch-driver-*` fixture root; the user manager remained running.
+This proves only the opt-in **no-provider natural-completion/import** path. It
+does not exercise provider credential delivery or egress, cancellation or
+crash-recovery through `run_worker()`, nor enable configured OCI execution by
+default. Provider-backed composition and broader task #3441/#2370 acceptance
+remain open.
+
+### Composed test-only FD4 canary through supervised `run_worker()` (2026-10-22)
+
+On base commit `e82f5f29e20b343bc9f0d84f354cd0fc89f3d221` plus the test-only
+harness diff (independent diff SHA-256
+`22da642d90b7cc7c7fc47eede36c022788f45c6efdb66bb46e433d66d8067206`), the
+exact pinned-runc lifecycle test passed **1/1** in the disposable Debian 12
+ARM64 guest `acp-2370-live-sandbox-kernel612-20261021` (kernel
+`6.12.95+deb12-cloud-arm64`, systemd `252.39`, Python `3.11.2`, rootless runc
+`1.5.2`). It ran with `ACP_LIVE_SUPERVISED_RUN_WORKER=1`,
+`ACP_LIVE_IMPORT_RESULT_AFTER_CLEANUP=1`, and the explicitly test-only
+`ACP_TEST_ALLOW_WORKER_CANARY=1` / `ACP_LIVE_WORKER_CANARY_FD4=1` settings.
+
+The composed path entered registered `GitSupervisor.run_worker()` through its
+existing private test seam, delivered a synthetic canary over FD4, completed
+the deterministic coding task, and returned `pending_qc` for the exact
+execution with cleanup verified. The host importer ran only after the
+independent cleanup verifier passed. Assertions checked the exact imported
+base and output paths, clean source worktree, and the canary's SHA-256-only
+result; the raw canary was absent from launch argv/environment, event payloads,
+SQLite, and the service log. This is test-only injection, not a production
+credential API. The guest and host matched these source/test hashes:
+
+| File | SHA-256 |
+| --- | --- |
+| `oci_worker.py` | `9731bedf92ffc0d6e0f368e23db722bc66d358f9cc025926154eb8c2f2f4f134` |
+| `sandbox_execution_journal.py` | `0000645f92f783fc45cd86b3d5da9d28e56da261f44e84f17391eafea474f70a` |
+| `sandbox_launch_driver_service.py` | `d68c16bbdf0ad86fbbdc6fb6df6bca07db399fa9c61214f159d5e3e867820865` |
+| `test_sandbox_worker_lifecycle_integration.py` | `c6d97d57d7d84d7f4781f93c1ce0b14598548ee0f7925aa26981aca8ea6aaae4` |
+
+Independent exact-diff review returned GO after correcting a test-payload
+marker collision; the reviewer did not run the guest. No provider proxy,
+provider credential, DNS/network request, model call, or paid call was used by
+the live worker run.
+Postflight found no test-specific ACP unit, worker process, or lifecycle temp
+root. The test's user manager remained active and the exact guest was stopped
+after cleanup. This proves only the opt-in synthetic-canary/no-provider
+composition and cleanup-gated import path. It does not prove provider-backed
+`run_worker()`, production credential delivery or egress, cancellation/crash
+recovery through `run_worker()`, or default-path enablement; broader #2370/#3441
+acceptance remains open.
+
+### Supervised result import with host-path isolation probes (2026-10-22)
+
+At commit `4ed4b73deab99ff2e83401492708fcec0125b97c`, the exact pinned-runc
+lifecycle test passed **1/1** in the same disposable Debian 12 ARM64 guest
+(kernel `6.12.95+deb12-cloud-arm64`, systemd `252.39`, Python `3.11.2`, rootless
+runc `1.5.2`) with `ACP_LIVE_ISOLATION_PROBES=1`, supervised `run_worker()`,
+and cleanup-gated result import enabled. The guest checkout matched the source
+and test hashes in the preceding section; the lifecycle test module was
+`c6d97d57d7d84d7f4781f93c1ce0b14598548ee0f7925aa26981aca8ea6aaae4`.
+
+In addition to the exact pending-QC import checks, the worker proved its
+assigned workspace writable and `.git` absent; `/tmp` and `/home/agent` were
+private tmpfs mounts; the minimal rootfs exposed only the copied BusyBox closure
+but not host `/usr`, and its `/etc` was read-only. Existence (`test -e`) and
+readability (`test -r`) checks could not see or read unique sentinels in host
+`/etc`, `/usr/local/share`, home,
+home config and SSH credential paths, host temp, the harness checkout, task
+base checkout, a sibling worktree, and an unrelated project; write probes
+against those sentinel paths were denied. Symlink and
+canonical-path escapes were denied; the worker could not see the host process
+sentinel, host-only UDS, or systemd socket. A direct-IP TCP attempt to the
+reserved test address failed with the expected permission-denied error. Only the
+expected task/driver outputs were imported, from the exact base, and the source
+worktree remained clean.
+
+Postflight found no ACP test units, worker process, fixture root, or remaining
+`acp-live-*` sentinel; the user manager was active and the exact guest was
+stopped after the run. The test uses privileged, uniquely named sentinels only
+inside this disposable guest and removes them by exact identity/content checks.
+It used no provider proxy or credential and made no DNS, provider/model, or
+paid request; the direct-IP probe is an expected denied attempt. This advances
+the opt-in Linux workspace/process/socket boundary and result-import evidence,
+but does not prove arbitrary hostile-kernel resistance, same-UID concurrent
+filesystem-mutation defense, provider-backed execution/egress, full crash or
+cancellation recovery through `run_worker()`, or default-path enablement.
+Acceptance #2370 remains open.

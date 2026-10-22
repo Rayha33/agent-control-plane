@@ -195,7 +195,7 @@ from .trust_bundles import (
 from .worker_trampoline import LIFECYCLE_FDS_PREFIX as LIFECYCLE_FDS_PREFIX
 from .worker_trampoline import MONITOR_MODE as MONITOR_MODE
 
-SCHEMA_VERSION = 24
+SCHEMA_VERSION = 35
 """Schema this binary understands. Raise it in the same commit that adds a MIGRATIONS entry."""
 
 
@@ -1578,6 +1578,961 @@ def _add_sandbox_launch_plan_binding(connection: sqlite3.Connection) -> None:
     )
 
 
+def _add_sandbox_bundle_digest_semantics(connection: sqlite3.Connection) -> None:
+    """Distinguish historical caller-asserted digests from host-derived reservations.
+
+    Existing rows are intentionally tagged legacy rather than rewritten: their original
+    digest provenance cannot be recovered. New reservations opt into the versioned,
+    host-derived meaning, and the identity trigger makes that choice immutable.
+    """
+
+    columns = {row["name"] for row in connection.execute("PRAGMA table_info(sandbox_executions)")}
+    if not columns:
+        raise sqlite3.DatabaseError(
+            "sandbox_executions must exist before bundle-digest semantics migration"
+        )
+    if "bundle_digest_semantics" not in columns:
+        connection.execute(
+            "ALTER TABLE sandbox_executions ADD COLUMN bundle_digest_semantics "
+            "TEXT NOT NULL DEFAULT 'legacy-caller-asserted-v0' "
+            "CHECK (bundle_digest_semantics IN "
+            "('legacy-caller-asserted-v0', 'oci-reservation-v1'))"
+        )
+
+    connection.execute("DROP TRIGGER IF EXISTS sandbox_execution_reservation_insert_guard")
+    connection.execute(
+        """
+        CREATE TRIGGER sandbox_execution_reservation_insert_guard
+        BEFORE INSERT ON sandbox_executions
+        WHEN acp_sandbox_reservation_authorized(
+          NEW.attempt_id, NEW.claim_token, NEW.execution_id,
+          NEW.bundle_digest, NEW.bundle_digest_semantics
+        ) != 1
+        BEGIN
+          SELECT RAISE(ABORT, 'sandbox_execution_reservation_authorization_required');
+        END
+        """
+    )
+
+    connection.execute("DROP TRIGGER IF EXISTS sandbox_execution_identity_immutable")
+    connection.execute(
+        """
+        CREATE TRIGGER sandbox_execution_identity_immutable
+        BEFORE UPDATE ON sandbox_executions
+        WHEN OLD.attempt_id IS NOT NEW.attempt_id
+          OR OLD.claim_token IS NOT NEW.claim_token
+          OR OLD.execution_id IS NOT NEW.execution_id
+          OR OLD.backend IS NOT NEW.backend
+          OR OLD.container_id IS NOT NEW.container_id
+          OR OLD.bundle_digest IS NOT NEW.bundle_digest
+          OR OLD.bundle_digest_semantics IS NOT NEW.bundle_digest_semantics
+          OR OLD.rootfs_digest IS NOT NEW.rootfs_digest
+          OR OLD.rootfs_closure_digest IS NOT NEW.rootfs_closure_digest
+          OR OLD.runc_executable_digest IS NOT NEW.runc_executable_digest
+          OR OLD.runtime_version IS NOT NEW.runtime_version
+          OR OLD.oci_version IS NOT NEW.oci_version
+          OR OLD.bundle_path IS NOT NEW.bundle_path
+          OR OLD.state_path IS NOT NEW.state_path
+          OR OLD.created_at IS NOT NEW.created_at
+        BEGIN
+          SELECT RAISE(ABORT, 'sandbox_execution_identity_immutable');
+        END
+        """
+    )
+
+
+def _add_sandbox_attempt_slice_identity(connection: sqlite3.Connection) -> None:
+    """Persist the exact per-attempt slice that owns the wrapper and runc scope."""
+
+    columns = {row["name"] for row in connection.execute("PRAGMA table_info(sandbox_executions)")}
+    if not columns:
+        raise sqlite3.DatabaseError(
+            "sandbox_executions must exist before attempt-slice identity migration"
+        )
+    additions = (
+        ("wrapper_cgroup_path", "TEXT NOT NULL DEFAULT ''"),
+        ("attempt_slice_unit", "TEXT NOT NULL DEFAULT ''"),
+        ("attempt_slice_invocation_id", "TEXT NOT NULL DEFAULT ''"),
+        ("attempt_slice_cgroup_path", "TEXT NOT NULL DEFAULT ''"),
+    )
+    for name, definition in additions:
+        if name not in columns:
+            connection.execute(f"ALTER TABLE sandbox_executions ADD COLUMN {name} {definition}")
+
+    connection.execute("DROP TRIGGER IF EXISTS sandbox_execution_attempt_slice_insert_guard")
+    connection.execute(
+        """
+        CREATE TRIGGER sandbox_execution_attempt_slice_insert_guard
+        BEFORE INSERT ON sandbox_executions
+        WHEN NEW.wrapper_cgroup_path != ''
+          OR NEW.attempt_slice_unit != ''
+          OR NEW.attempt_slice_invocation_id != ''
+          OR NEW.attempt_slice_cgroup_path != ''
+        BEGIN
+          SELECT RAISE(ABORT, 'sandbox_execution_must_start_without_slice_identity');
+        END
+        """
+    )
+    connection.execute("DROP TRIGGER IF EXISTS sandbox_execution_attempt_slice_immutable")
+    connection.execute(
+        """
+        CREATE TRIGGER sandbox_execution_attempt_slice_immutable
+        BEFORE UPDATE ON sandbox_executions
+        WHEN (OLD.wrapper_cgroup_path != ''
+              AND NEW.wrapper_cgroup_path IS NOT OLD.wrapper_cgroup_path)
+          OR (OLD.attempt_slice_unit != ''
+              AND NEW.attempt_slice_unit IS NOT OLD.attempt_slice_unit)
+          OR (OLD.attempt_slice_invocation_id != ''
+              AND NEW.attempt_slice_invocation_id IS NOT OLD.attempt_slice_invocation_id)
+          OR (OLD.attempt_slice_cgroup_path != ''
+              AND NEW.attempt_slice_cgroup_path IS NOT OLD.attempt_slice_cgroup_path)
+        BEGIN
+          SELECT RAISE(ABORT, 'sandbox_execution_attempt_slice_identity_immutable');
+        END
+        """
+    )
+    connection.execute("DROP TRIGGER IF EXISTS sandbox_execution_attempt_slice_phase_guard")
+    connection.execute(
+        """
+        CREATE TRIGGER sandbox_execution_attempt_slice_phase_guard
+        BEFORE UPDATE ON sandbox_executions
+        WHEN OLD.phase = NEW.phase AND (
+          OLD.wrapper_cgroup_path IS NOT NEW.wrapper_cgroup_path
+          OR OLD.attempt_slice_unit IS NOT NEW.attempt_slice_unit
+          OR OLD.attempt_slice_invocation_id IS NOT NEW.attempt_slice_invocation_id
+          OR OLD.attempt_slice_cgroup_path IS NOT NEW.attempt_slice_cgroup_path
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'sandbox_execution_slice_identity_requires_phase_transition');
+        END
+        """
+    )
+    connection.execute("DROP TRIGGER IF EXISTS sandbox_execution_attempt_slice_transition_guard")
+    connection.execute(
+        """
+        CREATE TRIGGER sandbox_execution_attempt_slice_transition_guard
+        BEFORE UPDATE ON sandbox_executions
+        WHEN (
+          OLD.wrapper_cgroup_path = ''
+          AND OLD.attempt_slice_unit = ''
+          AND OLD.attempt_slice_invocation_id = ''
+          AND OLD.attempt_slice_cgroup_path = ''
+          AND (
+            NEW.wrapper_cgroup_path != ''
+            OR NEW.attempt_slice_unit != ''
+            OR NEW.attempt_slice_invocation_id != ''
+            OR NEW.attempt_slice_cgroup_path != ''
+          )
+          AND NOT (OLD.phase = 'reserved' AND NEW.phase = 'launched')
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'sandbox_execution_slice_identity_requires_launch');
+        END
+        """
+    )
+    connection.execute("DROP TRIGGER IF EXISTS sandbox_execution_launch_requires_attempt_slice")
+    connection.execute(
+        """
+        CREATE TRIGGER sandbox_execution_launch_requires_attempt_slice
+        BEFORE UPDATE OF phase ON sandbox_executions
+        WHEN OLD.phase = 'reserved' AND NEW.phase = 'launched'
+          AND (
+            NEW.wrapper_cgroup_path = ''
+            OR NEW.attempt_slice_unit = ''
+            OR substr(NEW.attempt_slice_unit, -6) != '.slice'
+            OR length(NEW.attempt_slice_invocation_id) != 32
+            OR NEW.attempt_slice_invocation_id GLOB '*[^0-9a-f]*'
+            OR NEW.attempt_slice_cgroup_path = ''
+          )
+        BEGIN
+          SELECT RAISE(ABORT, 'sandbox_execution_attempt_slice_identity_required');
+        END
+        """
+    )
+
+
+def _require_verified_cleanup_before_candidate_capture(connection: sqlite3.Connection) -> None:
+    """Keep mutable workspace scans behind the final cleanup phase."""
+
+    connection.execute("DROP TRIGGER IF EXISTS sandbox_result_candidate_write_once")
+    connection.execute(
+        """
+        CREATE TRIGGER sandbox_result_candidate_write_once
+        BEFORE UPDATE OF result_candidate_version, result_candidate_json,
+          result_candidate_digest ON sandbox_executions
+        WHEN (
+          OLD.result_candidate_version = 0 AND NOT (
+            NEW.result_candidate_version = 1
+            AND NEW.result_candidate_json != ''
+            AND length(NEW.result_candidate_json) <= 65536
+            AND length(NEW.result_candidate_digest) = 64
+            AND OLD.phase = 'cleanup_verified' AND NEW.phase = 'cleanup_verified'
+            AND NEW.runc_exit_code = 0
+            AND NEW.runc_exit_evidence_source = 'runc_client_kernel_waitpid'
+            AND NEW.workspace_binding_version = 1
+            AND NEW.baseline_manifest_digest != ''
+            AND NEW.workspace_root_path != ''
+            AND NEW.workspace_root_dev IS NOT NULL
+            AND NEW.workspace_root_ino IS NOT NULL
+            AND NEW.cleanup_receipt_json != '{}'
+            AND instr(NEW.result_candidate_json, '"authorization":"none"') > 0
+            AND instr(NEW.result_candidate_json, '"status":"unverified"') > 0
+          )
+        ) OR (
+          OLD.result_candidate_version != 0 AND (
+            NEW.result_candidate_version IS NOT OLD.result_candidate_version
+            OR NEW.result_candidate_json IS NOT OLD.result_candidate_json
+            OR NEW.result_candidate_digest IS NOT OLD.result_candidate_digest
+          )
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'sandbox_result_candidate_immutable');
+        END
+        """
+    )
+
+
+def _add_sandbox_launch_submission_receipt(connection: sqlite3.Connection) -> None:
+    """Latch the exact runc submission before the external launch boundary.
+
+    The durable marker is deliberately one-way. If the monitor dies after this
+    transaction but before recording the returned handle, a restarted monitor may
+    not launch again; it must reconcile the exact runtime state or retain the
+    fence. Old reservations remain empty and therefore cannot be launched by a
+    newer binary without going through the new authorization path.
+    """
+
+    columns = {row["name"] for row in connection.execute("PRAGMA table_info(sandbox_executions)")}
+    if not columns:
+        raise sqlite3.DatabaseError(
+            "sandbox_executions must exist before launch-submission receipt migration"
+        )
+    additions = (
+        ("launch_submission_id", "TEXT NOT NULL DEFAULT ''"),
+        ("launch_submission_digest", "TEXT NOT NULL DEFAULT ''"),
+        ("launch_submission_at", "TEXT NOT NULL DEFAULT ''"),
+    )
+    for name, definition in additions:
+        if name not in columns:
+            connection.execute(f"ALTER TABLE sandbox_executions ADD COLUMN {name} {definition}")
+
+    for trigger in (
+        "sandbox_launch_submission_insert_guard",
+        "sandbox_launch_submission_write_once",
+        "sandbox_execution_launch_requires_submission",
+    ):
+        connection.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+
+    connection.execute(
+        """
+        CREATE TRIGGER sandbox_launch_submission_insert_guard
+        BEFORE INSERT ON sandbox_executions
+        WHEN NEW.launch_submission_id != ''
+          OR NEW.launch_submission_digest != ''
+          OR NEW.launch_submission_at != ''
+        BEGIN
+          SELECT RAISE(ABORT, 'sandbox_launch_submission_must_follow_reservation');
+        END
+        """
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER sandbox_launch_submission_write_once
+        BEFORE UPDATE OF launch_submission_id, launch_submission_digest,
+          launch_submission_at ON sandbox_executions
+        WHEN NOT (
+          OLD.phase = 'reserved' AND NEW.phase = 'reserved'
+          AND OLD.launch_submission_id = ''
+          AND OLD.launch_submission_digest = ''
+          AND OLD.launch_submission_at = ''
+          AND length(NEW.launch_submission_id) = 32
+          AND NEW.launch_submission_id NOT GLOB '*[^0-9a-f]*'
+          AND length(NEW.launch_submission_digest) = 64
+          AND NEW.launch_submission_digest NOT GLOB '*[^0-9a-f]*'
+          AND length(NEW.launch_submission_at) BETWEEN 1 AND 64
+          AND acp_sandbox_launch_submission_authorized(
+            OLD.attempt_id, OLD.claim_token, OLD.execution_id,
+            NEW.launch_submission_id, NEW.launch_submission_digest
+          ) = 1
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'sandbox_launch_submission_must_be_authorized_once');
+        END
+        """
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER sandbox_execution_launch_requires_submission
+        BEFORE UPDATE OF phase ON sandbox_executions
+        WHEN OLD.phase = 'reserved' AND NEW.phase = 'launched'
+          AND (
+            NEW.launch_submission_id = ''
+            OR length(NEW.launch_submission_digest) != 64
+            OR NEW.launch_submission_at = ''
+          )
+        BEGIN
+          SELECT RAISE(ABORT, 'sandbox_execution_launch_submission_required');
+        END
+        """
+    )
+
+
+def _add_sandbox_launch_driver_process_identity(connection: sqlite3.Connection) -> None:
+    """Persist the exact launch-driver service MainPID and start identity.
+
+    Existing rows are deliberately not backfilled: a later cleanup verifier must
+    fail closed when a running execution predates this collector evidence.
+    """
+
+    columns = {row["name"] for row in connection.execute("PRAGMA table_info(sandbox_executions)")}
+    if not columns:
+        raise sqlite3.DatabaseError(
+            "sandbox_executions must exist before launch-driver identity migration"
+        )
+    additions = (
+        ("launch_driver_pid", "INTEGER"),
+        ("launch_driver_identity", "TEXT NOT NULL DEFAULT ''"),
+        ("launch_driver_unit", "TEXT NOT NULL DEFAULT ''"),
+        ("launch_driver_invocation_id", "TEXT NOT NULL DEFAULT ''"),
+        ("launch_driver_cgroup_path", "TEXT NOT NULL DEFAULT ''"),
+    )
+    for name, definition in additions:
+        if name not in columns:
+            connection.execute(f"ALTER TABLE sandbox_executions ADD COLUMN {name} {definition}")
+
+    for trigger in (
+        "sandbox_execution_driver_identity_insert_guard",
+        "sandbox_execution_driver_identity_write_once",
+        "sandbox_execution_running_requires_driver_identity",
+    ):
+        connection.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+
+    connection.execute(
+        """
+        CREATE TRIGGER sandbox_execution_driver_identity_insert_guard
+        BEFORE INSERT ON sandbox_executions
+        WHEN NEW.launch_driver_pid IS NOT NULL
+          OR NEW.launch_driver_identity != ''
+          OR NEW.launch_driver_unit != ''
+          OR NEW.launch_driver_invocation_id != ''
+          OR NEW.launch_driver_cgroup_path != ''
+        BEGIN
+          SELECT RAISE(ABORT, 'sandbox_execution_driver_identity_must_follow_running_attestation');
+        END
+        """
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER sandbox_execution_driver_identity_write_once
+        BEFORE UPDATE OF launch_driver_pid, launch_driver_identity, launch_driver_unit,
+          launch_driver_invocation_id, launch_driver_cgroup_path ON sandbox_executions
+        WHEN NOT (
+          OLD.phase = 'launched' AND NEW.phase = 'running'
+          AND OLD.launch_driver_pid IS NULL AND OLD.launch_driver_identity = ''
+          AND OLD.launch_driver_unit = '' AND OLD.launch_driver_invocation_id = ''
+          AND OLD.launch_driver_cgroup_path = ''
+          AND NEW.launch_driver_pid IS NOT NULL AND NEW.launch_driver_pid > 0
+          AND NEW.launch_driver_identity LIKE ('linux:' || NEW.launch_driver_pid || ':%')
+          AND NEW.launch_driver_unit LIKE 'acp-launch-driver-%.service'
+          AND length(NEW.launch_driver_invocation_id) = 32
+          AND NEW.launch_driver_invocation_id NOT GLOB '*[^0-9a-f]*'
+          AND substr(NEW.launch_driver_cgroup_path, 1, 1) = '/'
+          AND acp_sandbox_running_attestation_authorized(
+            OLD.attempt_id, OLD.claim_token, OLD.execution_id,
+            NEW.launch_driver_pid, NEW.launch_driver_identity, NEW.launch_driver_unit,
+            NEW.launch_driver_invocation_id, NEW.launch_driver_cgroup_path
+          ) = 1
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'sandbox_execution_driver_identity_requires_collector_receipt');
+        END
+        """
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER sandbox_execution_running_requires_driver_identity
+        BEFORE UPDATE OF phase ON sandbox_executions
+        WHEN OLD.phase = 'launched' AND NEW.phase = 'running'
+          AND (
+            NEW.launch_driver_pid IS NULL OR NEW.launch_driver_pid <= 0
+            OR NEW.launch_driver_identity = '' OR NEW.launch_driver_unit = ''
+            OR NEW.launch_driver_invocation_id = '' OR NEW.launch_driver_cgroup_path = ''
+          )
+        BEGIN
+          SELECT RAISE(ABORT, 'sandbox_execution_running_requires_driver_identity');
+        END
+        """
+    )
+
+
+def _add_sandbox_launch_driver_start_intent(connection: sqlite3.Connection) -> None:
+    """Persist one pre-activation intent for the exact launch-driver service.
+
+    The marker is write-once and deliberately distinct from the later runc
+    submission. If systemd activation has an uncertain outcome, a controller
+    must reconcile the exact unit or retain the execution fence; it cannot
+    manufacture a second start intent.
+    """
+
+    columns = {row["name"] for row in connection.execute("PRAGMA table_info(sandbox_executions)")}
+    if not columns:
+        raise sqlite3.DatabaseError(
+            "sandbox_executions must exist before launch-driver start-intent migration"
+        )
+    additions = (
+        ("launch_driver_start_id", "TEXT NOT NULL DEFAULT ''"),
+        ("launch_driver_start_digest", "TEXT NOT NULL DEFAULT ''"),
+        ("launch_driver_start_at", "TEXT NOT NULL DEFAULT ''"),
+        ("launch_driver_start_unit", "TEXT NOT NULL DEFAULT ''"),
+    )
+    for name, definition in additions:
+        if name not in columns:
+            connection.execute(f"ALTER TABLE sandbox_executions ADD COLUMN {name} {definition}")
+
+    for trigger in (
+        "sandbox_launch_driver_start_insert_guard",
+        "sandbox_launch_driver_start_write_once",
+    ):
+        connection.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+
+    connection.execute(
+        """
+        CREATE TRIGGER sandbox_launch_driver_start_insert_guard
+        BEFORE INSERT ON sandbox_executions
+        WHEN NEW.launch_driver_start_id != ''
+          OR NEW.launch_driver_start_digest != ''
+          OR NEW.launch_driver_start_at != ''
+          OR NEW.launch_driver_start_unit != ''
+        BEGIN
+          SELECT RAISE(ABORT, 'sandbox_launch_driver_start_must_follow_reservation');
+        END
+        """
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER sandbox_launch_driver_start_write_once
+        BEFORE UPDATE OF launch_driver_start_id, launch_driver_start_digest,
+          launch_driver_start_at, launch_driver_start_unit ON sandbox_executions
+        WHEN NOT (
+          OLD.phase = 'reserved' AND NEW.phase = 'reserved'
+          AND OLD.launch_driver_start_id = ''
+          AND OLD.launch_driver_start_digest = ''
+          AND OLD.launch_driver_start_at = ''
+          AND OLD.launch_driver_start_unit = ''
+          AND OLD.launch_submission_id = ''
+          AND OLD.launch_plan_required = 1
+          AND OLD.workspace_binding_version = 1
+          AND OLD.private_path_binding_version = 1
+          AND length(NEW.launch_driver_start_id) = 32
+          AND NEW.launch_driver_start_id NOT GLOB '*[^0-9a-f]*'
+          AND length(NEW.launch_driver_start_digest) = 64
+          AND NEW.launch_driver_start_digest NOT GLOB '*[^0-9a-f]*'
+          AND length(NEW.launch_driver_start_at) BETWEEN 1 AND 64
+          AND NEW.launch_driver_start_unit = 'acp-launch-driver-' || OLD.execution_id || '.service'
+          AND acp_sandbox_launch_driver_start_authorized(
+            OLD.attempt_id, OLD.claim_token, OLD.execution_id,
+            NEW.launch_driver_start_id, NEW.launch_driver_start_digest,
+            NEW.launch_driver_start_unit
+          ) = 1
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'sandbox_launch_driver_start_must_be_authorized_once');
+        END
+        """
+    )
+
+
+def _add_sandbox_launch_driver_start_redemption(connection: sqlite3.Connection) -> None:
+    """Persist the one exact service activation that may submit the pinned launch."""
+
+    columns = {row["name"] for row in connection.execute("PRAGMA table_info(sandbox_executions)")}
+    if not columns:
+        raise sqlite3.DatabaseError(
+            "sandbox_executions must exist before launch-driver redemption migration"
+        )
+    additions = (
+        ("launch_driver_start_redeemed_at", "TEXT NOT NULL DEFAULT ''"),
+        ("launch_driver_start_redeemed_invocation_id", "TEXT NOT NULL DEFAULT ''"),
+        ("launch_driver_start_redeemed_pid", "INTEGER"),
+        ("launch_driver_start_redeemed_identity", "TEXT NOT NULL DEFAULT ''"),
+        ("launch_driver_start_redeemed_cgroup_path", "TEXT NOT NULL DEFAULT ''"),
+        ("launch_driver_start_redeemed_slice_unit", "TEXT NOT NULL DEFAULT ''"),
+        ("launch_driver_start_redeemed_slice_invocation_id", "TEXT NOT NULL DEFAULT ''"),
+        ("launch_driver_start_redeemed_slice_cgroup_path", "TEXT NOT NULL DEFAULT ''"),
+    )
+    for name, definition in additions:
+        if name not in columns:
+            connection.execute(f"ALTER TABLE sandbox_executions ADD COLUMN {name} {definition}")
+
+    for trigger in (
+        "sandbox_launch_driver_redemption_insert_guard",
+        "sandbox_launch_driver_redemption_write_once",
+        "sandbox_execution_submission_requires_driver_redemption",
+        "sandbox_execution_launch_requires_driver_redemption",
+        "sandbox_execution_running_requires_redeemed_driver",
+    ):
+        connection.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+
+    connection.execute(
+        """
+        CREATE TRIGGER sandbox_launch_driver_redemption_insert_guard
+        BEFORE INSERT ON sandbox_executions
+        WHEN NEW.launch_driver_start_redeemed_at != ''
+          OR NEW.launch_driver_start_redeemed_invocation_id != ''
+          OR NEW.launch_driver_start_redeemed_pid IS NOT NULL
+          OR NEW.launch_driver_start_redeemed_identity != ''
+          OR NEW.launch_driver_start_redeemed_cgroup_path != ''
+          OR NEW.launch_driver_start_redeemed_slice_unit != ''
+          OR NEW.launch_driver_start_redeemed_slice_invocation_id != ''
+          OR NEW.launch_driver_start_redeemed_slice_cgroup_path != ''
+        BEGIN
+          SELECT RAISE(ABORT, 'sandbox_launch_driver_redemption_must_follow_start_intent');
+        END
+        """
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER sandbox_launch_driver_redemption_write_once
+        BEFORE UPDATE OF launch_driver_start_redeemed_at,
+          launch_driver_start_redeemed_invocation_id, launch_driver_start_redeemed_pid,
+          launch_driver_start_redeemed_identity, launch_driver_start_redeemed_cgroup_path,
+          launch_driver_start_redeemed_slice_unit,
+          launch_driver_start_redeemed_slice_invocation_id,
+          launch_driver_start_redeemed_slice_cgroup_path ON sandbox_executions
+        WHEN NOT (
+          OLD.phase = 'reserved' AND NEW.phase = 'reserved'
+          AND OLD.launch_driver_start_id != ''
+          AND OLD.launch_driver_start_digest != ''
+          AND OLD.launch_driver_start_unit = 'acp-launch-driver-' || OLD.execution_id || '.service'
+          AND OLD.launch_driver_start_redeemed_at = ''
+          AND OLD.launch_driver_start_redeemed_invocation_id = ''
+          AND OLD.launch_driver_start_redeemed_pid IS NULL
+          AND OLD.launch_driver_start_redeemed_identity = ''
+          AND OLD.launch_driver_start_redeemed_cgroup_path = ''
+          AND OLD.launch_driver_start_redeemed_slice_unit = ''
+          AND OLD.launch_driver_start_redeemed_slice_invocation_id = ''
+          AND OLD.launch_driver_start_redeemed_slice_cgroup_path = ''
+          AND length(NEW.launch_driver_start_redeemed_at) BETWEEN 1 AND 64
+          AND length(NEW.launch_driver_start_redeemed_invocation_id) = 32
+          AND NEW.launch_driver_start_redeemed_invocation_id NOT GLOB '*[^0-9a-f]*'
+          AND NEW.launch_driver_start_redeemed_pid IS NOT NULL
+          AND NEW.launch_driver_start_redeemed_pid > 0
+          AND NEW.launch_driver_start_redeemed_identity LIKE
+            ('linux:' || NEW.launch_driver_start_redeemed_pid || ':%')
+          AND NEW.launch_driver_start_redeemed_cgroup_path =
+            NEW.launch_driver_start_redeemed_slice_cgroup_path || '/' || OLD.launch_driver_start_unit
+          AND NEW.launch_driver_start_redeemed_slice_unit != ''
+          AND substr(NEW.launch_driver_start_redeemed_slice_unit, -6) = '.slice'
+          AND length(NEW.launch_driver_start_redeemed_slice_invocation_id) = 32
+          AND NEW.launch_driver_start_redeemed_slice_invocation_id NOT GLOB '*[^0-9a-f]*'
+          AND NEW.launch_driver_start_redeemed_slice_cgroup_path != ''
+          AND substr(NEW.launch_driver_start_redeemed_slice_cgroup_path, 1, 1) = '/'
+          AND substr(NEW.launch_driver_start_redeemed_slice_cgroup_path,
+            -length(NEW.launch_driver_start_redeemed_slice_unit)) =
+            NEW.launch_driver_start_redeemed_slice_unit
+          AND acp_sandbox_launch_driver_redemption_authorized(
+            OLD.attempt_id, OLD.claim_token, OLD.execution_id,
+            OLD.launch_driver_start_id, OLD.launch_driver_start_digest,
+            OLD.launch_driver_start_unit,
+            NEW.launch_driver_start_redeemed_at,
+            NEW.launch_driver_start_redeemed_invocation_id,
+            NEW.launch_driver_start_redeemed_pid,
+            NEW.launch_driver_start_redeemed_identity,
+            NEW.launch_driver_start_redeemed_cgroup_path,
+            NEW.launch_driver_start_redeemed_slice_unit,
+            NEW.launch_driver_start_redeemed_slice_invocation_id,
+            NEW.launch_driver_start_redeemed_slice_cgroup_path
+          ) = 1
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'sandbox_launch_driver_redemption_must_be_authorized_once');
+        END
+        """
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER sandbox_execution_submission_requires_driver_redemption
+        BEFORE UPDATE OF launch_submission_id, launch_submission_digest,
+          launch_submission_at ON sandbox_executions
+        WHEN (
+          NEW.launch_submission_id != OLD.launch_submission_id
+          OR NEW.launch_submission_digest != OLD.launch_submission_digest
+          OR NEW.launch_submission_at != OLD.launch_submission_at
+        ) AND (
+          OLD.launch_driver_start_id = ''
+          OR OLD.launch_driver_start_redeemed_at = ''
+          OR OLD.launch_driver_start_redeemed_pid IS NULL
+          OR OLD.launch_driver_start_redeemed_invocation_id = ''
+          OR OLD.launch_driver_start_redeemed_slice_unit = ''
+          OR OLD.launch_driver_start_redeemed_slice_invocation_id = ''
+          OR OLD.launch_driver_start_redeemed_slice_cgroup_path = ''
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'sandbox_execution_driver_redemption_required');
+        END
+        """
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER sandbox_execution_launch_requires_driver_redemption
+        BEFORE UPDATE OF phase ON sandbox_executions
+        WHEN OLD.phase = 'reserved' AND NEW.phase = 'launched'
+          AND (
+            OLD.launch_driver_start_redeemed_at = ''
+            OR OLD.launch_driver_start_redeemed_pid IS NULL
+            OR NEW.attempt_slice_unit IS NOT OLD.launch_driver_start_redeemed_slice_unit
+            OR NEW.attempt_slice_invocation_id IS NOT
+              OLD.launch_driver_start_redeemed_slice_invocation_id
+            OR NEW.attempt_slice_cgroup_path IS NOT
+              OLD.launch_driver_start_redeemed_slice_cgroup_path
+          )
+        BEGIN
+          SELECT RAISE(ABORT, 'sandbox_execution_driver_redemption_mismatch');
+        END
+        """
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER sandbox_execution_running_requires_redeemed_driver
+        BEFORE UPDATE OF phase ON sandbox_executions
+        WHEN OLD.phase = 'launched' AND NEW.phase = 'running'
+          AND (
+            OLD.launch_driver_start_redeemed_at = ''
+            OR NEW.launch_driver_pid IS NOT OLD.launch_driver_start_redeemed_pid
+            OR NEW.launch_driver_identity IS NOT OLD.launch_driver_start_redeemed_identity
+            OR NEW.launch_driver_unit IS NOT OLD.launch_driver_start_unit
+            OR NEW.launch_driver_invocation_id IS NOT
+              OLD.launch_driver_start_redeemed_invocation_id
+            OR NEW.launch_driver_cgroup_path IS NOT
+              OLD.launch_driver_start_redeemed_cgroup_path
+            OR NEW.attempt_slice_unit IS NOT OLD.launch_driver_start_redeemed_slice_unit
+            OR NEW.attempt_slice_invocation_id IS NOT
+              OLD.launch_driver_start_redeemed_slice_invocation_id
+            OR NEW.attempt_slice_cgroup_path IS NOT
+              OLD.launch_driver_start_redeemed_slice_cgroup_path
+          )
+        BEGIN
+          SELECT RAISE(ABORT, 'sandbox_execution_running_driver_redemption_mismatch');
+        END
+        """
+    )
+
+
+def _require_pinned_runc_cleanup_action_receipt(connection: sqlite3.Connection) -> None:
+    """Require process-local provenance for every new cleanup report.
+
+    Historical v1/v2 reports remain readable for migration/replay compatibility.
+    New v2 reports are only unverified journal records and require the exact
+    journal-writer capability. A v3 report additionally requires a registered
+    exact pinned-runc delete receipt scoped to its canonical payload.
+    """
+
+    columns = {row["name"] for row in connection.execute("PRAGMA table_info(sandbox_executions)")}
+    if not columns or "cleanup_receipt_json" not in columns:
+        raise sqlite3.DatabaseError(
+            "sandbox_executions must exist before cleanup action provenance migration"
+        )
+    connection.execute("DROP TRIGGER IF EXISTS sandbox_execution_cleanup_action_receipt_guard")
+    connection.execute(
+        """
+        CREATE TRIGGER sandbox_execution_cleanup_action_receipt_guard
+        BEFORE UPDATE OF cleanup_receipt_json, phase ON sandbox_executions
+        WHEN OLD.phase = 'exited' AND NEW.phase = 'cleanup_reported'
+          AND (OLD.cleanup_receipt_json IS NOT NEW.cleanup_receipt_json
+            OR OLD.phase IS NOT NEW.phase)
+          AND NOT (
+            CASE
+              WHEN json_valid(NEW.cleanup_receipt_json) THEN
+                CASE
+                  WHEN json_type(NEW.cleanup_receipt_json, '$.version')
+                        IN ('integer', 'real')
+                    AND json_extract(NEW.cleanup_receipt_json, '$.version') = 3
+                  THEN acp_sandbox_cleanup_action_authorized(
+                    OLD.attempt_id, OLD.claim_token, OLD.execution_id,
+                    NEW.cleanup_receipt_json
+                  ) = 1
+                  ELSE acp_sandbox_cleanup_report_authorized(
+                    OLD.attempt_id, OLD.claim_token, OLD.execution_id,
+                    NEW.cleanup_receipt_json
+                  ) = 1
+                END
+              ELSE acp_sandbox_cleanup_report_authorized(
+                OLD.attempt_id, OLD.claim_token, OLD.execution_id,
+                NEW.cleanup_receipt_json
+              ) = 1
+            END
+          )
+        BEGIN
+          SELECT RAISE(ABORT, 'sandbox_execution_cleanup_receipt_provenance_required');
+        END
+        """
+    )
+
+
+def _require_independent_sandbox_cleanup_verification(connection: sqlite3.Connection) -> None:
+    """Guard the only transition that can certify final sandbox cleanup.
+
+    The journal's cleanup action receipt is explicitly unverified. This migration
+    adds a separate write-once verifier receipt and makes its process-local
+    authorization mandatory for ``cleanup_reported -> cleanup_verified``.
+    Historical rows remain readable and receive the empty sentinel.
+    """
+
+    columns = {row["name"] for row in connection.execute("PRAGMA table_info(sandbox_executions)")}
+    if not columns:
+        raise sqlite3.DatabaseError(
+            "sandbox_executions must exist before independent cleanup verification migration"
+        )
+    if "cleanup_verification_json" not in columns:
+        connection.execute(
+            "ALTER TABLE sandbox_executions ADD COLUMN cleanup_verification_json "
+            "TEXT NOT NULL DEFAULT '{}'"
+        )
+
+    connection.execute("DROP TRIGGER IF EXISTS sandbox_execution_phase_transition")
+    connection.execute(
+        """
+        CREATE TRIGGER sandbox_execution_phase_transition
+        BEFORE UPDATE OF phase ON sandbox_executions
+        WHEN OLD.phase != NEW.phase AND NOT (
+          (OLD.phase = 'reserved' AND NEW.phase IN ('launched', 'ambiguous'))
+          OR (OLD.phase = 'launched' AND NEW.phase IN ('running', 'stopping', 'exited', 'ambiguous'))
+          OR (OLD.phase = 'running' AND NEW.phase IN ('stopping', 'exited', 'ambiguous'))
+          OR (OLD.phase = 'stopping' AND NEW.phase IN ('exited', 'ambiguous'))
+          OR (OLD.phase = 'exited' AND NEW.phase IN ('cleanup_reported', 'ambiguous'))
+          OR (OLD.phase = 'cleanup_reported' AND NEW.phase = 'ambiguous')
+          OR (OLD.phase = 'cleanup_reported' AND NEW.phase = 'cleanup_verified'
+            AND OLD.cleanup_verification_json = '{}'
+            AND NEW.cleanup_verification_json != '{}'
+            AND length(NEW.cleanup_verification_json) <= 65536
+            AND json_valid(NEW.cleanup_verification_json)
+            AND json_type(NEW.cleanup_verification_json, '$.version') = 'integer'
+            AND json_extract(NEW.cleanup_verification_json, '$.version') = 1
+            AND acp_sandbox_cleanup_verification_authorized(
+              OLD.attempt_id, OLD.claim_token, OLD.execution_id,
+              NEW.cleanup_verification_json
+            ) = 1)
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'sandbox_execution_phase_transition_invalid');
+        END
+        """
+    )
+    connection.execute("DROP TRIGGER IF EXISTS sandbox_cleanup_verification_insert_guard")
+    connection.execute(
+        """
+        CREATE TRIGGER sandbox_cleanup_verification_insert_guard
+        BEFORE INSERT ON sandbox_executions
+        WHEN NEW.cleanup_verification_json != '{}'
+        BEGIN
+          SELECT RAISE(ABORT, 'sandbox_cleanup_verification_must_be_written_after_observation');
+        END
+        """
+    )
+    connection.execute("DROP TRIGGER IF EXISTS sandbox_cleanup_verification_write_once")
+    connection.execute(
+        """
+        CREATE TRIGGER sandbox_cleanup_verification_write_once
+        BEFORE UPDATE OF cleanup_verification_json ON sandbox_executions
+        WHEN OLD.cleanup_verification_json IS NOT NEW.cleanup_verification_json
+          AND NOT (
+            OLD.phase = 'cleanup_reported' AND NEW.phase = 'cleanup_verified'
+            AND OLD.cleanup_verification_json = '{}'
+            AND NEW.cleanup_verification_json != '{}'
+            AND length(NEW.cleanup_verification_json) <= 65536
+            AND json_valid(NEW.cleanup_verification_json)
+            AND json_type(NEW.cleanup_verification_json, '$.version') = 'integer'
+            AND json_extract(NEW.cleanup_verification_json, '$.version') = 1
+            AND acp_sandbox_cleanup_verification_authorized(
+              OLD.attempt_id, OLD.claim_token, OLD.execution_id,
+              NEW.cleanup_verification_json
+            ) = 1
+          )
+        BEGIN
+          SELECT RAISE(ABORT, 'sandbox_execution_cleanup_verification_provenance_required');
+        END
+        """
+    )
+
+
+def _allow_lease_loss_quarantined_exit(connection: sqlite3.Connection) -> None:
+    """Allow exact kernel-wait exit evidence to advance a quarantined lease-loss run.
+
+    The ambiguous-to-exited transition remains restricted to the launch-driver's
+    exact lease-loss quarantine reason and the existing process-local wait-receipt
+    authorization. Cleanup still requires its separate action and verifier receipts.
+    """
+
+    reason = "launch-driver stop intent could not be recorded after attempt lease loss"
+    connection.execute("DROP TRIGGER IF EXISTS sandbox_execution_phase_transition")
+    connection.execute(
+        f"""
+        CREATE TRIGGER sandbox_execution_phase_transition
+        BEFORE UPDATE OF phase ON sandbox_executions
+        WHEN OLD.phase != NEW.phase AND NOT (
+          (OLD.phase = 'reserved' AND NEW.phase IN ('launched', 'ambiguous'))
+          OR (OLD.phase = 'launched' AND NEW.phase IN ('running', 'stopping', 'exited', 'ambiguous'))
+          OR (OLD.phase = 'running' AND NEW.phase IN ('stopping', 'exited', 'ambiguous'))
+          OR (OLD.phase = 'stopping' AND NEW.phase IN ('exited', 'ambiguous'))
+          OR (OLD.phase = 'exited' AND NEW.phase IN ('cleanup_reported', 'ambiguous'))
+          OR (OLD.phase = 'cleanup_reported' AND NEW.phase = 'ambiguous')
+          OR (OLD.phase = 'cleanup_reported' AND NEW.phase = 'cleanup_verified'
+            AND OLD.cleanup_verification_json = '{{}}'
+            AND NEW.cleanup_verification_json != '{{}}'
+            AND length(NEW.cleanup_verification_json) <= 65536
+            AND json_valid(NEW.cleanup_verification_json)
+            AND json_type(NEW.cleanup_verification_json, '$.version') = 'integer'
+            AND json_extract(NEW.cleanup_verification_json, '$.version') = 1
+            AND acp_sandbox_cleanup_verification_authorized(
+              OLD.attempt_id, OLD.claim_token, OLD.execution_id,
+              NEW.cleanup_verification_json
+            ) = 1)
+          OR (OLD.phase = 'ambiguous' AND NEW.phase = 'exited'
+            AND OLD.failure_reason = '{reason}')
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'sandbox_execution_phase_transition_invalid');
+        END
+        """
+    )
+    connection.execute("DROP TRIGGER IF EXISTS sandbox_execution_exit_requires_kernel_waitpid")
+    connection.execute(
+        f"""
+        CREATE TRIGGER sandbox_execution_exit_requires_kernel_waitpid
+        BEFORE UPDATE OF phase ON sandbox_executions
+        WHEN (
+          OLD.phase IN ('launched', 'running', 'stopping')
+          OR (OLD.phase = 'ambiguous' AND OLD.failure_reason = '{reason}')
+        )
+          AND NEW.phase = 'exited'
+          AND (
+            NEW.runc_exit_observed_by != 'runc_client_popen_wait'
+            OR NEW.runc_exit_evidence_source != 'runc_client_kernel_waitpid'
+          )
+        BEGIN
+          SELECT RAISE(ABORT, 'sandbox_execution_kernel_wait_evidence_required');
+        END
+        """
+    )
+    connection.execute("DROP TRIGGER IF EXISTS sandbox_execution_exit_evidence_write_guard")
+    connection.execute(
+        f"""
+        CREATE TRIGGER sandbox_execution_exit_evidence_write_guard
+        BEFORE UPDATE OF runc_exit_code, runc_exit_observed_by,
+          runc_exit_evidence_source ON sandbox_executions
+        WHEN (
+          OLD.runc_exit_code IS NOT NEW.runc_exit_code
+          OR OLD.runc_exit_observed_by IS NOT NEW.runc_exit_observed_by
+          OR OLD.runc_exit_evidence_source IS NOT NEW.runc_exit_evidence_source
+        ) AND NOT (
+          (
+            OLD.phase IN ('launched', 'running', 'stopping')
+            OR (OLD.phase = 'ambiguous' AND OLD.failure_reason = '{reason}')
+          )
+          AND NEW.phase = 'exited'
+          AND OLD.runc_exit_code IS NULL
+          AND OLD.runc_exit_observed_by = ''
+          AND OLD.runc_exit_evidence_source = ''
+          AND NEW.runc_exit_code IS NOT NULL
+          AND NEW.runc_exit_observed_by = 'runc_client_popen_wait'
+          AND NEW.runc_exit_evidence_source = 'runc_client_kernel_waitpid'
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'sandbox_execution_exit_evidence_write_requires_exit');
+        END
+        """
+    )
+    connection.execute("DROP TRIGGER IF EXISTS sandbox_execution_exit_receipt_guard")
+    connection.execute(
+        f"""
+        CREATE TRIGGER sandbox_execution_exit_receipt_guard
+        BEFORE UPDATE OF phase ON sandbox_executions
+        WHEN (
+          OLD.phase IN ('launched', 'running', 'stopping')
+          OR (OLD.phase = 'ambiguous' AND OLD.failure_reason = '{reason}')
+        )
+          AND NEW.phase = 'exited'
+          AND acp_sandbox_exit_receipt_authorized(
+            OLD.attempt_id, OLD.claim_token, OLD.execution_id,
+            OLD.runc_client_pid, OLD.runc_client_identity, NEW.runc_exit_code
+          ) != 1
+        BEGIN
+          SELECT RAISE(ABORT, 'sandbox_execution_wait_receipt_required');
+        END
+        """
+    )
+
+
+def _bind_provider_proxy_artifact_to_launch_submission(connection: sqlite3.Connection) -> None:
+    """Persist the exact provider-proxy inode fence in the one-use launch latch."""
+
+    columns = {row["name"] for row in connection.execute("PRAGMA table_info(sandbox_executions)")}
+    if not columns:
+        raise sqlite3.DatabaseError(
+            "sandbox_executions must exist before provider-proxy artifact migration"
+        )
+    if "provider_proxy_artifact_json" not in columns:
+        connection.execute(
+            "ALTER TABLE sandbox_executions ADD COLUMN provider_proxy_artifact_json "
+            "TEXT NOT NULL DEFAULT '{}'"
+        )
+
+    connection.execute("DROP TRIGGER IF EXISTS sandbox_provider_proxy_artifact_insert_guard")
+    connection.execute(
+        """
+        CREATE TRIGGER sandbox_provider_proxy_artifact_insert_guard
+        BEFORE INSERT ON sandbox_executions
+        WHEN NEW.provider_proxy_artifact_json != '{}'
+        BEGIN
+          SELECT RAISE(ABORT, 'sandbox_provider_proxy_artifact_must_follow_reservation');
+        END
+        """
+    )
+    connection.execute("DROP TRIGGER IF EXISTS sandbox_provider_proxy_artifact_write_once")
+    connection.execute(
+        """
+        CREATE TRIGGER sandbox_provider_proxy_artifact_write_once
+        BEFORE UPDATE OF provider_proxy_artifact_json ON sandbox_executions
+        WHEN OLD.provider_proxy_artifact_json IS NOT NEW.provider_proxy_artifact_json
+          AND NOT (
+            OLD.phase = 'reserved' AND NEW.phase = 'reserved'
+            AND OLD.provider_proxy_artifact_json = '{}'
+            AND length(NEW.provider_proxy_artifact_json) BETWEEN 1 AND 16384
+            AND json_valid(NEW.provider_proxy_artifact_json)
+            AND json_type(NEW.provider_proxy_artifact_json, '$.version') = 'integer'
+            AND json_extract(NEW.provider_proxy_artifact_json, '$.version') = 1
+            AND json_extract(NEW.provider_proxy_artifact_json, '$.attempt_id') = OLD.attempt_id
+            AND json_type(NEW.provider_proxy_artifact_json, '$.claim_token') = 'integer'
+            AND json_extract(NEW.provider_proxy_artifact_json, '$.claim_token') = OLD.claim_token
+            AND json_extract(NEW.provider_proxy_artifact_json, '$.execution_id') = OLD.execution_id
+            AND json_extract(NEW.provider_proxy_artifact_json, '$.state_root.path') = OLD.state_path
+            AND json_type(NEW.provider_proxy_artifact_json, '$.state_root.device') = 'integer'
+            AND json_extract(NEW.provider_proxy_artifact_json, '$.state_root.device') = OLD.state_root_dev
+            AND json_type(NEW.provider_proxy_artifact_json, '$.state_root.inode') = 'integer'
+            AND json_extract(NEW.provider_proxy_artifact_json, '$.state_root.inode') = OLD.state_root_ino
+            AND json_type(NEW.provider_proxy_artifact_json, '$.directory.device') = 'integer'
+            AND json_extract(NEW.provider_proxy_artifact_json, '$.directory.device') >= 0
+            AND json_type(NEW.provider_proxy_artifact_json, '$.directory.inode') = 'integer'
+            AND json_extract(NEW.provider_proxy_artifact_json, '$.directory.inode') > 0
+            AND json_type(NEW.provider_proxy_artifact_json, '$.socket.device') = 'integer'
+            AND json_extract(NEW.provider_proxy_artifact_json, '$.socket.device') >= 0
+            AND json_type(NEW.provider_proxy_artifact_json, '$.socket.inode') = 'integer'
+            AND json_extract(NEW.provider_proxy_artifact_json, '$.socket.inode') > 0
+            AND NEW.launch_submission_id != ''
+            AND NEW.launch_submission_digest != ''
+            AND NEW.launch_submission_at != ''
+            AND acp_sandbox_launch_submission_authorized(
+              OLD.attempt_id, OLD.claim_token, OLD.execution_id,
+              NEW.launch_submission_id, NEW.launch_submission_digest
+            ) = 1
+          )
+        BEGIN
+          SELECT RAISE(ABORT, 'sandbox_provider_proxy_artifact_must_be_bound_to_launch_once');
+        END
+        """
+    )
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     (2, _add_declared_resources),
     (3, _add_attempt_progress_timestamps),
@@ -1602,6 +2557,17 @@ MIGRATIONS: tuple[Migration, ...] = (
     (22, _add_sandbox_launch_plan_binding),
     (23, _add_agent_intent_revisions),
     (24, _add_agent_intent_attempt_latest_index),
+    (25, _add_sandbox_bundle_digest_semantics),
+    (26, _add_sandbox_attempt_slice_identity),
+    (27, _require_verified_cleanup_before_candidate_capture),
+    (28, _add_sandbox_launch_submission_receipt),
+    (29, _add_sandbox_launch_driver_process_identity),
+    (30, _add_sandbox_launch_driver_start_intent),
+    (31, _add_sandbox_launch_driver_start_redemption),
+    (32, _require_pinned_runc_cleanup_action_receipt),
+    (33, _require_independent_sandbox_cleanup_verification),
+    (34, _allow_lease_loss_quarantined_exit),
+    (35, _bind_provider_proxy_artifact_to_launch_submission),
 )
 
 

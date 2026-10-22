@@ -30,6 +30,32 @@ from .common import (
 from .sandbox_execution_journal import _sandbox_execution_cleanup_is_verified
 
 
+def _sandbox_execution_cleanup_hold_diagnostic(execution: Any | None) -> tuple[str, str]:
+    """Describe why proxy artifacts remain fenced without treating them as removable."""
+
+    if execution is None:
+        phase = "missing"
+        submission_state = "unknown"
+    else:
+        phase = str(execution["phase"])
+        submission = (
+            execution["launch_submission_id"],
+            execution["launch_submission_digest"],
+            execution["launch_submission_at"],
+        )
+        if all(submission):
+            submission_state = "recorded"
+        elif any(submission):
+            submission_state = "partial_or_ambiguous"
+        else:
+            submission_state = "absent"
+    reason = (
+        f"sandbox cleanup unverified (phase={phase}, launch_submission={submission_state}); "
+        "provider proxy artifact, if present, is retained; attempt and resources remain fenced"
+    )
+    return submission_state, reason
+
+
 class ReaperMixin:
     """Lease expiry, two-phase cleanup, worktree GC and quarantine recovery."""
 
@@ -52,9 +78,10 @@ class ReaperMixin:
     #     away would forge exactly the proof the mismatch is reporting.
     #   * recover NEVER releases an allocation on an assertion. A port returns
     #     to the pool only against a POSITIVE ABSENCE PROOF — the driver's own
-    #     verify phase reporting present=False, or the port failing to accept a
-    #     bind. An operator receipt is authenticated and recorded, but it is
-    #     testimony, not proof, and it cannot release anything on its own.
+    #     verify phase succeeding under its cleanup-proof policy, or the port
+    #     successfully accepting a bind. An operator receipt is authenticated
+    #     and recorded, but it is testimony, not proof, and it cannot release
+    #     anything on its own.
     # ------------------------------------------------------------------ #
 
     _QUARANTINE_ACTIONS: tuple[str, ...] = (
@@ -995,6 +1022,64 @@ class ReaperMixin:
         cleanup_attempts: set[str] = set()
         workers_to_stop: list[tuple[str, int, str]] = []
         task_cleanups: dict[str, str] = {}
+        # Cleanup verification performs bounded systemd/proc/cgroup inspection
+        # and may remove the exact recorded private trees.  Run it before the
+        # write transaction so a crashed verifier can be retried on the next
+        # reap without holding SQLite's global writer lock during OS checks.
+        with self.connect() as connection:
+            pending_verification = connection.execute(
+                """
+                SELECT execution.attempt_id, execution.claim_token
+                FROM sandbox_executions AS execution
+                JOIN attempts AS attempt ON attempt.id = execution.attempt_id
+                WHERE execution.phase = 'cleanup_reported'
+                  AND (
+                    (attempt.status IN ('provisioning', 'working')
+                     AND attempt.lease_expires_at <= ?)
+                    OR attempt.status = 'terminating'
+                  )
+                ORDER BY execution.attempt_id
+                """,
+                (epoch,),
+            ).fetchall()
+        for pending in pending_verification:
+            try:
+                self._sandbox_execution_verify_cleanup(
+                    pending["attempt_id"], pending["claim_token"]
+                )
+            except (OSError, subprocess.SubprocessError, SupervisorError):
+                # The transactional pass below keeps the attempt quarantined
+                # and all resources fenced unless the durable receipt exists.
+                # A later reap retries the exact row under its inode fence.
+                continue
+        with self.connect() as connection:
+            pending_recovery = connection.execute(
+                """
+                SELECT execution.attempt_id, execution.claim_token
+                FROM sandbox_executions AS execution
+                JOIN attempts AS attempt ON attempt.id = execution.attempt_id
+                WHERE execution.phase = 'exited'
+                  AND (
+                    (attempt.status IN ('provisioning', 'working')
+                     AND attempt.lease_expires_at <= ?)
+                    OR attempt.status = 'terminating'
+                  )
+                ORDER BY execution.attempt_id
+                """,
+                (epoch,),
+            ).fetchall()
+        for pending in pending_recovery:
+            try:
+                self._sandbox_execution_recover_cleanup(
+                    pending["attempt_id"],
+                    pending["claim_token"],
+                    reaper_epoch=epoch,
+                )
+            except (OSError, subprocess.SubprocessError, SupervisorError):
+                # Recovery is deliberately best-effort. Its exact receipt or
+                # the normal cleanup verifier is the only path that can release
+                # the attempt and resource fences in the transactional pass.
+                continue
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             attempts = connection.execute(
@@ -1036,10 +1121,15 @@ class ReaperMixin:
                     (CLEANUP_FENCE_EPOCH, stamp, attempt["id"]),
                 )
                 if not _sandbox_execution_cleanup_is_verified(connection, attempt["id"]):
-                    phase = connection.execute(
-                        "SELECT phase FROM sandbox_executions WHERE attempt_id = ?",
+                    execution = connection.execute(
+                        "SELECT phase, launch_submission_id, launch_submission_digest, "
+                        "launch_submission_at FROM sandbox_executions WHERE attempt_id = ?",
                         (attempt["id"],),
-                    ).fetchone()["phase"]
+                    ).fetchone()
+                    submission_state, cleanup_reason = _sandbox_execution_cleanup_hold_diagnostic(
+                        execution
+                    )
+                    phase = execution["phase"] if execution is not None else "missing"
                     connection.execute(
                         "UPDATE attempts SET termination_target_status = 'quarantined', "
                         "updated_at = ? WHERE id = ?",
@@ -1051,8 +1141,7 @@ class ReaperMixin:
                         "cleanup_error = ?, updated_at = ? "
                         "WHERE id = ? AND current_attempt_id = ?",
                         (
-                            "sandbox execution cleanup is not independently verified; "
-                            "attempt and resources remain fenced",
+                            cleanup_reason,
                             stamp,
                             attempt["task_id"],
                             attempt["id"],
@@ -1070,6 +1159,8 @@ class ReaperMixin:
                                 "attempt_id": attempt["id"],
                                 "claim_token": attempt["claim_token"],
                                 "phase": phase,
+                                "launch_submission_state": submission_state,
+                                "provider_proxy_artifact_action": "retained_if_present",
                             },
                         )
                     continue

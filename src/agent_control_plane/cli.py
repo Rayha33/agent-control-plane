@@ -64,6 +64,18 @@ def parse_duration(text: str) -> int:
     return int(value[:-1]) * DURATION_UNITS[value[-1]]
 
 
+def _parse_provider_uds_destination(raw: str) -> tuple[str, int]:
+    """Parse one provider destination for the experimental UDS-only route."""
+
+    host, separator, port_text = raw.rpartition(":")
+    if not separator or not host or not port_text.isdecimal():
+        raise argparse.ArgumentTypeError("destination must use HOST:PORT")
+    port = int(port_text)
+    if not 1 <= port <= 65535:
+        raise argparse.ArgumentTypeError("destination port must be between 1 and 65535")
+    return host, port
+
+
 def _hook_target(raw: str) -> tuple[str, str] | None:
     try:
         payload = json.loads(raw)
@@ -353,6 +365,36 @@ def parser() -> argparse.ArgumentParser:
         "--result-manifest",
         metavar="PATH",
         help="optional manifest path in the worker commit (relative to the attempt worktree)",
+    )
+    run.add_argument(
+        "--sandbox-experimental-opt-in",
+        action="store_true",
+        help=(
+            "run the experimental OCI worker; requires every resource limit below and "
+            "a pinned sandbox.oci configuration; provider UDS access is separately opt-in"
+        ),
+    )
+    run.add_argument("--sandbox-memory-max-bytes", type=int)
+    run.add_argument("--sandbox-cpu-quota", type=int, help="CPU quota in microseconds")
+    run.add_argument("--sandbox-cpu-period", type=int, help="CPU period in microseconds")
+    run.add_argument("--sandbox-pids-max", type=int)
+    run.add_argument("--sandbox-timeout-seconds", type=float)
+    run.add_argument(
+        "--sandbox-provider-uds-policy-name",
+        help=(
+            "audit label for the caller-supplied provider UDS destination allowlist; "
+            "requires sandbox opt-in and does not select a central policy profile"
+        ),
+    )
+    run.add_argument(
+        "--sandbox-provider-uds-destination",
+        action="append",
+        type=_parse_provider_uds_destination,
+        metavar="HOST:PORT",
+        help=(
+            "allow one normalized CONNECT destination (repeatable); does not enable "
+            "HTTP_PROXY/TCP SDK compatibility"
+        ),
     )
     add_credential_source(run)
     run.add_argument("command", nargs=argparse.REMAINDER)
@@ -996,12 +1038,47 @@ def main(argv: Sequence[str] | None = None) -> int:
             result = supervisor.integrate(args.task_id, args.integrator, _read_credential(args))
         elif args.action == "run":
             command = args.command[1:] if args.command[:1] == ["--"] else args.command
+            sandbox_options = {}
+            provider_destinations: dict[str, list[int]] = {}
+            for host, port in args.sandbox_provider_uds_destination or ():
+                provider_destinations.setdefault(host, []).append(port)
+            provider_requested = args.sandbox_provider_uds_policy_name is not None or bool(
+                provider_destinations
+            )
+            sandbox_values = (
+                args.sandbox_memory_max_bytes,
+                args.sandbox_cpu_quota,
+                args.sandbox_cpu_period,
+                args.sandbox_pids_max,
+                args.sandbox_timeout_seconds,
+            )
+            if (
+                args.sandbox_experimental_opt_in
+                or any(value is not None for value in sandbox_values)
+                or provider_requested
+            ):
+                sandbox_options = {
+                    "sandbox_experimental_opt_in": args.sandbox_experimental_opt_in,
+                    "sandbox_memory_max_bytes": args.sandbox_memory_max_bytes,
+                    "sandbox_cpu_quota": args.sandbox_cpu_quota,
+                    "sandbox_cpu_period": args.sandbox_cpu_period,
+                    "sandbox_pids_max": args.sandbox_pids_max,
+                    "sandbox_timeout_seconds": args.sandbox_timeout_seconds,
+                }
+                if provider_requested:
+                    sandbox_options.update(
+                        {
+                            "sandbox_provider_uds_policy_name": args.sandbox_provider_uds_policy_name,
+                            "sandbox_provider_uds_destinations": provider_destinations or None,
+                        }
+                    )
             result = supervisor.run_worker(
                 args.attempt_id,
                 args.claim_token,
                 command,
                 _read_credential(args),
                 result_manifest_path=args.result_manifest,
+                **sandbox_options,
             )
         elif args.action == "terminate":
             result = supervisor.terminate_worker(args.attempt_id, _read_credential(args))
