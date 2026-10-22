@@ -1,9 +1,17 @@
 from __future__ import annotations
 
+import os
+import time
+import unicodedata
+import uuid
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from threading import Barrier
 
+import pytest
+
 from agent_control_plane.service import ControlPlaneError
+from agent_control_plane.workspace_files import WorkspaceFileError
 
 
 def create_agent(client, admin_headers, name, role):
@@ -50,6 +58,13 @@ def create_task(client, admin_headers, resources=None, dependencies=None, title=
     )
     assert response.status_code == 201, response.text
     return response.json()
+
+
+def create_workspace_resource_task(client, admin_headers, name, resources):
+    worker = create_agent(client, admin_headers, name, "worker")
+    token = issue_coordination_mandate(client, admin_headers, worker["id"])
+    task = create_task(client, admin_headers, resources=resources, title=name)
+    return task, token
 
 
 def claim_task(client, task_id, token):
@@ -108,6 +123,436 @@ def test_simultaneous_claims_have_exactly_one_winner(client, app, admin_headers)
     losers = [outcome for outcome in outcomes if outcome[0] == "lost"]
     assert len(winners) == 1
     assert losers == [("lost", 409, "task_unavailable")]
+
+
+def test_workspace_case_sensitivity_is_probed_from_configured_root(app):
+    store = app.state.coordination.workspace_files
+    root = Path(app.state.settings.workspace_root)
+    probe = root / f"CaseProbe-{uuid.uuid4().hex}"
+    alias = root / probe.name.swapcase()
+    normalization_probe = root / f"NormalizationProbe-é-{uuid.uuid4().hex}"
+    normalization_alias = root / unicodedata.normalize("NFD", normalization_probe.name)
+    try:
+        probe.write_bytes(b"case probe")
+        assert store.case_sensitive is (not alias.exists())
+        normalization_probe.write_bytes(b"normalization probe")
+        assert store.normalization_sensitive is (not normalization_alias.exists())
+    finally:
+        probe.unlink(missing_ok=True)
+        normalization_probe.unlink(missing_ok=True)
+
+    assert not list(root.glob(".AcP-CaseProbe-*"))
+
+
+def test_workspace_file_case_aliases_respect_root_volume_behavior(
+    client, app, admin_headers
+):
+    store = app.state.coordination.workspace_files
+    assert store.case_sensitive is not None
+
+    first_task, first_token = create_workspace_resource_task(
+        client,
+        admin_headers,
+        "case-alias-first",
+        ["workspace-file:src/Name.py"],
+    )
+    first_claim = claim_task(client, first_task["id"], first_token)
+    assert first_claim.status_code == 200, first_claim.text
+
+    second_task, second_token = create_workspace_resource_task(
+        client,
+        admin_headers,
+        "case-alias-second",
+        ["workspace-file:src/name.py"],
+    )
+    second_claim = claim_task(client, second_task["id"], second_token)
+    if store.case_sensitive:
+        assert second_claim.status_code == 200, second_claim.text
+    else:
+        assert second_claim.status_code == 409
+        assert second_claim.json()["error"] == "resource_busy"
+
+
+def test_one_task_cannot_declare_case_aliases_for_one_workspace_file(
+    client, app, admin_headers
+):
+    store = app.state.coordination.workspace_files
+    assert store.case_sensitive is not None
+    task, token = create_workspace_resource_task(
+        client,
+        admin_headers,
+        "case-alias-self-conflict",
+        ["workspace-file:src/Name.py", "workspace-file:src/name.py"],
+    )
+
+    response = claim_task(client, task["id"], token)
+    if store.case_sensitive:
+        assert response.status_code == 200, response.text
+    else:
+        assert response.status_code == 409
+        assert response.json()["error"] == "resource_alias_conflict"
+
+
+def test_preexisting_alias_leases_block_operations_after_upgrade(
+    client, app, admin_headers
+):
+    store = app.state.coordination.workspace_files
+    store.case_sensitive = True
+    first_task, first_token = create_workspace_resource_task(
+        client,
+        admin_headers,
+        "legacy-case-alias-first",
+        ["workspace-file:src/Name.py"],
+    )
+    first_claim = claim_task(client, first_task["id"], first_token)
+    assert first_claim.status_code == 200, first_claim.text
+    first_claim = first_claim.json()
+
+    second_task, second_token = create_workspace_resource_task(
+        client,
+        admin_headers,
+        "legacy-case-alias-second",
+        ["workspace-file:src/name.py"],
+    )
+    second_claim = claim_task(client, second_task["id"], second_token)
+    assert second_claim.status_code == 200, second_claim.text
+
+    store.case_sensitive = False
+    with app.state.coordination.database.connect() as connection:
+        task = app.state.coordination._task_row(connection, first_task["id"])
+        with pytest.raises(ControlPlaneError) as error:
+            app.state.coordination._assert_active_claim(
+                connection,
+                task,
+                first_claim["task"]["owner_agent_id"],
+                first_claim["task"]["claim_fencing_token"],
+                resource_tokens(first_claim),
+                int(time.time()),
+            )
+
+    assert error.value.status_code == 409
+    assert error.value.code == "resource_busy"
+
+
+def test_non_ascii_workspace_paths_fail_closed_on_case_insensitive_roots(
+    client, app, admin_headers
+):
+    app.state.coordination.workspace_files.case_sensitive = False
+    task, token = create_workspace_resource_task(
+        client,
+        admin_headers,
+        "unicode-workspace-path",
+        ["workspace-file:src/café.py"],
+    )
+
+    response = claim_task(client, task["id"], token)
+    assert response.status_code == 422
+    assert response.json()["error"] == "unsupported_workspace_path_alias"
+
+
+def test_unicode_normalization_aliases_collide_on_normalization_insensitive_roots(
+    client, app, admin_headers
+):
+    store = app.state.coordination.workspace_files
+    store.case_sensitive = True
+    store.normalization_sensitive = False
+
+    first_task, first_token = create_workspace_resource_task(
+        client,
+        admin_headers,
+        "normalization-alias-first",
+        ["workspace-file:src/café.py"],
+    )
+    first_claim = claim_task(client, first_task["id"], first_token)
+    assert first_claim.status_code == 200, first_claim.text
+
+    decomposed_path = unicodedata.normalize("NFD", "src/café.py")
+    second_task, second_token = create_workspace_resource_task(
+        client,
+        admin_headers,
+        "normalization-alias-second",
+        [f"workspace-file:{decomposed_path}"],
+    )
+    second_claim = claim_task(client, second_task["id"], second_token)
+    assert second_claim.status_code == 409
+    assert second_claim.json()["error"] == "resource_busy"
+
+
+def test_unicode_spellings_remain_distinct_on_normalization_sensitive_roots(
+    client, app, admin_headers
+):
+    store = app.state.coordination.workspace_files
+    store.case_sensitive = True
+    store.normalization_sensitive = True
+
+    first_task, first_token = create_workspace_resource_task(
+        client,
+        admin_headers,
+        "normalization-sensitive-first",
+        ["workspace-file:src/café.py"],
+    )
+    first_claim = claim_task(client, first_task["id"], first_token)
+    assert first_claim.status_code == 200, first_claim.text
+
+    decomposed_path = unicodedata.normalize("NFD", "src/café.py")
+    second_task, second_token = create_workspace_resource_task(
+        client,
+        admin_headers,
+        "normalization-sensitive-second",
+        [f"workspace-file:{decomposed_path}"],
+    )
+    second_claim = claim_task(client, second_task["id"], second_token)
+    assert second_claim.status_code == 200, second_claim.text
+
+
+def test_one_task_cannot_declare_unicode_normalization_aliases(
+    client, app, admin_headers
+):
+    store = app.state.coordination.workspace_files
+    store.case_sensitive = True
+    store.normalization_sensitive = False
+    decomposed_path = unicodedata.normalize("NFD", "src/café.py")
+    task, token = create_workspace_resource_task(
+        client,
+        admin_headers,
+        "normalization-alias-self-conflict",
+        ["workspace-file:src/café.py", f"workspace-file:{decomposed_path}"],
+    )
+
+    response = claim_task(client, task["id"], token)
+    assert response.status_code == 409
+    assert response.json()["error"] == "resource_alias_conflict"
+
+
+def test_unknown_unicode_normalization_behavior_fails_closed(
+    client, app, admin_headers
+):
+    store = app.state.coordination.workspace_files
+    store.case_sensitive = True
+    store.normalization_sensitive = None
+    task, token = create_workspace_resource_task(
+        client,
+        admin_headers,
+        "unknown-normalization-semantics",
+        ["workspace-file:src/café.py"],
+    )
+
+    response = claim_task(client, task["id"], token)
+    assert response.status_code == 503
+    assert response.json()["error"] == "workspace_volume_semantics_unknown"
+
+
+def test_paths_inside_per_directory_casefolded_directories_fail_closed(
+    client, app, admin_headers, monkeypatch
+):
+    store = app.state.coordination.workspace_files
+    store.case_sensitive = True
+    store.normalization_sensitive = True
+    folded_directory = Path(store.root) / "casefolded"
+    folded_directory.mkdir()
+    folded_inode = folded_directory.stat().st_ino
+    is_casefolded = [True]
+
+    def probe_directory(directory_fd):
+        if os.fstat(directory_fd).st_ino == folded_inode:
+            return not is_casefolded[0], True
+        return True, True
+
+    monkeypatch.setattr(store, "_probe_directory_semantics", probe_directory)
+
+    rejected_task, rejected_token = create_workspace_resource_task(
+        client,
+        admin_headers,
+        "casefolded-directory-claim",
+        ["workspace-file:casefolded/Name.py"],
+    )
+    rejected_claim = claim_task(client, rejected_task["id"], rejected_token)
+    assert rejected_claim.status_code == 422
+    assert rejected_claim.json()["error"] == "unsupported_workspace_path_alias"
+
+    is_casefolded[0] = False
+    task, token = create_workspace_resource_task(
+        client,
+        admin_headers,
+        "casefolded-directory-write",
+        ["workspace-file:casefolded/Name.py"],
+    )
+    claim = claim_task(client, task["id"], token)
+    assert claim.status_code == 200, claim.text
+
+    is_casefolded[0] = True
+    write_response = client.post(
+        f"/v1/tasks/{task['id']}/file-writes",
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "operation_id": str(uuid.uuid4()),
+            "path": "casefolded/Name.py",
+            "expected_sha256": None,
+            "content_base64": "dGVzdA==",
+            "claim_fencing_token": claim.json()["task"]["claim_fencing_token"],
+            "resource_fencing_tokens": resource_tokens(claim.json()),
+        },
+    )
+    assert write_response.status_code == 422
+    assert write_response.json()["error"] == "unsupported_workspace_path_alias"
+    assert not (folded_directory / "Name.py").exists()
+    with pytest.raises(WorkspaceFileError) as error:
+        with store._open_parent("casefolded/Name.py"):
+            pass
+    assert error.value.code == "unsupported_workspace_path_alias"
+
+
+def test_paths_inside_nested_normalization_insensitive_directories_fail_closed(
+    client, app, admin_headers, monkeypatch
+):
+    store = app.state.coordination.workspace_files
+    store.case_sensitive = True
+    store.normalization_sensitive = True
+    nested_directory = Path(store.root) / "normalization-insensitive"
+    nested_directory.mkdir()
+    nested_inode = nested_directory.stat().st_ino
+
+    def probe_directory(directory_fd):
+        if os.fstat(directory_fd).st_ino == nested_inode:
+            return True, False
+        return True, True
+
+    monkeypatch.setattr(store, "_probe_directory_semantics", probe_directory)
+    task, token = create_workspace_resource_task(
+        client,
+        admin_headers,
+        "nested-normalization-alias",
+        ["workspace-file:normalization-insensitive/café.py"],
+    )
+
+    response = claim_task(client, task["id"], token)
+    assert response.status_code == 422
+    assert response.json()["error"] == "unsupported_workspace_path_alias"
+
+
+def test_unknown_nested_directory_semantics_fail_closed(
+    client, app, admin_headers, monkeypatch
+):
+    store = app.state.coordination.workspace_files
+    store.case_sensitive = True
+    store.normalization_sensitive = True
+    nested_directory = Path(store.root) / "unknown-semantics"
+    nested_directory.mkdir()
+    nested_inode = nested_directory.stat().st_ino
+
+    def probe_directory(directory_fd):
+        if os.fstat(directory_fd).st_ino == nested_inode:
+            return None, None
+        return True, True
+
+    monkeypatch.setattr(store, "_probe_directory_semantics", probe_directory)
+    task, token = create_workspace_resource_task(
+        client,
+        admin_headers,
+        "unknown-nested-semantics",
+        ["workspace-file:unknown-semantics/File.py"],
+    )
+
+    response = claim_task(client, task["id"], token)
+    assert response.status_code == 503
+    assert response.json()["error"] == "workspace_volume_semantics_unknown"
+
+
+def test_unknown_nested_normalization_fails_closed_on_insensitive_root(
+    client, app, admin_headers, monkeypatch
+):
+    store = app.state.coordination.workspace_files
+    store.case_sensitive = True
+    store.normalization_sensitive = False
+    nested_directory = Path(store.root) / "unknown-normalization"
+    nested_directory.mkdir()
+    nested_inode = nested_directory.stat().st_ino
+
+    def probe_directory(directory_fd):
+        if os.fstat(directory_fd).st_ino == nested_inode:
+            return True, None
+        return True, True
+
+    monkeypatch.setattr(store, "_probe_directory_semantics", probe_directory)
+    task, token = create_workspace_resource_task(
+        client,
+        admin_headers,
+        "unknown-nested-normalization",
+        ["workspace-file:unknown-normalization/café.py"],
+    )
+
+    response = claim_task(client, task["id"], token)
+    assert response.status_code == 503
+    assert response.json()["error"] == "workspace_volume_semantics_unknown"
+
+
+@pytest.mark.parametrize("operation", ["claim", "write"])
+def test_directory_close_error_never_closes_reused_descriptor(
+    app, monkeypatch, operation
+):
+    store = app.state.coordination.workspace_files
+    store.case_sensitive = True
+    store.normalization_sensitive = True
+    (Path(store.root) / "nested").mkdir()
+
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    directory_handles = []
+    replacement_handles = []
+    real_open = os.open
+    real_close = os.close
+
+    def tracked_open(path, flags, *args, **kwargs):
+        file_fd = real_open(path, flags, *args, **kwargs)
+        if flags == directory_flags and not directory_handles:
+            directory_handles.append(file_fd)
+        return file_fd
+
+    def close_with_descriptor_reuse(file_fd):
+        if (
+            directory_handles
+            and file_fd == directory_handles[0]
+            and not replacement_handles
+        ):
+            real_close(file_fd)
+            replacement_fd = real_open(os.devnull, os.O_RDONLY)
+            replacement_handles.append(replacement_fd)
+            raise OSError("simulated close failure after descriptor release")
+        real_close(file_fd)
+
+    monkeypatch.setattr(os, "open", tracked_open)
+    monkeypatch.setattr(os, "close", close_with_descriptor_reuse)
+
+    try:
+        with pytest.raises(WorkspaceFileError) as error:
+            if operation == "claim":
+                store._reject_path_component_aliases("nested/File.py")
+            else:
+                with store._open_parent("nested/File.py"):
+                    pass
+
+        assert error.value.status_code == 503
+        assert replacement_handles == directory_handles
+        os.fstat(replacement_handles[0])
+    finally:
+        if replacement_handles:
+            try:
+                real_close(replacement_handles[0])
+            except OSError:
+                pass
+
+
+def test_unknown_workspace_volume_semantics_fail_closed(client, app, admin_headers):
+    app.state.coordination.workspace_files.case_sensitive = None
+    task, token = create_workspace_resource_task(
+        client,
+        admin_headers,
+        "unknown-volume-semantics",
+        ["workspace-file:src/Name.py"],
+    )
+
+    response = claim_task(client, task["id"], token)
+    assert response.status_code == 503
+    assert response.json()["error"] == "workspace_volume_semantics_unknown"
 
 
 def test_atomic_claim_resource_reservation_independent_qc_and_release_gate(

@@ -4,6 +4,8 @@ import errno
 import hashlib
 import os
 import stat
+import unicodedata
+import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
@@ -80,6 +82,227 @@ class WorkspaceFileStore:
                 "workspace writes require O_NOFOLLOW and O_DIRECTORY support"
             )
         self.root = resolved
+        self.case_sensitive, self.normalization_sensitive = (
+            self._detect_filesystem_semantics(resolved)
+        )
+
+    @staticmethod
+    def _detect_filesystem_semantics(
+        root: Path,
+    ) -> tuple[bool | None, bool | None]:
+        """Probe case and Unicode normalization behavior at the configured root.
+
+        A random, private file is inspected through case-only and canonical-
+        normalization alternate spellings. If the probe cannot be created,
+        inspected, and safely removed, callers must treat the semantics as
+        unknown.
+        """
+        try:
+            directory_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        except OSError:
+            return None, None
+
+        try:
+            semantics = WorkspaceFileStore._probe_directory_semantics(directory_fd)
+        except OSError:
+            semantics = (None, None)
+        try:
+            os.close(directory_fd)
+        except OSError:
+            return None, None
+        return semantics
+
+    @staticmethod
+    def _probe_directory_semantics(
+        directory_fd: int,
+    ) -> tuple[bool | None, bool | None]:
+        """Probe case and normalization behavior for an open directory."""
+        file_fd: int | None = None
+        probe_name = f".AcP-CaseProbe-é-{uuid.uuid4().hex}"
+        alias_names = (
+            probe_name.swapcase(),
+            unicodedata.normalize("NFD", probe_name),
+        )
+        probe_identity: tuple[int, int] | None = None
+        sensitivities: list[bool | None] = [None, None]
+        cleanup_ok = True
+
+        try:
+            file_fd = os.open(
+                probe_name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=directory_fd,
+            )
+            created = os.fstat(file_fd)
+            probe_identity = (created.st_dev, created.st_ino)
+            for index, alias_name in enumerate(alias_names):
+                try:
+                    alias = os.stat(
+                        alias_name, dir_fd=directory_fd, follow_symlinks=False
+                    )
+                except FileNotFoundError:
+                    sensitivities[index] = True
+                except OSError:
+                    sensitivities[index] = None
+                else:
+                    if (alias.st_dev, alias.st_ino) == probe_identity:
+                        sensitivities[index] = False
+                    # A different object at the alias spelling is ambiguous.
+        except OSError:
+            sensitivities = [None, None]
+        finally:
+            if file_fd is not None:
+                try:
+                    os.close(file_fd)
+                except OSError:
+                    cleanup_ok = False
+
+            if probe_identity is not None:
+                try:
+                    current = os.stat(
+                        probe_name, dir_fd=directory_fd, follow_symlinks=False
+                    )
+                    if (current.st_dev, current.st_ino) == probe_identity:
+                        os.unlink(probe_name, dir_fd=directory_fd)
+                    else:
+                        cleanup_ok = False
+                except OSError:
+                    cleanup_ok = False
+
+        if not cleanup_ok:
+            return None, None
+        return sensitivities[0], sensitivities[1]
+
+    def lease_alias_key(self, relative_path: str) -> str:
+        """Return a conservative identity for a workspace-file lease path."""
+        path = canonical_relative_path(relative_path)
+        if self.case_sensitive is None:
+            raise WorkspaceFileError(
+                503,
+                "workspace_volume_semantics_unknown",
+                "workspace file leases are disabled because filesystem case behavior is unknown",
+            )
+        if self.case_sensitive:
+            self._reject_path_component_aliases(path)
+        if not self.case_sensitive:
+            if path.isascii():
+                return path.lower()
+            raise WorkspaceFileError(
+                422,
+                "unsupported_workspace_path_alias",
+                "non-ASCII workspace paths cannot be safely aliased on a case-insensitive volume",
+            )
+        if path.isascii() or self.normalization_sensitive:
+            return path
+        if self.normalization_sensitive is None:
+            raise WorkspaceFileError(
+                503,
+                "workspace_volume_semantics_unknown",
+                "non-ASCII workspace file leases are disabled because Unicode normalization behavior is unknown",
+            )
+        return unicodedata.normalize("NFD", path)
+
+    def _assert_component_alias_behavior(
+        self, directory_fd: int, component: str, *, is_root: bool
+    ) -> None:
+        """Reject aliases that differ from the configured root's lease key."""
+        if self.case_sensitive is None:
+            raise WorkspaceFileError(
+                503,
+                "workspace_volume_semantics_unknown",
+                "workspace file leases are disabled because filesystem case behavior is unknown",
+            )
+        if not self.case_sensitive:
+            return
+
+        if is_root:
+            case_sensitive = self.case_sensitive
+            normalization_sensitive = self.normalization_sensitive
+        else:
+            case_sensitive, normalization_sensitive = self._probe_directory_semantics(
+                directory_fd
+            )
+
+        if case_sensitive is None:
+            raise WorkspaceFileError(
+                503,
+                "workspace_volume_semantics_unknown",
+                "workspace directory case behavior cannot be inspected safely",
+            )
+        if not case_sensitive:
+            raise WorkspaceFileError(
+                422,
+                "unsupported_workspace_path_alias",
+                "workspace paths inside case-insensitive directories are not supported",
+            )
+
+        if component.isascii():
+            return
+        if self.normalization_sensitive is None or normalization_sensitive is None:
+            raise WorkspaceFileError(
+                503,
+                "workspace_volume_semantics_unknown",
+                "workspace directory Unicode normalization behavior cannot be inspected safely",
+            )
+        if self.normalization_sensitive is False:
+            return
+        if not normalization_sensitive:
+            raise WorkspaceFileError(
+                422,
+                "unsupported_workspace_path_alias",
+                "workspace paths inside normalization-insensitive directories are not supported",
+            )
+
+    def _reject_path_component_aliases(self, relative_path: str) -> None:
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        try:
+            directory_fd = os.open(self.root, flags)
+        except OSError as error:
+            raise WorkspaceFileError(
+                503,
+                "workspace_volume_semantics_unknown",
+                "configured workspace directory behavior cannot be inspected safely",
+            ) from error
+
+        try:
+            components = relative_path.split("/")
+            is_root = True
+            for index, component in enumerate(components):
+                self._assert_component_alias_behavior(
+                    directory_fd, component, is_root=is_root
+                )
+                if index == len(components) - 1:
+                    break
+                try:
+                    next_fd = os.open(component, flags, dir_fd=directory_fd)
+                except FileNotFoundError:
+                    break
+                except OSError as error:
+                    if error.errno in {errno.ELOOP, errno.ENOTDIR}:
+                        raise WorkspaceFileError(
+                            422,
+                            "unsafe_workspace_path",
+                            "workspace path contains a symlink or non-directory",
+                        ) from error
+                    raise WorkspaceFileError(
+                        503,
+                        "workspace_volume_semantics_unknown",
+                        "workspace directory case behavior cannot be inspected safely",
+                    ) from error
+                previous_fd = directory_fd
+                directory_fd = next_fd
+                is_root = False
+                try:
+                    os.close(previous_fd)
+                except OSError as error:
+                    raise WorkspaceFileError(
+                        503,
+                        "workspace_volume_semantics_unknown",
+                        "workspace directory handles cannot be safely rotated",
+                    ) from error
+        finally:
+            os.close(directory_fd)
 
     @contextmanager
     def _open_parent(self, relative_path: str) -> Iterator[tuple[int, str]]:
@@ -93,7 +316,12 @@ class WorkspaceFileStore:
             ) from error
 
         try:
-            for component in path.split("/")[:-1]:
+            components = path.split("/")
+            is_root = True
+            for component in components[:-1]:
+                self._assert_component_alias_behavior(
+                    directory_fd, component, is_root=is_root
+                )
                 try:
                     next_fd = os.open(component, flags, dir_fd=directory_fd)
                 except FileNotFoundError as error:
@@ -114,8 +342,20 @@ class WorkspaceFileStore:
                         "workspace_path_denied",
                         "workspace parent directory cannot be opened",
                     ) from error
-                os.close(directory_fd)
+                previous_fd = directory_fd
                 directory_fd = next_fd
+                is_root = False
+                try:
+                    os.close(previous_fd)
+                except OSError as error:
+                    raise WorkspaceFileError(
+                        503,
+                        "workspace_unavailable",
+                        "workspace directory handles cannot be safely rotated",
+                    ) from error
+            self._assert_component_alias_behavior(
+                directory_fd, components[-1], is_root=is_root
+            )
             yield directory_fd, path.split("/")[-1]
         finally:
             os.close(directory_fd)

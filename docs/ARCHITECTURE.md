@@ -61,7 +61,7 @@ transaction.
 
 ### 2. A declared resource has one active task
 
-Tasks declare exact resources before execution, for example:
+Tasks declare resources before execution, for example:
 
 ```text
 repo:payments:file:src/checkout.py
@@ -70,7 +70,27 @@ deployment:production:api
 ```
 
 A claim fails if any resource is reserved by another unexpired task. Resource
-names are currently exact strings; callers should use a canonical namespace.
+names are exact strings except `workspace-file:` paths, whose lease conflicts
+are resolved using case and Unicode normalization behavior probed at the
+configured workspace root. On a case-insensitive root, ASCII case variants
+collide and cannot be claimed concurrently; non-ASCII workspace paths fail
+closed because filesystem collation varies. On a case-sensitive,
+normalization-insensitive root, canonically equivalent Unicode spellings share
+a lease; on a normalization-sensitive root they remain distinct. Existing
+parent directories are independently probed for the semantics of each path
+component. If a directory introduces case or normalization aliases that the
+root-derived lease key would not collapse, the claim is rejected; the check is
+repeated at the mediated-write boundary. This also covers nested mounts and
+filesystem-specific per-directory modes. If behavior cannot be safely probed,
+the affected claim fails closed. Linux ext4 supports case-insensitive lookup on
+a per-directory basis; its [documentation](https://docs.kernel.org/6.16/admin-guide/ext4.html)
+describes that mode and its canonical-decomposition lookup behavior. Apple
+documents APFS normalization behavior in its [APFS FAQ](https://developer.apple.com/library/archive/documentation/FileManagement/Conceptual/APFS_Guide/FAQ/FAQ.html).
+
+The lease key is derived without changing the declared resource string or its
+fencing token. This preserves the task's exact declaration while atomically
+rejecting aliases before any conflicting task is granted a workspace-file
+lease.
 
 ### 3. Time alone never establishes write authority
 
@@ -121,8 +141,17 @@ Workers heartbeat with a checkpoint and renewed TTL. The reaper:
 ### 7. A mediated file write is a content-version compare-and-swap
 
 Set `ACP_WORKSPACE_ROOT` to an existing, dedicated checkout directory to enable
-the file-write endpoint. A task must declare the exact resource
-`workspace-file:<relative-posix-path>` before it is claimed. The worker submits
+the file-write endpoint. At service startup ACP creates and removes a private,
+random probe file in that root and checks both case-only and NFC/NFD alternate
+spellings; failure to inspect or clean up the probe disables workspace-file
+claims. Claim validation probes each existing parent directory through its
+open directory handle, including nested mounts, and fails closed when its
+semantics are unknown or incompatible with the root-derived lease key. The
+same checks run again immediately before mediated writes, so directories that
+appear after the claim are covered too. A task must declare the resource
+`workspace-file:<relative-posix-path>` before it is claimed. ACP preserves that
+resource string for fencing tokens while checking active aliases atomically in
+the claim transaction. The worker submits
 that relative path, the exact SHA-256 it read (or `null` only when it expects a
 new file), the replacement bytes as base64, a caller-generated UUID operation
 ID, and all current claim/resource fencing tokens to
