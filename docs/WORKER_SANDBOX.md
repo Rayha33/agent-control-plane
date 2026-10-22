@@ -3379,15 +3379,19 @@ unique state root listed no container, both sampled init PIDs were absent, and
 the leased scratch tree was removed. This paired observation attributes that
 single listener socket-creation denial to the generated profile in this setup;
 it does not establish broader egress control, other syscall rules, cgroup or
-device enforcement, or worker isolation. The integrated-worker and per-rule
-runtime gates below remain open.
+device enforcement, or worker isolation. At this point in the record
+(2026-10-04), the integrated-worker and per-rule runtime gates were still
+open; later scoped evidence and the current status are noted below.
 
 This does not prove that ACP persists either systemd invocation, captures an
 attached runc exit receipt, coordinates cancellation/recovery across supervisor
 restart, or safely releases its execution/result-import fences. It also does
-not prove credential or provider egress policy. Worker execution is still
-direct-host with bounded log capture only; no OCI filesystem isolation is
-integrated, and `externalSandbox` remains disabled.
+not prove credential or provider egress policy. At the time this paired probe
+was recorded (2026-10-04), worker execution was still direct-host with bounded
+log capture only; OCI filesystem isolation had not yet been integrated into
+`run_worker()`, and `externalSandbox` remained disabled. The later experimental
+no-model `run_worker()` isolation/result-import proof is recorded in
+[`WORKER_LAUNCH_DRIVER.md`](WORKER_LAUNCH_DRIVER.md).
 
 ## Required proof gates
 
@@ -3425,12 +3429,22 @@ integrated, and `externalSandbox` remains disabled.
   can be contacted. Do not make a paid inference call for this no-model proof.
 - **Release gate:** independent criterion-level adversarial QC, focused and full
   supported test suites, lint/format/package build, and exact-head Linux/macOS
-  CI must pass. Keep the feature disabled by default and do not claim worker
-  read isolation until every gate is met.
+  CI must pass. Keep the experimental OCI route disabled by default and do not
+  claim worker read isolation until every gate is met.
 
-Until then, the supported claim is narrower: ACP's resource driver can create a
-constrained systemd unit around a configured payload on the measured NAS; the
-supervised coding worker still executes directly in its registered worktree.
+**Current status (2026-10-22):** an explicit
+`sandbox_experimental_opt_in=True` route has been exercised through
+`WorkersMixin.run_worker()` and the OCI launch driver with a no-provider/no-model
+task and the required resource limits and pinned runc/rootfs inputs; scoped
+exact-host isolation probes and validated result-import evidence are recorded in
+[`WORKER_LAUNCH_DRIVER.md`](WORKER_LAUNCH_DRIVER.md). This remains an
+experimental, scoped capability, not provider-ready or general sandbox proof.
+Omitting the opt-in while `sandbox.oci` is configured remains fail-closed. When
+OCI is not configured, the pre-existing direct-host worker path can still run
+on Linux with process-tree containment but without OCI filesystem isolation.
+Provider authentication/destination-restricted egress and broader
+supervisor-daemon crash/restart recovery, logout/linger, and reboot acceptance
+remain open; do not mark the parent task complete.
 
 ### Pinned runc recursive-propagation adapter (2026-10-05)
 
