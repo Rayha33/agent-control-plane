@@ -1138,3 +1138,50 @@ separation during cancellation; it does not establish cross-attempt workspace
 read/write isolation, shared Git-metadata isolation, provider/model execution,
 or use of the public `run_worker()` entry point. No model or credential was
 used, and task #2370 remains open.
+
+### Same-repository concurrent workspace and Git-metadata probe (2026-10-22)
+
+The opt-in `test_live_concurrent_attempts_use_distinct_scopes_and_clean_up`
+passed 1/1 on the same disposable Debian 12 ARM64 / Linux
+`6.12.95+deb12-cloud-arm64` / systemd 252.39 / Python 3.11.2 guest with
+root-owned runc 1.5.2 (SHA-256
+`d10ecae898361832a059be2089bab92d158aec54661b18ed7346ed79628b46b0`). Run it
+with `ACP_RUN_SANDBOX_WORKER_LIFECYCLE=1`,
+`ACP_LIVE_CONCURRENT_ATTEMPTS=1`,
+`ACP_OCI_TEST_RUNC=/usr/local/bin/runc`,
+`ACP_OCI_TEST_RUNC_VERSION=1.5.2`, and
+`ACP_OCI_TEST_BUSYBOX=/usr/bin/busybox` on that disposable supported host.
+
+Unlike the earlier concurrent probe above, this fixture creates one shared
+repository and one pinned rootfs for both child processes. It provisions
+distinct declared task resources and two runtime-port values, then requires
+distinct attempt, task, claim, execution, container, workspace, and active
+systemd-scope identities. After two stable scope samples, the host writes a
+readable sentinel into each peer workspace and a common sentinel under the
+repository `.git` directory. Each worker records its own `/proc/self/mountinfo`
+into its private assigned workspace while both scopes are active. The parent
+test verifies that the `/workspace` mount root equals that attempt's exact
+host workspace path, that `/tmp`, `/dev`, and `/home/agent` are tmpfs and
+`/proc` is procfs, and that no mount root from the shared fixture is exposed
+outside `/workspace`. The assigned workspace contains no `.git`. Each worker
+directly looked up the host-absolute peer-workspace and shared-`.git` sentinels.
+It also looked up the peer-workspace sentinel through an absolute symlink and a
+`..` path resolving into guest `/tmp`. Those direct paths and peer-workspace
+variants were not visible in the worker namespace; direct overwrite probes
+found no visible target to write. The host confirmed all three sentinel inodes
+and bytes stayed unchanged.
+
+Both child processes then independently verified exact cleanup and synchronize
+at a test-only barrier before either invokes the shared-repository reaper. This
+avoids one test's simulated future timestamp prematurely expiring its peer.
+Each attempt finished orphaned with its runtime allocation released. Postflight
+found no active ACP scopes, runc or test processes, launch roots, control
+directory, or shared fixture. The VM was stopped, not deleted; the temporary
+guest checkout and virtual environment were removed. No model, provider
+credential, or provider endpoint was used.
+
+This establishes the observed live mount roots and that these specific shared
+repository paths were not visible through the tested lookups on one guest. It
+does not establish general kernel isolation, broader host-filesystem coverage,
+network-egress policy, provider/model execution, another kernel or
+architecture, or default `run_worker()` activation. Task #2370 remains open.

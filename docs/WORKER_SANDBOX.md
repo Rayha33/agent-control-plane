@@ -1,13 +1,21 @@
 # Per-attempt worker sandbox decision
 
-**Current status (2026-10-21):** Provider-backed end-to-end acceptance remains
+**Current status (2026-10-22):** Provider-backed end-to-end acceptance remains
 incomplete. An explicit experimental, no-model `run_worker()` route now reaches
 the production launch driver, independent cleanup verifier, and host-side
-result-import path; it does not enable the default OCI worker path. Provider
-authentication/egress, supervisor-daemon restart, logout/linger, and reboot
-recovery remain unproven. The dated entries below describe evidence and status
-as of their stated dates; the current summary above supersedes older
-integration-status statements.
+result-import path; it does not enable the default OCI worker path. A live
+two-worker test on one shared repository recorded `/proc/self/mountinfo` from
+each worker and verified its `/workspace` mount root matched that attempt's
+exact workspace path, `/tmp`, `/dev`, and `/home/agent` were tmpfs, `/proc` was
+procfs, and no mount root from the shared fixture appeared outside `/workspace`.
+Direct lookups of host-absolute peer-workspace and shared-Git sentinel paths
+were not visible; the peer-workspace sentinel was also tested through symlink
+and `..` paths. Cleanup was verified for both attempts. This is specific-path
+and live-mount evidence on one disposable Linux
+guest, not a general kernel-isolation proof. Provider authentication/egress,
+supervisor-daemon restart, logout/linger, and reboot recovery remain unproven.
+The dated entries below describe evidence and status as of their stated dates;
+the current summary above supersedes older integration-status statements.
 
 Standalone bounded snapshot and change-set primitives, exact host-side manifest
 replay validation, secure snapshot readback, an isolated-index candidate-tree
@@ -34,8 +42,9 @@ and pending-QC handoff through the explicit no-model `run_worker()` opt-in. A
 separate journal regression concurrently reserves two
 different attempts and binds disjoint baseline/workspace roots, proving unique
 execution/container identities and concurrent independent write sentinels at
-the filesystem/journal layer; it does not run two live runc workers concurrently
-or prove cross-container kernel isolation. See the live evidence below and
+the filesystem/journal layer. Unlike the live concurrent probe described below,
+it does not run two live runc workers or prove cross-container kernel
+isolation. See the live evidence below and
 [`RESULT_IMPORT_OBJECTS.md`](RESULT_IMPORT_OBJECTS.md) for the current staging,
 retention, and cleanup contract. End-to-end worker isolation proof remains
 incomplete. The OCI policy compiler stages init behind fd 3, and a reusable
@@ -44,6 +53,36 @@ retaining that gate. The explicit route is still an experimental no-model
 path: it does not provide provider authentication/egress or enable the default
 OCI `run_worker()` path. This record does not authorize `externalSandbox` for
 ACP workers.
+
+**Live same-repository concurrent probe (2026-10-22):**
+`test_live_concurrent_attempts_use_distinct_scopes_and_clean_up` passed 1/1 on
+the disposable Debian 12 ARM64 Lima guest (Linux
+`6.12.95+deb12-cloud-arm64`, systemd 252.39, Python 3.11.2) with root-owned
+runc 1.5.2, SHA-256
+`d10ecae898361832a059be2089bab92d158aec54661b18ed7346ed79628b46b0`. Both
+workers used the same repository and pinned rootfs but separate attempts,
+workspaces, scopes, and runtime-port allocations. While both scopes were active,
+each worker wrote its own `/proc/self/mountinfo` into its assigned workspace.
+The parent test verified the exact per-attempt `/workspace` mount root, private
+tmpfs mounts at `/tmp`, `/dev`, and `/home/agent`, procfs at `/proc`, and no
+mount root from the shared fixture outside the assigned `/workspace`. The
+assigned copy contained no `.git`. Workers directly probed the host-absolute
+peer-workspace and shared-Git sentinel paths; they additionally probed the
+peer-workspace sentinel through an absolute symlink and a `..` path. Those
+tested paths were not visible. The host checked that all three external sentinels retained their
+original inode and bytes. Both attempts independently verified cleanup before
+the shared-repository reaper ran; each ended orphaned with its runtime
+allocation released. Postflight found no active ACP scope, runc
+process, launch root, shared fixture, or control directory. The VM was stopped,
+not deleted, and the temporary guest checkout and virtual environment were
+removed.
+
+This records the live mount roots and shows that those specific shared-repository
+paths were not visible through the tested lookups on this guest. It does not
+prove general cross-container kernel isolation, provider/model execution, broad
+network egress controls, another kernel/architecture, or the default OCI
+`run_worker()` path.
+No provider credential or model call was used, and task #2370 remains open.
 
 **Earlier live isolation and import probe (2026-10-21):** On exact
 source commit `a70eef36b1b90523be383598bc7d0e0501d710cf`, the opt-in

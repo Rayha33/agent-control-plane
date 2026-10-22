@@ -171,6 +171,66 @@ _SUPPORTED_RUNC_VERSION = "1.5.2"
 _MONITOR_SLICE_UNIT = "user-acp.slice"
 _PAYLOAD_MARKER = "lifecycle-gate-marker"
 _GIT_METADATA_MARKER = "git-metadata-absent-marker"
+_CROSS_ATTEMPT_PROBE_SCRIPT_NAME = "acp-live-cross-attempt-probe.sh"
+_CROSS_ATTEMPT_PROBE_SCRIPT = r"""
+set -eu
+umask 077
+printf 'production-driver-started\n' > /workspace/__STARTED_MARKER__
+probe_config=/workspace/.acp-live-cross-attempt-targets
+probe_go=/workspace/.acp-live-cross-attempt-go
+probe_result=/workspace/.acp-live-cross-attempt-result
+probe_result_tmp=/workspace/.acp-live-cross-attempt-result.tmp
+probe_mountinfo=/workspace/.acp-live-cross-attempt-mountinfo
+attempt=0
+while [ ! -f "$probe_go" ] && [ "$attempt" -lt 300 ]; do
+  /bin/busybox sleep 0.1
+  attempt=$((attempt + 1))
+done
+test -f "$probe_go"
+{ read -r other_workspace_sentinel; read -r shared_git_sentinel; } < "$probe_config"
+: > "$probe_result_tmp"
+probe_read() {
+  label=$1
+  target=$2
+  if ! /bin/busybox test -e "$target"; then
+    /bin/busybox printf '%s=not-visible\n' "$label" >> "$probe_result_tmp"
+  elif /bin/busybox cat "$target" >/dev/null 2>&1; then
+    /bin/busybox printf '%s=readable\n' "$label" >> "$probe_result_tmp"
+  else
+    /bin/busybox printf '%s=unreadable\n' "$label" >> "$probe_result_tmp"
+  fi
+}
+probe_write() {
+  label=$1
+  target=$2
+  if ! /bin/busybox test -e "$target"; then
+    /bin/busybox printf '%s=target-not-visible\n' "$label" >> "$probe_result_tmp"
+  elif /bin/busybox printf 'acp-cross-attempt-write-probe\n' > "$target" 2>/dev/null; then
+    /bin/busybox printf '%s=write-succeeded\n' "$label" >> "$probe_result_tmp"
+  else
+    /bin/busybox printf '%s=write-denied\n' "$label" >> "$probe_result_tmp"
+  fi
+}
+probe_read other-workspace "$other_workspace_sentinel"
+probe_write other-workspace "$other_workspace_sentinel"
+probe_read shared-git "$shared_git_sentinel"
+probe_write shared-git "$shared_git_sentinel"
+if ! /bin/busybox ln -s "$other_workspace_sentinel" /workspace/.acp-live-cross-attempt-link; then
+  exit 71
+fi
+probe_read other-workspace-symlink /workspace/.acp-live-cross-attempt-link
+/bin/busybox rm /workspace/.acp-live-cross-attempt-link
+canonical_target=/workspace/../../${other_workspace_sentinel#/}
+probe_read other-workspace-canonical "$canonical_target"
+if /bin/busybox test -e /workspace/.git; then
+  /bin/busybox printf 'workspace-git=visible\n' >> "$probe_result_tmp"
+else
+  /bin/busybox printf 'workspace-git=absent\n' >> "$probe_result_tmp"
+fi
+/bin/busybox cat /proc/self/mountinfo > "$probe_mountinfo"
+/bin/busybox mv "$probe_result_tmp" "$probe_result"
+while :; do /bin/busybox sleep 1; done
+"""
 
 _LIVE_HOST_SENTINEL_HELPER = r"""
 import json
@@ -2027,6 +2087,12 @@ def _wait_for_live_concurrent_release(
         or not properties["ControlGroup"]
     ):
         raise RuntimeError("concurrent child did not own an exact running ACP scope")
+    with GitSupervisor(repo).connect() as connection:
+        runtime_allocations = connection.execute(
+            "SELECT pool_name, value, lease_expires_at FROM runtime_allocations "
+            "WHERE attempt_id = ? ORDER BY pool_name, value",
+            (attempt["id"],),
+        ).fetchall()
     ready = {
         "attempt_id": attempt["id"],
         "claim_token": attempt["claim_token"],
@@ -2034,6 +2100,7 @@ def _wait_for_live_concurrent_release(
         "execution_id": execution["execution_id"],
         "pid": os.getpid(),
         "repo": str(repo.resolve(strict=True)),
+        "runtime_allocations": [dict(row) for row in runtime_allocations],
         "run_root": str(run_root.resolve(strict=True)),
         "scope_control_group": properties["ControlGroup"],
         "scope_invocation_id": properties["InvocationID"],
@@ -2063,6 +2130,59 @@ def _wait_for_live_concurrent_release(
         or release_path.read_text(encoding="ascii") != "release"
     ):
         raise RuntimeError("concurrent live release marker identity or content changed")
+
+
+def _wait_for_live_concurrent_cleanup_verification(
+    control: tuple[Path, str], *, attempt_id: str, execution_id: str
+) -> None:
+    """Let both shared-repository attempts verify cleanup before either reaps."""
+
+    root, slot = control
+    marker = root / f"cleanup-verified-{slot}.json"
+    _write_live_concurrent_marker(
+        root,
+        marker.name,
+        json.dumps(
+            {"attempt_id": attempt_id, "execution_id": execution_id, "slot": slot},
+            sort_keys=True,
+        ).encode("utf-8"),
+    )
+    deadline = time.monotonic() + 90
+    while time.monotonic() < deadline:
+        records: dict[str, dict[str, str]] = {}
+        for expected_slot in ("0", "1"):
+            path = root / f"cleanup-verified-{expected_slot}.json"
+            try:
+                info = path.lstat()
+            except FileNotFoundError:
+                continue
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or stat.S_ISLNK(info.st_mode)
+                or info.st_uid != os.geteuid()
+                or stat.S_IMODE(info.st_mode) != 0o600
+            ):
+                raise RuntimeError("concurrent cleanup-verification marker has unsafe metadata")
+            record = json.loads(path.read_text(encoding="utf-8"))
+            if (
+                not isinstance(record, dict)
+                or record.get("slot") != expected_slot
+                or not isinstance(record.get("attempt_id"), str)
+                or not isinstance(record.get("execution_id"), str)
+            ):
+                raise RuntimeError("concurrent cleanup-verification marker is malformed")
+            records[expected_slot] = record
+        if len(records) == 2:
+            if (
+                len({record["attempt_id"] for record in records.values()}) != 2
+                or len({record["execution_id"] for record in records.values()}) != 2
+                or records[slot]["attempt_id"] != attempt_id
+                or records[slot]["execution_id"] != execution_id
+            ):
+                raise RuntimeError("concurrent cleanup-verification markers are not distinct")
+            return
+        time.sleep(0.05)
+    raise TimeoutError("peer attempt did not verify cleanup before the shared reaper barrier")
 
 
 def _read_live_concurrent_prepared_records(
@@ -2337,17 +2457,27 @@ def test_unit_preflight_allows_only_inactive_empty_implicit_slices(
         _assert_units_available_for_test("acp-test.service")
 
 
-def _remove_private_test_tree(root: Path) -> None:
+def _remove_private_test_tree(
+    root: Path, *, expected_identity: tuple[int, int] | None = None
+) -> None:
     """Remove only this private fixture after making its read-only files deletable."""
 
     root_info = root.lstat()
     if (
         root.parent != Path("/tmp")
-        or not root.name.startswith(("acp-live-sandbox-lifecycle-", "acp-live-launch-driver-"))
+        or not root.name.startswith(
+            (
+                "acp-live-sandbox-lifecycle-",
+                "acp-live-launch-driver-",
+                "acp-live-concurrent-shared-",
+            )
+        )
         or not stat.S_ISDIR(root_info.st_mode)
         or root_info.st_uid != os.geteuid()
     ):
         raise RuntimeError("refusing to remove an unexpected live-test artifact root")
+    if expected_identity is not None and (root_info.st_dev, root_info.st_ino) != expected_identity:
+        raise RuntimeError("refusing to remove a replaced live-test artifact root")
 
     def fail_walk(error: OSError) -> None:
         raise error
@@ -2692,6 +2822,25 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
 
     source_root = Path(__file__).resolve().parents[1]
     concurrent_control = _live_concurrent_control()
+    cross_attempt_probes = os.environ.get("ACP_LIVE_CROSS_ATTEMPT_PROBES") == "1"
+    if cross_attempt_probes and concurrent_control is None:
+        pytest.fail("cross-attempt probes require the concurrent live parent harness")
+    shared_repo_value = os.environ.get("ACP_LIVE_SHARED_REPO", "")
+    shared_rootfs_value = os.environ.get("ACP_LIVE_SHARED_ROOTFS", "")
+    shared_port_range_value = os.environ.get("ACP_LIVE_SHARED_PORT_RANGE", "")
+    if cross_attempt_probes and (not shared_repo_value or not shared_rootfs_value):
+        pytest.fail("cross-attempt probes require the shared fixture repo and rootfs")
+    shared_port_range: tuple[int, int] | None = None
+    if cross_attempt_probes:
+        try:
+            shared_port_start, shared_port_end = (
+                int(part) for part in shared_port_range_value.split(",", maxsplit=1)
+            )
+        except (ValueError, TypeError):
+            pytest.fail("cross-attempt probes require a two-port shared runtime range")
+        if not 1024 <= shared_port_start < shared_port_end <= 65535:
+            pytest.fail("cross-attempt shared runtime range is invalid")
+        shared_port_range = (shared_port_start, shared_port_end)
     from agent_control_plane.supervisor import sandbox_launch_driver_service as launch_service
 
     if Path(launch_service.__file__).resolve().parents[2] != (source_root / "src").resolve():
@@ -2963,24 +3112,41 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
                 pytest.fail(
                     "synthetic host process sentinel is not running above the worker PID limit"
                 )
-        rootfs_source.mkdir(mode=0o755)
-        for directory in (
-            "bin",
-            "dev",
-            "etc",
-            "home/agent",
-            "proc",
-            "run",
-            "tmp",
-            "workspace",
-        ):
-            (rootfs_source / directory).mkdir(parents=True, exist_ok=True, mode=0o755)
-        _busybox_version, busybox_applets = _copy_busybox_closure(busybox_path, rootfs_source)
-        if isolation_probes and "rm" not in busybox_applets:
-            pytest.fail("trusted BusyBox lacks rm for the temporary workspace symlink probe")
-        repo_root = run_root / "repo"
-        repo_root.mkdir(mode=0o700)
-        repo = init_repo(repo_root)
+        if cross_attempt_probes:
+            rootfs_source = Path(shared_rootfs_value).resolve(strict=True)
+            repo = Path(shared_repo_value).resolve(strict=True)
+            if (
+                not rootfs_source.is_relative_to(Path("/tmp"))
+                or not repo.is_relative_to(Path("/tmp"))
+                or not rootfs_source.is_dir()
+                or rootfs_source.is_symlink()
+                or not (repo / ".git").is_dir()
+                or repo.is_symlink()
+                or repo.stat().st_uid != os.geteuid()
+                or stat.S_IMODE(repo.stat().st_mode) != 0o700
+            ):
+                pytest.fail("shared concurrent fixture paths are not private disposable inputs")
+            assert shared_port_range is not None
+            runtime_test_port = shared_port_range[0]
+        else:
+            rootfs_source.mkdir(mode=0o755)
+            for directory in (
+                "bin",
+                "dev",
+                "etc",
+                "home/agent",
+                "proc",
+                "run",
+                "tmp",
+                "workspace",
+            ):
+                (rootfs_source / directory).mkdir(parents=True, exist_ok=True, mode=0o755)
+            _busybox_version, busybox_applets = _copy_busybox_closure(busybox_path, rootfs_source)
+            if isolation_probes and "rm" not in busybox_applets:
+                pytest.fail("trusted BusyBox lacks rm for the temporary workspace symlink probe")
+            repo_root = run_root / "repo"
+            repo_root.mkdir(mode=0o700)
+            repo = init_repo(repo_root)
         if isolation_probes:
             host_home = Path.home().resolve(strict=True)
             home_config = host_home / ".config"
@@ -3199,44 +3365,58 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
         if os.environ.get("ACP_LIVE_CANCEL_AFTER_START") == "1":
             config_path = repo / "acp.toml"
             config_text = config_path.read_text(encoding="utf-8")
-            if "lease_seconds = 60" not in config_text:
+            if "lease_seconds = 60" in config_text:
+                config_path.write_text(
+                    config_text.replace("lease_seconds = 60", "lease_seconds = 10", 1),
+                    encoding="utf-8",
+                )
+            elif not (cross_attempt_probes and "lease_seconds = 10" in config_text):
                 pytest.fail("live fixture did not start with the expected test lease")
-            config_path.write_text(
-                config_text.replace("lease_seconds = 60", "lease_seconds = 10", 1),
-                encoding="utf-8",
-            )
         _ensure_private_fixture_directory(repo / ".acp")
         _ensure_private_fixture_directory(repo / ".acp" / "sandbox-executions")
-        rootfs_manifest = oci_worker.rootfs_tree_manifest(rootfs_source)
-        runtime_probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        try:
-            runtime_probe.bind(("127.0.0.1", 0))
-            runtime_test_port = runtime_probe.getsockname()[1]
-        finally:
-            runtime_probe.close()
-        with (repo / "acp.toml").open("a", encoding="utf-8") as stream:
-            stream.write(
-                "\n[sandbox.oci]\n"
-                f"runc_executable = {json.dumps(str(runc_path.resolve(strict=True)))}\n"
-                f"runc_version = {json.dumps(_SUPPORTED_RUNC_VERSION)}\n"
-                f"rootfs_path = {json.dumps(str(rootfs_source.resolve(strict=True)))}\n"
-                f"rootfs_sha256 = {json.dumps(rootfs_manifest['rootfs_sha256'])}\n"
-                f"rootfs_closure_sha256 = {json.dumps(rootfs_manifest['closure_sha256'])}\n"
-                "\n[runtime.ports]\n"
-                f"LAUNCH_DRIVER_TEST_PORT = [{runtime_test_port}, {runtime_test_port}]\n"
-            )
+        if not cross_attempt_probes:
+            rootfs_manifest = oci_worker.rootfs_tree_manifest(rootfs_source)
+            runtime_probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                runtime_probe.bind(("127.0.0.1", 0))
+                runtime_test_port = runtime_probe.getsockname()[1]
+            finally:
+                runtime_probe.close()
+            with (repo / "acp.toml").open("a", encoding="utf-8") as stream:
+                stream.write(
+                    "\n[sandbox.oci]\n"
+                    f"runc_executable = {json.dumps(str(runc_path.resolve(strict=True)))}\n"
+                    f"runc_version = {json.dumps(_SUPPORTED_RUNC_VERSION)}\n"
+                    f"rootfs_path = {json.dumps(str(rootfs_source.resolve(strict=True)))}\n"
+                    f"rootfs_sha256 = {json.dumps(rootfs_manifest['rootfs_sha256'])}\n"
+                    f"rootfs_closure_sha256 = {json.dumps(rootfs_manifest['closure_sha256'])}\n"
+                    "\n[runtime.ports]\n"
+                    f"LAUNCH_DRIVER_TEST_PORT = [{runtime_test_port}, {runtime_test_port}]\n"
+                )
         supervisor = GitSupervisor(repo)
-        runner = supervisor.enroll_runner("sandbox-launch-driver-test", "worker")
+        live_marker_resource = "launch-driver-marker"
+        live_started_resource = "launch-driver-started"
+        if cross_attempt_probes and concurrent_control is not None:
+            live_marker_resource = f"{live_marker_resource}-{concurrent_control[1]}"
+            live_started_resource = f"{live_started_resource}-{concurrent_control[1]}"
+        runner_name = "sandbox-launch-driver-test"
+        if cross_attempt_probes and concurrent_control is not None:
+            runner_name = f"{runner_name}-{concurrent_control[1]}"
+        runner = supervisor.enroll_runner(runner_name, "worker")
         task = make_task(
             supervisor,
-            "launch-driver-marker",
-            "launch-driver-started",
+            live_marker_resource,
+            live_started_resource,
             *((coding_script_name, coding_test_output_name) if coding_task else ()),
-            title="launch-driver producer test",
+            title=(
+                f"launch-driver producer test {concurrent_control[1]}"
+                if cross_attempt_probes and concurrent_control is not None
+                else "launch-driver producer test"
+            ),
         )
         attempt = supervisor.claim(
             task["id"],
-            "sandbox-launch-driver-test",
+            runner_name,
             credential=runner["credential"],
         )
         initial_lease_expires_at = attempt["lease_expires_at"]
@@ -3348,6 +3528,12 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
         sandbox_timeout_seconds = 150 if concurrent_live_child else 1 if timeout_after_start else 30
         if isolation_probes:
             payload_command = ("/bin/busybox", "sh", f"/workspace/{isolation_script_name}")
+        elif cross_attempt_probes:
+            payload_command = (
+                "/bin/busybox",
+                "sh",
+                f"/workspace/{_CROSS_ATTEMPT_PROBE_SCRIPT_NAME}",
+            )
         elif coding_task:
             payload_command = (
                 "/bin/busybox",
@@ -4397,6 +4583,23 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
         assert runner["credential"] not in service_log
         expected_cleanup_phase = "cleanup_verified" if supervised_run_worker else "cleanup_reported"
         assert durable is not None and durable["phase"] == expected_cleanup_phase, service_log
+        if cross_attempt_probes:
+            if concurrent_control is None or execution is None:
+                pytest.fail(
+                    "cross-attempt cleanup barrier requires exact concurrent execution identity"
+                )
+            verified_cleanup = supervisor._sandbox_execution_verify_cleanup(
+                attempt["id"],
+                attempt["claim_token"],
+                credential=runner["credential"],
+            )
+            assert verified_cleanup["phase"] == "cleanup_verified"
+            assert verified_cleanup["cleanup_verification"]["observations"]
+            _wait_for_live_concurrent_cleanup_verification(
+                concurrent_control,
+                attempt_id=attempt["id"],
+                execution_id=execution["execution_id"],
+            )
         if isolation_probes and durable["runc_exit_code"] != 0:
             probe_marker = Path(durable["workspace_root_path"]) / "launch-driver-started"
             probe_detail = (
@@ -4704,9 +4907,17 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
                 assert lease["lease_expires_at"] > attempt_after_execution["lease_expires_at"]
         assert len(allocations_before) == 1
         assert runtime_before is not None and runtime_before["state"] != "released"
-        assert [
-            (row["pool_name"], row["value"], row["lease_expires_at"]) for row in allocations_before
-        ] == [("LAUNCH_DRIVER_TEST_PORT", runtime_test_port, expected_lease_expiry)]
+        if cross_attempt_probes:
+            assert shared_port_range is not None
+            allocation = allocations_before[0]
+            assert allocation["pool_name"] == "LAUNCH_DRIVER_TEST_PORT"
+            assert shared_port_range[0] <= allocation["value"] <= shared_port_range[1]
+            assert allocation["lease_expires_at"] == expected_lease_expiry
+        else:
+            assert [
+                (row["pool_name"], row["value"], row["lease_expires_at"])
+                for row in allocations_before
+            ] == [("LAUNCH_DRIVER_TEST_PORT", runtime_test_port, expected_lease_expiry)]
 
         reap_receiver, reap_sender = context.Pipe(duplex=False)
         import_probe = (
@@ -4817,8 +5028,22 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
             assert supervisor.task(task["id"])["status"] == "blocked"
             assert supervisor.task(task["id"])["cleanup_target_status"] == ""
         elif imported_submission is None:
-            assert reaped["orphaned"] == [task["id"]]
-            assert reaped["runtime_cleanup"] == [{"attempt_id": attempt["id"], "state": "released"}]
+            if cross_attempt_probes:
+                # The reaper scans the shared repository, so the peer child may
+                # have atomically orphaned this attempt in its own pass.
+                cleanup_deadline = time.monotonic() + 20
+                while time.monotonic() < cleanup_deadline and (
+                    supervisor.attempt(attempt["id"])["status"] != "orphaned"
+                    or supervisor.task(task["id"])["status"] != "orphaned"
+                ):
+                    time.sleep(0.05)
+                assert supervisor.attempt(attempt["id"])["status"] == "orphaned"
+                assert supervisor.task(task["id"])["status"] == "orphaned"
+            else:
+                assert reaped["orphaned"] == [task["id"]]
+                assert reaped["runtime_cleanup"] == [
+                    {"attempt_id": attempt["id"], "state": "released"}
+                ]
             assert supervisor.attempt(attempt["id"])["status"] == "orphaned"
             assert supervisor.task(task["id"])["status"] == "orphaned"
         else:
@@ -5161,6 +5386,15 @@ def test_live_concurrent_attempts_use_distinct_scopes_and_clean_up() -> None:
     runc_path = Path(os.environ.get("ACP_OCI_TEST_RUNC", "/usr/bin/runc"))
     if not runc_path.is_file():
         pytest.fail("set ACP_OCI_TEST_RUNC to the trusted runc 1.5.2 executable")
+    runc_path = runc_path.resolve(strict=True)
+    runc_info = runc_path.lstat()
+    if (
+        not stat.S_ISREG(runc_info.st_mode)
+        or stat.S_ISLNK(runc_info.st_mode)
+        or runc_info.st_uid != 0
+        or stat.S_IMODE(runc_info.st_mode) & 0o022
+    ):
+        pytest.fail("concurrent live proof requires a root-owned, non-group/world-writable runc")
 
     systemctl = str(sandbox_attestation._trusted_systemctl_executable())
     systemd_environment = sandbox_attestation._trusted_systemd_command_environment()
@@ -5198,15 +5432,6 @@ def test_live_concurrent_attempts_use_distinct_scopes_and_clean_up() -> None:
             f"refusing concurrent proof with pre-existing ACP scopes: {sorted(preexisting)}"
         )
 
-    child_environment = dict(systemd_environment)
-    child_environment["PYTHONPATH"] = str(source_root / "src")
-    child_environment["ACP_RUN_SANDBOX_WORKER_LIFECYCLE"] = "1"
-    child_environment["ACP_LIVE_CANCEL_AFTER_START"] = "1"
-    child_environment["ACP_OCI_TEST_RUNC"] = str(runc_path.resolve(strict=True))
-    child_environment["ACP_OCI_TEST_RUNC_VERSION"] = _SUPPORTED_RUNC_VERSION
-    if os.environ.get("ACP_OCI_TEST_BUSYBOX"):
-        child_environment["ACP_OCI_TEST_BUSYBOX"] = os.environ["ACP_OCI_TEST_BUSYBOX"]
-
     control_root = Path(tempfile.mkdtemp(prefix="acp-live-concurrent-control-", dir="/tmp"))
     control_info = control_root.lstat()
     if (
@@ -5216,6 +5441,131 @@ def test_live_concurrent_attempts_use_distinct_scopes_and_clean_up() -> None:
         or stat.S_IMODE(control_info.st_mode) != 0o700
     ):
         pytest.fail("concurrent control root is not a private test-owned directory")
+
+    shared_fixture_root = Path(tempfile.mkdtemp(prefix="acp-live-concurrent-shared-", dir="/tmp"))
+    shared_fixture_info = shared_fixture_root.lstat()
+    shared_fixture_identity = (shared_fixture_info.st_dev, shared_fixture_info.st_ino)
+    try:
+        rootfs_source = shared_fixture_root / "rootfs-source"
+        rootfs_source.mkdir(mode=0o755)
+        for directory in (
+            "bin",
+            "dev",
+            "etc",
+            "home/agent",
+            "proc",
+            "run",
+            "tmp",
+            "workspace",
+        ):
+            (rootfs_source / directory).mkdir(parents=True, exist_ok=True, mode=0o755)
+        busybox_value = os.environ.get("ACP_OCI_TEST_BUSYBOX") or shutil.which("busybox")
+        if busybox_value is None:
+            pytest.fail("concurrent live proof requires the trusted BusyBox executable")
+        _busybox_version, busybox_applets = _copy_busybox_closure(
+            Path(busybox_value).resolve(strict=True), rootfs_source
+        )
+        required_applets = {
+            "cat",
+            "ln",
+            "mv",
+            "printf",
+            "rm",
+            "sh",
+            "sleep",
+            "test",
+            "touch",
+        }
+        if not required_applets.issubset(busybox_applets):
+            pytest.fail(
+                "trusted BusyBox lacks cross-attempt probe applets: "
+                f"{sorted(required_applets - busybox_applets)}"
+            )
+        repo_root = shared_fixture_root / "repo"
+        repo_root.mkdir(mode=0o700)
+        shared_repo = init_repo(repo_root)
+        shared_port_start: int | None = None
+        for _ in range(32):
+            first_probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                first_probe.bind(("127.0.0.1", 0))
+                candidate = first_probe.getsockname()[1]
+            finally:
+                first_probe.close()
+            if candidate >= 65535:
+                continue
+            second_probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                second_probe.bind(("127.0.0.1", candidate + 1))
+            except OSError:
+                continue
+            else:
+                shared_port_start = candidate
+                break
+            finally:
+                second_probe.close()
+        if shared_port_start is None:
+            pytest.fail("could not reserve a free adjacent two-port runtime fixture range")
+        shared_port_range = (shared_port_start, shared_port_start + 1)
+        probe_script = shared_repo / _CROSS_ATTEMPT_PROBE_SCRIPT_NAME
+        probe_script.write_text(
+            _CROSS_ATTEMPT_PROBE_SCRIPT.replace(
+                "__STARTED_MARKER__", "launch-driver-started"
+            ).lstrip(),
+            encoding="ascii",
+        )
+        subprocess.run(
+            ["git", "-C", str(shared_repo), "add", "--", probe_script.name],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        subprocess.run(
+            ["git", "-C", str(shared_repo), "commit", "-m", "fixture: cross-attempt probes"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        config_path = shared_repo / "acp.toml"
+        config_text = config_path.read_text(encoding="utf-8")
+        if config_text.count("lease_seconds = 60") != 1:
+            pytest.fail("shared live fixture did not have exactly one default lease")
+        config_text = config_text.replace("lease_seconds = 60", "lease_seconds = 10", 1)
+        config_path.write_text(config_text, encoding="utf-8")
+        rootfs_manifest = oci_worker.rootfs_tree_manifest(rootfs_source)
+        with config_path.open("a", encoding="utf-8") as stream:
+            stream.write(
+                "\n[sandbox.oci]\n"
+                f"runc_executable = {json.dumps(str(runc_path))}\n"
+                f"runc_version = {json.dumps(_SUPPORTED_RUNC_VERSION)}\n"
+                f"rootfs_path = {json.dumps(str(rootfs_source.resolve(strict=True)))}\n"
+                f"rootfs_sha256 = {json.dumps(rootfs_manifest['rootfs_sha256'])}\n"
+                f"rootfs_closure_sha256 = {json.dumps(rootfs_manifest['closure_sha256'])}\n"
+                "\n[runtime.ports]\n"
+                f"LAUNCH_DRIVER_TEST_PORT = [{shared_port_range[0]}, {shared_port_range[1]}]\n"
+            )
+        GitSupervisor(shared_repo)
+    except BaseException:
+        _remove_private_test_tree(shared_fixture_root, expected_identity=shared_fixture_identity)
+        control_root.rmdir()
+        raise
+
+    child_environment = dict(systemd_environment)
+    child_environment["PYTHONPATH"] = str(source_root / "src")
+    child_environment["ACP_RUN_SANDBOX_WORKER_LIFECYCLE"] = "1"
+    child_environment["ACP_LIVE_CANCEL_AFTER_START"] = "1"
+    child_environment["ACP_LIVE_CROSS_ATTEMPT_PROBES"] = "1"
+    child_environment["ACP_LIVE_SHARED_REPO"] = str(shared_repo)
+    child_environment["ACP_LIVE_SHARED_ROOTFS"] = str(rootfs_source)
+    child_environment["ACP_LIVE_SHARED_PORT_RANGE"] = (
+        f"{shared_port_range[0]},{shared_port_range[1]}"
+    )
+    child_environment["ACP_OCI_TEST_RUNC"] = str(runc_path)
+    child_environment["ACP_OCI_TEST_RUNC_VERSION"] = _SUPPORTED_RUNC_VERSION
+    if os.environ.get("ACP_OCI_TEST_BUSYBOX"):
+        child_environment["ACP_OCI_TEST_BUSYBOX"] = os.environ["ACP_OCI_TEST_BUSYBOX"]
 
     target = (
         f"{Path(__file__).resolve()}::"
@@ -5228,18 +5578,36 @@ def test_live_concurrent_attempts_use_distinct_scopes_and_clean_up() -> None:
         if path.is_dir() or path.is_symlink()
     }
     processes: list[subprocess.Popen[str]] = []
+    child_output_paths: dict[str, Path] = {}
+    child_output_streams: dict[str, Any] = {}
+
+    def close_child_output_streams() -> None:
+        for stream in child_output_streams.values():
+            if not stream.closed:
+                stream.flush()
+                stream.close()
+
     try:
         for slot in ("0", "1"):
             slot_environment = dict(child_environment)
             slot_environment["ACP_LIVE_CONCURRENT_CHILD"] = "1"
             slot_environment["ACP_LIVE_CONCURRENT_CONTROL_ROOT"] = str(control_root)
             slot_environment["ACP_LIVE_CONCURRENT_SLOT"] = slot
+            output_path = control_root / f"child-{slot}.log"
+            output_fd = os.open(
+                output_path,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+            )
+            output_stream = os.fdopen(output_fd, "w", encoding="utf-8", errors="replace")
+            child_output_paths[slot] = output_path
+            child_output_streams[slot] = output_stream
             processes.append(
                 subprocess.Popen(
                     command,
                     cwd=source_root,
                     env=slot_environment,
-                    stdout=subprocess.PIPE,
+                    stdout=output_stream,
                     stderr=subprocess.STDOUT,
                     text=True,
                     start_new_session=True,
@@ -5353,6 +5721,7 @@ def test_live_concurrent_attempts_use_distinct_scopes_and_clean_up() -> None:
                 cleanup_failures.append(
                     f"test process group {process.pid} did not close its output pipes"
                 )
+        close_child_output_streams()
         # After bounded process termination, retry exact-unit stops to close
         # an activation race against an earlier stop request.
         stop_exact_units(retry=True)
@@ -5415,11 +5784,15 @@ def test_live_concurrent_attempts_use_distinct_scopes_and_clean_up() -> None:
             )
 
         if not cleanup_failures:
-            allowed_names = {
-                f"{kind}-{slot}{suffix}"
-                for slot in ("0", "1")
-                for kind, suffix in (("prepared", ".json"), ("ready", ".json"), ("release", ""))
-            }
+            allowed_names = (
+                {
+                    f"{kind}-{slot}{suffix}"
+                    for slot in ("0", "1")
+                    for kind, suffix in (("prepared", ".json"), ("ready", ".json"), ("release", ""))
+                }
+                | {f"child-{slot}.log" for slot in ("0", "1")}
+                | {f"cleanup-verified-{slot}.json" for slot in ("0", "1")}
+            )
             try:
                 entries = list(control_root.iterdir())
             except OSError as error:
@@ -5468,6 +5841,15 @@ def test_live_concurrent_attempts_use_distinct_scopes_and_clean_up() -> None:
             raise RuntimeError(
                 "partial concurrent launch cleanup could not be verified: "
                 + "; ".join(dict.fromkeys(cleanup_failures))
+            ) from spawn_error
+        try:
+            _remove_private_test_tree(
+                shared_fixture_root, expected_identity=shared_fixture_identity
+            )
+        except (OSError, RuntimeError) as error:
+            raise RuntimeError(
+                "child cleanup passed but the shared concurrent fixture could not be removed; "
+                f"preserving {shared_fixture_root}: {error}"
             ) from spawn_error
         raise
 
@@ -5526,15 +5908,75 @@ def test_live_concurrent_attempts_use_distinct_scopes_and_clean_up() -> None:
                 "container_id",
                 "execution_id",
                 "pid",
-                "repo",
                 "run_root",
                 "scope_unit",
                 "source_worktree",
                 "workspace_root",
             )
+            if {ready["repo"] for ready in ready_records.values()} != {str(shared_repo)}:
+                failures.append("both attempts did not use the exact shared fixture repository")
+            assert shared_port_range is not None
+            shared_runtime_allocations: list[dict[str, Any]] = []
+            for slot in ("0", "1"):
+                allocations = ready_records[slot].get("runtime_allocations")
+                if not isinstance(allocations, list) or len(allocations) != 1:
+                    failures.append(f"slot {slot} did not retain one runtime-port allocation")
+                    continue
+                allocation = allocations[0]
+                if (
+                    not isinstance(allocation, dict)
+                    or allocation.get("pool_name") != "LAUNCH_DRIVER_TEST_PORT"
+                    or type(allocation.get("value")) is not int
+                    or not shared_port_range[0] <= allocation["value"] <= shared_port_range[1]
+                ):
+                    failures.append(
+                        f"slot {slot} runtime-port allocation is outside the fixture pool"
+                    )
+                else:
+                    shared_runtime_allocations.append(allocation)
+            if (
+                len(shared_runtime_allocations) == 2
+                and shared_runtime_allocations[0]["value"] == shared_runtime_allocations[1]["value"]
+            ):
+                failures.append("the two active attempts shared one runtime-port allocation")
             for field in unique_fields:
                 if len({ready[field] for ready in ready_records.values()}) != 2:
                     failures.append(f"the two child receipts do not have distinct {field} values")
+            workspace_roots = {
+                slot: Path(ready_records[slot]["workspace_root"]) for slot in ("0", "1")
+            }
+            mountinfo_paths = {
+                slot: workspace_root / ".acp-live-cross-attempt-mountinfo"
+                for slot, workspace_root in workspace_roots.items()
+            }
+            sandbox_execution_root = shared_repo / ".acp" / "sandbox-executions"
+            shared_repo_supervisor = GitSupervisor(shared_repo)
+            for slot, workspace_root in workspace_roots.items():
+                workspace_info = workspace_root.lstat()
+                if (
+                    workspace_root.resolve(strict=True) != workspace_root
+                    or not workspace_root.is_relative_to(
+                        sandbox_execution_root.resolve(strict=True)
+                    )
+                    or workspace_root.parent.parent != sandbox_execution_root
+                    or not stat.S_ISDIR(workspace_info.st_mode)
+                    or stat.S_ISLNK(workspace_info.st_mode)
+                    or workspace_info.st_uid != os.geteuid()
+                    or stat.S_IMODE(workspace_info.st_mode) != 0o700
+                ):
+                    failures.append(
+                        f"slot {slot} workspace is not the exact private shared-repo execution copy"
+                    )
+                if os.path.lexists(workspace_root / ".git"):
+                    failures.append(f"slot {slot} workspace contains Git metadata")
+                execution_record = shared_repo_supervisor._sandbox_execution_get(
+                    ready_records[slot]["attempt_id"]
+                )
+                if (
+                    execution_record is None
+                    or execution_record["execution_id"] != ready_records[slot]["execution_id"]
+                ):
+                    failures.append(f"slot {slot} live execution journal identity changed")
             expected_units = {ready["scope_unit"] for ready in ready_records.values()}
             live_samples: list[dict[str, tuple[str, str, str]]] = []
             for _ in range(2):
@@ -5583,6 +6025,203 @@ def test_live_concurrent_attempts_use_distinct_scopes_and_clean_up() -> None:
                 failures.append(
                     "the two exact active scope identities were not stable across samples"
                 )
+            if not failures:
+                probe_token = os.urandom(12).hex()
+                sentinel_bytes = f"acp-live-cross-attempt-{probe_token}\n".encode("ascii")
+                git_probe_root = shared_repo / ".git" / f"acp-live-cross-attempt-{probe_token}"
+                git_probe_root.mkdir(mode=0o700)
+                git_sentinel = git_probe_root / "shared-git.sentinel"
+                _write_live_concurrent_marker(git_probe_root, git_sentinel.name, sentinel_bytes)
+                git_info = git_sentinel.lstat()
+                git_identity = (git_info.st_dev, git_info.st_ino)
+                workspace_sentinels: dict[str, Path] = {}
+                workspace_sentinel_identities: dict[str, tuple[int, int]] = {}
+                result_paths: dict[str, Path] = {}
+                for slot in ("0", "1"):
+                    workspace_root = workspace_roots[slot]
+                    workspace_sentinel = workspace_root / (
+                        f".acp-live-cross-attempt-{probe_token}-{slot}.sentinel"
+                    )
+                    workspace_sentinels[slot] = workspace_sentinel
+                    _write_live_concurrent_marker(
+                        workspace_root,
+                        workspace_sentinel.name,
+                        sentinel_bytes,
+                    )
+                    sentinel_info = workspace_sentinel.lstat()
+                    workspace_sentinel_identities[slot] = (
+                        sentinel_info.st_dev,
+                        sentinel_info.st_ino,
+                    )
+                    for name in (
+                        ".acp-live-cross-attempt-targets",
+                        ".acp-live-cross-attempt-go",
+                        ".acp-live-cross-attempt-result",
+                        ".acp-live-cross-attempt-result.tmp",
+                        ".acp-live-cross-attempt-mountinfo",
+                        ".acp-live-cross-attempt-link",
+                    ):
+                        if os.path.lexists(workspace_root / name):
+                            raise RuntimeError(
+                                f"slot {slot} workspace already contains probe path {name}"
+                            )
+                    result_paths[slot] = workspace_root / ".acp-live-cross-attempt-result"
+                for slot in ("0", "1"):
+                    other_slot = "1" if slot == "0" else "0"
+                    workspace_root = workspace_roots[slot]
+                    targets = (f"{workspace_sentinels[other_slot]}\n{git_sentinel}\n").encode()
+                    _write_live_concurrent_marker(
+                        workspace_root,
+                        ".acp-live-cross-attempt-targets",
+                        targets,
+                    )
+                    _write_live_concurrent_marker(
+                        workspace_root,
+                        ".acp-live-cross-attempt-go",
+                        b"go\n",
+                    )
+
+                expected_probe = (
+                    "other-workspace=not-visible\n"
+                    "other-workspace=target-not-visible\n"
+                    "shared-git=not-visible\n"
+                    "shared-git=target-not-visible\n"
+                    "other-workspace-symlink=not-visible\n"
+                    "other-workspace-canonical=not-visible\n"
+                    "workspace-git=absent\n"
+                ).encode("ascii")
+                probe_deadline = time.monotonic() + 35
+                probe_results: dict[str, bytes] = {}
+                while time.monotonic() < probe_deadline:
+                    for slot, result_path in result_paths.items():
+                        if slot in probe_results or not os.path.lexists(result_path):
+                            continue
+                        result_info = result_path.lstat()
+                        if (
+                            not stat.S_ISREG(result_info.st_mode)
+                            or stat.S_ISLNK(result_info.st_mode)
+                            or result_info.st_uid != os.geteuid()
+                        ):
+                            raise RuntimeError(
+                                f"slot {slot} cross-attempt result has unsafe file identity"
+                            )
+                        probe_results[slot] = result_path.read_bytes()
+                    if len(probe_results) == 2:
+                        break
+                    if any(process.poll() is not None for process in processes):
+                        raise RuntimeError(
+                            "a concurrent worker exited before reporting isolation probes"
+                        )
+                    time.sleep(0.1)
+                if len(probe_results) != 2:
+                    raise TimeoutError("both workers did not finish cross-attempt isolation probes")
+                for slot, actual in probe_results.items():
+                    if actual != expected_probe:
+                        raise AssertionError(
+                            f"slot {slot} cross-attempt probe mismatch: {actual!r}"
+                        )
+                workspace_mount_roots: dict[str, str] = {}
+                for slot, mountinfo_path in mountinfo_paths.items():
+                    mountinfo_info = mountinfo_path.lstat()
+                    if (
+                        not stat.S_ISREG(mountinfo_info.st_mode)
+                        or stat.S_ISLNK(mountinfo_info.st_mode)
+                        or mountinfo_info.st_uid != os.geteuid()
+                        or mountinfo_info.st_size > 1024 * 1024
+                    ):
+                        raise RuntimeError(
+                            f"slot {slot} worker mountinfo has unsafe file identity or size"
+                        )
+                    records: list[tuple[str, str, str, str]] = []
+                    for line in mountinfo_path.read_text(encoding="ascii").splitlines():
+                        fields = line.split()
+                        try:
+                            separator = fields.index("-")
+                        except ValueError as error:
+                            raise RuntimeError(
+                                f"slot {slot} worker mountinfo has no field separator"
+                            ) from error
+                        if separator < 6 or len(fields) < separator + 3:
+                            raise RuntimeError(
+                                f"slot {slot} worker mountinfo has a truncated record"
+                            )
+
+                        def decode_mount_field(value: str) -> str:
+                            return (
+                                value.replace("\\040", " ")
+                                .replace("\\011", "\t")
+                                .replace("\\012", "\n")
+                                .replace("\\134", "\\")
+                            )
+
+                        records.append(
+                            (
+                                decode_mount_field(fields[3]),
+                                decode_mount_field(fields[4]),
+                                fields[separator + 1],
+                                decode_mount_field(fields[separator + 2]),
+                            )
+                        )
+                    by_target: dict[str, list[tuple[str, str, str, str]]] = {}
+                    for record in records:
+                        by_target.setdefault(record[1], []).append(record)
+                    for target in ("/proc", "/dev", "/workspace", "/tmp", "/home/agent"):
+                        if len(by_target.get(target, [])) != 1:
+                            raise AssertionError(
+                                f"slot {slot} live mountinfo does not show exactly one {target} mount"
+                            )
+                    for target in ("/tmp", "/home/agent", "/dev"):
+                        if by_target[target][0][2] != "tmpfs":
+                            raise AssertionError(f"slot {slot} live {target} mount is not tmpfs")
+                    if by_target["/proc"][0][2] != "proc":
+                        raise AssertionError(f"slot {slot} live /proc mount is not procfs")
+                    workspace_record = by_target["/workspace"][0]
+                    expected_mount_root = workspace_roots[slot].as_posix()
+                    if workspace_record[0] != expected_mount_root:
+                        raise AssertionError(
+                            f"slot {slot} live /workspace mount root does not identify its exact "
+                            f"host workspace: expected={expected_mount_root!r} "
+                            f"observed={workspace_record[0]!r}"
+                        )
+                    fixture_mounts = [
+                        record
+                        for record in records
+                        if record[0].startswith("/tmp/acp-live-concurrent-")
+                    ]
+                    if fixture_mounts != [workspace_record]:
+                        raise AssertionError(
+                            f"slot {slot} live mountinfo exposes a test-fixture host path "
+                            "outside its exact assigned /workspace"
+                        )
+                    workspace_mount_roots[slot] = workspace_record[0]
+                    if any(target in by_target for target in ("/etc", "/usr", "/home", "/root")):
+                        raise AssertionError(
+                            f"slot {slot} live mountinfo unexpectedly exposes a broad host path"
+                        )
+                if len(set(workspace_mount_roots.values())) != 2:
+                    raise AssertionError(
+                        "the two live worker namespaces do not report distinct workspace mounts"
+                    )
+                for slot, workspace_sentinel in workspace_sentinels.items():
+                    sentinel_info = workspace_sentinel.lstat()
+                    if (
+                        not stat.S_ISREG(sentinel_info.st_mode)
+                        or stat.S_ISLNK(sentinel_info.st_mode)
+                        or (sentinel_info.st_dev, sentinel_info.st_ino)
+                        != workspace_sentinel_identities[slot]
+                        or workspace_sentinel.read_bytes() != sentinel_bytes
+                    ):
+                        raise AssertionError(
+                            f"slot {slot} cross-attempt sentinel changed during live probes"
+                        )
+                git_info_after = git_sentinel.lstat()
+                if (
+                    not stat.S_ISREG(git_info_after.st_mode)
+                    or stat.S_ISLNK(git_info_after.st_mode)
+                    or (git_info_after.st_dev, git_info_after.st_ino) != git_identity
+                    or git_sentinel.read_bytes() != sentinel_bytes
+                ):
+                    raise AssertionError("shared Git-metadata sentinel changed during live probes")
     except Exception as error:
         failures.append(
             f"concurrent readiness verification failed: {type(error).__name__}: {error}"
@@ -5666,24 +6305,33 @@ def test_live_concurrent_attempts_use_distinct_scopes_and_clean_up() -> None:
     outputs: list[str] = []
     for process in processes:
         try:
-            output, _ = process.communicate(timeout=10)
-        except subprocess.TimeoutExpired as first_timeout:
-            failures.append(f"test process group {process.pid} did not close its output pipes")
+            process.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            failures.append(f"test process group {process.pid} did not close")
             _signal_live_test_process_group(process, signal.SIGKILL)
             try:
-                output, _ = process.communicate(timeout=10)
-            except subprocess.TimeoutExpired as second_timeout:
-                failures.append(
-                    f"test process group {process.pid} still held output pipes after SIGKILL"
-                )
-                output = second_timeout.output or first_timeout.output or ""
+                process.communicate(timeout=10)
+            except subprocess.TimeoutExpired:
+                failures.append(f"test process group {process.pid} survived SIGKILL")
         except OSError as error:
-            failures.append(f"could not drain test process {process.pid} output: {error}")
+            failures.append(f"could not wait for test process {process.pid}: {error}")
             _signal_live_test_process_group(process, signal.SIGKILL)
-            output = ""
-        outputs.append(output)
+    try:
+        close_child_output_streams()
+    except OSError as error:
+        failures.append(f"could not close child output logs: {error}")
+    for slot in ("0", "1"):
+        output_path = child_output_paths.get(slot)
+        if output_path is None:
+            outputs.append("")
+            continue
+        try:
+            outputs.append(output_path.read_text(encoding="utf-8", errors="replace")[-3000:])
+        except OSError as error:
+            failures.append(f"could not read slot {slot} child output log: {error}")
+            outputs.append("")
 
-    # Always retry exact stops after process-group and pipe cleanup. This closes
+    # Always retry exact stops after process-group and output-log cleanup. This closes
     # a late systemd activation race and ensures postflight is never skipped by
     # a communicate timeout.
     stop_exact_units()
@@ -5761,7 +6409,13 @@ def test_live_concurrent_attempts_use_distinct_scopes_and_clean_up() -> None:
         expected_markers: set[str] = set()
         for slot in ("0", "1"):
             expected_markers.update(
-                {f"prepared-{slot}.json", f"ready-{slot}.json", f"release-{slot}"}
+                {
+                    f"prepared-{slot}.json",
+                    f"ready-{slot}.json",
+                    f"release-{slot}",
+                    f"child-{slot}.log",
+                    f"cleanup-verified-{slot}.json",
+                }
             )
         try:
             control_entries = list(control_root.iterdir())
@@ -5807,6 +6461,18 @@ def test_live_concurrent_attempts_use_distinct_scopes_and_clean_up() -> None:
                 control_root.rmdir()
             except OSError as error:
                 failures.append(f"could not remove concurrent control directory: {error}")
+    if not failures:
+        try:
+            _remove_private_test_tree(
+                shared_fixture_root, expected_identity=shared_fixture_identity
+            )
+            if os.path.lexists(shared_fixture_root):
+                failures.append("shared concurrent fixture remained after exact cleanup")
+        except (OSError, RuntimeError) as error:
+            failures.append(
+                "shared concurrent fixture cleanup could not be verified; "
+                f"preserving {shared_fixture_root}: {error}"
+            )
     if failures:
         details = "; ".join(
             f"child {index} exit={process.returncode}: {output[-3000:]}"
