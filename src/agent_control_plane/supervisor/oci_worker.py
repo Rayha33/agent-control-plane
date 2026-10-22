@@ -150,6 +150,7 @@ _RUNC_PRIVATE_BUNDLE_LAUNCHER = r"""
 import array
 import ctypes
 import errno
+import fcntl
 import json
 import os
 import resource
@@ -157,8 +158,19 @@ import socket
 import stat
 import sys
 
-start_fd, status_fd, map_ack_fd, exec_ack_fd, gate_fd, runc_fd, bundle_fd, rootfs_fd, snapshot_socket_fd = (
-    int(value) for value in sys.argv[1:10]
+(
+    start_fd,
+    status_fd,
+    map_ack_fd,
+    exec_ack_fd,
+    gate_fd,
+    worker_credential_fd,
+    runc_fd,
+    bundle_fd,
+    rootfs_fd,
+    snapshot_socket_fd,
+) = (
+    int(value) for value in sys.argv[1:11]
 )
 CLONE_NEWNS = 0x00020000
 CLONE_NEWUSER = 0x10000000
@@ -552,7 +564,8 @@ try:
         or command[3:5] != ["--systemd-cgroup", "run"]
         or command[5] != "--bundle"
         or command[7] != "--pid-file"
-        or command[9:11] != ["--preserve-fds", "1"]
+        or command[9:11]
+        != ["--preserve-fds", "2" if worker_credential_fd >= 0 else "1"]
         or command[11] != "--keep"
     ):
         _fail()
@@ -987,7 +1000,7 @@ try:
         or command[3:5] != ["--systemd-cgroup", "run"]
         or command[5] != "--bundle"
         or command[7] != "--pid-file"
-        or command[9:11] != ["--preserve-fds", "1"]
+        or command[9:11] != ["--preserve-fds", "2" if worker_credential_fd >= 0 else "1"]
         or command[11] != "--keep"
         or len(bundle_args) != 1
         or bundle_args[0] + 1 >= len(command)
@@ -1029,6 +1042,22 @@ try:
     else:
         os.dup2(gate_fd, 3, inheritable=True)
         os.close(gate_fd)
+    if worker_credential_fd >= 0:
+        if (
+            not stat.S_ISFIFO(os.fstat(worker_credential_fd).st_mode)
+            or fcntl.fcntl(worker_credential_fd, fcntl.F_GETFL) & os.O_ACCMODE
+            != os.O_RDONLY
+        ):
+            _fail()
+        if status_fd == 4:
+            moved_status_fd = fcntl.fcntl(status_fd, fcntl.F_DUPFD_CLOEXEC, 70)
+            os.close(status_fd)
+            status_fd = moved_status_fd
+        if worker_credential_fd == 4:
+            os.set_inheritable(worker_credential_fd, True)
+        else:
+            os.dup2(worker_credential_fd, 4, inheritable=True)
+            os.close(worker_credential_fd)
     os.set_inheritable(runc_fd, False)
     resource.setrlimit(resource.RLIMIT_FSIZE, (67108864, 67108864))
     os.execve(runc_fd, command, payload["env"])
@@ -2654,6 +2683,8 @@ def build_oci_worker_config(
     execing candidate code. The runc caller must map the trusted pipe read end
     to fd 3, pass exactly that descriptor with ``--preserve-fds 1``, and release
     its paired writer only after durable journal and runtime identity checks.
+    Only the private test-only fake-canary seam may also preserve a bounded
+    read-only pipe as fd 4; it does not enable production provider-secret delivery.
     ``apparmor_profile``, when supplied, only names a preloaded profile; this
     compiler does not provision or audit its policy, or verify that the runtime
     applied it. This compiler also does not release the gate.
@@ -3411,11 +3442,15 @@ def build_runc_run_argv(
     workspace_root: str | Path,
     pid_file: str | Path,
     container_id: str,
+    *,
+    test_worker_credential_fd: int | None = None,
 ) -> list[str]:
     """Return an attached runc command with explicit state root and bundle.
 
-    The OCI init requires one inherited launch-gate descriptor at fd 3. The
-    public :func:`spawn_pinned_runc` replaces the host bundle path with an
+    The OCI init requires one inherited launch-gate descriptor at fd 3. An
+    explicitly test-only canary transport may add a read-only pipe at fd 4;
+    that case preserves exactly two descriptors. The public
+    :func:`spawn_pinned_runc` replaces the host bundle path with an
     inherited descriptor path inside a private mount namespace before runc is
     executed. The diagnostic helper intentionally retains its host-path mode.
     ``executable`` must be a process-local pin minted by
@@ -3467,6 +3502,10 @@ def build_runc_run_argv(
     pid_path = pid_parent / pid_path.name
     if os.path.lexists(pid_path):
         raise SupervisorError("invalid_oci_pid_file", "runc PID file must not already exist")
+    if test_worker_credential_fd is not None and (
+        type(test_worker_credential_fd) is not int or test_worker_credential_fd < 0
+    ):
+        raise SupervisorError("invalid_oci_command", "test worker canary descriptor is invalid")
     return [
         str(binary),
         "--root",
@@ -3478,7 +3517,7 @@ def build_runc_run_argv(
         "--pid-file",
         str(pid_path),
         "--preserve-fds",
-        "1",
+        "2" if test_worker_credential_fd is not None else "1",
         "--keep",
         container_id,
     ]
@@ -3681,6 +3720,8 @@ class _RuncLaunchTarget:
     cpu_quota: int | None = None
     cpu_period: int | None = None
     pids_limit: int | None = None
+    # True only for the opt-in test-only fake canary pipe preserved at fd 4.
+    test_worker_canary_fd4: bool = False
 
 
 _RUNC_LAUNCH_SUBMISSION_TARGETS: dict[
@@ -5194,16 +5235,19 @@ def _private_bundle_runc_launch_target(
     config_json: bytes,
     expected_rootfs_sha256: str,
     expected_rootfs_closure_sha256: str,
+    *,
+    test_worker_credential: bool = False,
 ) -> _RuncLaunchTarget:
     """Capture the exact command, config, and path identities launched by runc."""
 
     if (
-        len(command) != 13
+        type(test_worker_credential) is not bool
+        or len(command) != 13
         or command[1] != "--root"
         or command[3:5] != ("--systemd-cgroup", "run")
         or command[5] != "--bundle"
         or command[7] != "--pid-file"
-        or command[9:11] != ("--preserve-fds", "1")
+        or command[9:11] != ("--preserve-fds", "2" if test_worker_credential else "1")
         or command[11] != "--keep"
         or command[0] != str(executable.path)
         or command[6] != str(bundle)
@@ -5359,6 +5403,7 @@ def _private_bundle_runc_launch_target(
         cpu_quota=cpu_quota,
         cpu_period=cpu_period,
         pids_limit=pids_limit,
+        test_worker_canary_fd4=test_worker_credential,
     )
 
 
@@ -5388,7 +5433,11 @@ def _bind_private_runc_launch_fds(
         or command[3:5] != ("--systemd-cgroup", "run")
         or command[5] != "--bundle"
         or command[7] != "--pid-file"
-        or command[9:11] != ("--preserve-fds", "1")
+        or command[9:11]
+        not in {
+            ("--preserve-fds", "1"),
+            ("--preserve-fds", "2"),
+        }
         or command[11] != "--keep"
         or target.state_path is None
         or target.workspace_path is None
@@ -5467,6 +5516,7 @@ def _spawn_pinned_runc_with_private_bundle(
     _before_workspace_open: Callable[[int, Path, int, int], None] | None = None,
     _before_runc_exec: Callable[[int, Path, int], None] | None = None,
     _authorize_runc_submission: Callable[[_RuncLaunchTarget], Any] | None = None,
+    _test_worker_credential_fd: int | None = None,
 ) -> RuncLaunchHandle:
     """Exec pinned runc only after sealing its bundle in a private mount namespace.
 
@@ -5511,6 +5561,31 @@ def _spawn_pinned_runc_with_private_bundle(
         or sum(len(os.fsencode(value)) + 1 for value in command) > _MAX_RUNC_LAUNCH_PAYLOAD_BYTES
     ):
         raise SupervisorError("invalid_oci_command", "runc argv is invalid or exceeds its limit")
+    import fcntl
+
+    if _test_worker_credential_fd is None:
+        if command[9:11] != ("--preserve-fds", "1"):
+            raise SupervisorError(
+                "invalid_oci_command", "runc preserve-fds must match the launch capabilities"
+            )
+    else:
+        if type(_test_worker_credential_fd) is not int or _test_worker_credential_fd < 0:
+            raise SupervisorError("invalid_oci_command", "test worker canary descriptor is invalid")
+        try:
+            credential_info = os.fstat(_test_worker_credential_fd)
+            credential_flags = fcntl.fcntl(_test_worker_credential_fd, fcntl.F_GETFL)
+        except OSError as error:
+            raise SupervisorError(
+                "invalid_oci_command", "test worker canary descriptor is unavailable"
+            ) from error
+        if (
+            not stat.S_ISFIFO(credential_info.st_mode)
+            or credential_flags & os.O_ACCMODE != os.O_RDONLY
+            or command[9:11] != ("--preserve-fds", "2")
+        ):
+            raise SupervisorError(
+                "invalid_oci_command", "test worker canary must be a read-only pipe at fd 4"
+            )
     bundle_args = [index for index, value in enumerate(command) if value == "--bundle"]
     if len(bundle_args) != 1 or bundle_args[0] + 1 >= len(command):
         raise SupervisorError("invalid_oci_command", "runc argv must contain one bundle path")
@@ -5518,7 +5593,6 @@ def _spawn_pinned_runc_with_private_bundle(
     bundle, initial_bundle_fd, initial_rootfs_fd = _open_private_bundle_fds(bundle_root)
     initial_bundle_info = os.fstat(initial_bundle_fd)
     initial_rootfs_info = os.fstat(initial_rootfs_fd)
-    import fcntl
 
     runtime_environment = _runc_client_environment()
     try:
@@ -5537,6 +5611,7 @@ def _spawn_pinned_runc_with_private_bundle(
         raise
     runc_fd = bundle_fd = rootfs_fd = -1
     state_path_fd = workspace_path_fd = state_fd = workspace_fd = -1
+    test_worker_credential_descriptor = -1
     start_read = start_write = status_read = status_write = -1
     map_ack_read = map_ack_write = exec_ack_read = exec_ack_write = -1
     gate_read = gate_write = -1
@@ -5574,6 +5649,7 @@ def _spawn_pinned_runc_with_private_bundle(
             config_json,
             rootfs_sha256,
             rootfs_closure_sha256,
+            test_worker_credential=_test_worker_credential_fd is not None,
         )
         if (
             launch_target.state_device is None
@@ -5662,6 +5738,10 @@ def _spawn_pinned_runc_with_private_bundle(
         map_ack_read, map_ack_write = os.pipe2(os.O_CLOEXEC)
         exec_ack_read, exec_ack_write = os.pipe2(os.O_CLOEXEC)
         gate_read, gate_write = _create_runc_launch_gate_pipe()
+        if _test_worker_credential_fd is not None:
+            test_worker_credential_descriptor = fcntl.fcntl(
+                _test_worker_credential_fd, fcntl.F_DUPFD_CLOEXEC, 68
+            )
         snapshot_socket_parent, snapshot_socket_child = socket.socketpair(
             socket.AF_UNIX,
             socket.SOCK_SEQPACKET | getattr(socket, "SOCK_CLOEXEC", 0),
@@ -5685,6 +5765,7 @@ def _spawn_pinned_runc_with_private_bundle(
                 str(map_ack_read),
                 str(exec_ack_read),
                 str(gate_read),
+                str(test_worker_credential_descriptor),
                 str(runc_fd),
                 str(bundle_fd),
                 str(rootfs_fd),
@@ -5702,6 +5783,11 @@ def _spawn_pinned_runc_with_private_bundle(
                 map_ack_read,
                 exec_ack_read,
                 gate_read,
+                *(
+                    (test_worker_credential_descriptor,)
+                    if test_worker_credential_descriptor >= 0
+                    else ()
+                ),
                 runc_fd,
                 bundle_fd,
                 rootfs_fd,
@@ -5738,6 +5824,10 @@ def _spawn_pinned_runc_with_private_bundle(
         descriptor = gate_read
         gate_read = -1
         os.close(descriptor)
+        if test_worker_credential_descriptor >= 0:
+            descriptor = test_worker_credential_descriptor
+            test_worker_credential_descriptor = -1
+            os.close(descriptor)
         descriptor = runc_fd
         runc_fd = -1
         os.close(descriptor)
@@ -5943,6 +6033,7 @@ def _spawn_pinned_runc_with_private_bundle(
             exec_ack_read,
             exec_ack_write,
             gate_read,
+            test_worker_credential_descriptor,
         )
         opened_descriptor = initial_bundle_fd = initial_rootfs_fd = -1
         runc_fd = bundle_fd = rootfs_fd = -1
@@ -5950,6 +6041,7 @@ def _spawn_pinned_runc_with_private_bundle(
         start_read = start_write = status_read = status_write = -1
         map_ack_read = map_ack_write = exec_ack_read = exec_ack_write = -1
         gate_read = -1
+        test_worker_credential_descriptor = -1
         for descriptor in descriptors_to_close:
             if descriptor >= 0:
                 try:
@@ -5978,6 +6070,7 @@ def spawn_pinned_runc(
     stdout: Any = subprocess.DEVNULL,
     stderr: Any = subprocess.DEVNULL,
     _authorize_runc_submission: Callable[[_RuncLaunchTarget], Any] | None = None,
+    _test_worker_credential_fd: int | None = None,
 ) -> RuncLaunchHandle:
     """Launch sealed runc policy from a private, descriptor-anchored bundle.
 
@@ -5997,7 +6090,9 @@ def spawn_pinned_runc(
     ``run_worker`` call remains fail-closed without explicit opt-in, required
     resource limits, and pinned runtime/rootfs. A supervised monitor may
     supply the private submission callback, which must return the
-    process-local capability committed for this exact launch target.
+    process-local capability committed for this exact launch target. Only the
+    private test-only fake-canary seam adds a read-only fd 4 to runc's preserved
+    descriptors; the production default remains fd 3 only.
     """
 
     if type(binding) is not _PinnedRuncWorkerConfig:
@@ -6013,6 +6108,7 @@ def spawn_pinned_runc(
         workspace_root,
         pid_file,
         container_id,
+        test_worker_credential_fd=_test_worker_credential_fd,
     )
     return _spawn_pinned_runc_with_private_bundle(
         executable,
@@ -6024,6 +6120,7 @@ def spawn_pinned_runc(
         stdout=stdout,
         stderr=stderr,
         _authorize_runc_submission=_authorize_runc_submission,
+        _test_worker_credential_fd=_test_worker_credential_fd,
     )
 
 

@@ -59,6 +59,8 @@ _PROVIDER_POLICY_NAME = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}\Z")
 _MAX_TIMEOUT_SECONDS = 3540
 _RUNNER_CREDENTIAL_NAME = "acp-runner"
 _RUNNER_CREDENTIAL_LIMIT = 4096
+_TEST_WORKER_CANARY_CREDENTIAL_NAME = "acp-test-worker-canary"
+_TEST_WORKER_CANARY_LIMIT = 4096
 
 
 class SandboxLaunchDriverServiceError(RuntimeError):
@@ -579,6 +581,88 @@ def _read_service_runner_credential() -> str | None:
         os.close(descriptor)
 
 
+def _read_service_test_worker_canary() -> bytes | None:
+    """Read an opt-in fake credential only for the test-only FD4 transport proof."""
+
+    if os.environ.get("ACP_TEST_ALLOW_WORKER_CANARY") != "1":
+        return None
+    directory_value = os.environ.get("CREDENTIALS_DIRECTORY")
+    if not directory_value:
+        raise SandboxLaunchDriverServiceError("test canary credential directory is unavailable")
+    directory = Path(directory_value)
+    if not directory.is_absolute() or directory.as_posix() != directory_value:
+        raise SandboxLaunchDriverServiceError("test canary credential directory is invalid")
+    try:
+        directory_info = directory.lstat()
+        if (
+            not stat.S_ISDIR(directory_info.st_mode)
+            or stat.S_ISLNK(directory_info.st_mode)
+            or directory_info.st_uid != os.geteuid()
+            or directory_info.st_mode & 0o077
+        ):
+            raise SandboxLaunchDriverServiceError("test canary credential directory is not private")
+        descriptor = os.open(
+            directory / _TEST_WORKER_CANARY_CREDENTIAL_NAME,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+        )
+    except OSError as error:
+        raise SandboxLaunchDriverServiceError(
+            "test canary credential cannot be opened safely"
+        ) from error
+    try:
+        info = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.geteuid()
+            or info.st_mode & 0o222
+            or info.st_size < 1
+            or info.st_size > _TEST_WORKER_CANARY_LIMIT
+        ):
+            raise SandboxLaunchDriverServiceError("test canary credential file is unsafe")
+        chunks: list[bytes] = []
+        remaining = _TEST_WORKER_CANARY_LIMIT + 1
+        while remaining:
+            chunk = os.read(descriptor, min(1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        payload = b"".join(chunks)
+        if len(payload) != info.st_size or len(payload) > _TEST_WORKER_CANARY_LIMIT:
+            raise SandboxLaunchDriverServiceError(
+                "test canary credential file changed while reading"
+            )
+        return payload
+    finally:
+        os.close(descriptor)
+
+
+def _test_worker_canary_pipe(payload: bytes) -> int:
+    """Return a read-only pipe containing bounded fake test-canary bytes."""
+
+    if type(payload) is not bytes or not 1 <= len(payload) <= _TEST_WORKER_CANARY_LIMIT:
+        raise SandboxLaunchDriverServiceError("test canary credential is invalid")
+    if hasattr(os, "pipe2"):
+        read_fd, write_fd = os.pipe2(os.O_CLOEXEC)
+    else:
+        read_fd, write_fd = os.pipe()
+        os.set_inheritable(read_fd, False)
+        os.set_inheritable(write_fd, False)
+    try:
+        remaining = memoryview(payload)
+        while remaining:
+            written = os.write(write_fd, remaining)
+            if written <= 0:
+                raise OSError("could not stage the bounded test canary pipe")
+            remaining = remaining[written:]
+    except BaseException:
+        os.close(read_fd)
+        raise
+    finally:
+        os.close(write_fd)
+    return read_fd
+
+
 def _unit_properties(unit: str, properties: tuple[str, ...]) -> dict[str, str]:
     raw = _run_trusted_runtime_command(
         [
@@ -991,6 +1075,7 @@ def start_sandbox_launch_driver(
     timeout_seconds: float = 600.0,
     startup_timeout_seconds: float = 15.0,
     credential: str | None = None,
+    _test_worker_canary: bytes | None = None,
     provider_egress_policy_name: str | None = None,
     provider_egress_destinations: dict[str, Any] | None = None,
 ) -> SandboxLaunchDriverReceipt:
@@ -1025,6 +1110,20 @@ def start_sandbox_launch_driver(
     )
     _reject_runner_credential_in_command(request, credential)
     _validate_runner_credential(credential)
+    if _test_worker_canary is not None and (
+        os.environ.get("ACP_TEST_ALLOW_WORKER_CANARY") != "1"
+        or type(_test_worker_canary) is not bytes
+        or not 1 <= len(_test_worker_canary) <= _TEST_WORKER_CANARY_LIMIT
+    ):
+        raise SandboxLaunchDriverServiceError(
+            "test worker canary requires the bounded explicit test-only opt-in"
+        )
+    if _test_worker_canary is not None and any(
+        _test_worker_canary in part.encode("utf-8") for part in request["command"]
+    ):
+        raise SandboxLaunchDriverServiceError(
+            "test worker canary must not be included in the worker command"
+        )
     execution = supervisor._sandbox_execution_get(identity[0])
     if (
         execution is None
@@ -1080,14 +1179,18 @@ def start_sandbox_launch_driver(
     systemd_run = _systemd_run_path()
     request_path = _state_request_path(supervisor, execution)
     credential_fd: int | None = None
+    test_worker_canary_fd: int | None = None
 
-    def close_credential_fd() -> None:
-        nonlocal credential_fd
+    def close_credential_fds() -> None:
+        nonlocal credential_fd, test_worker_canary_fd
         if credential_fd is not None:
             descriptor, credential_fd = credential_fd, None
             os.close(descriptor)
+        if test_worker_canary_fd is not None:
+            descriptor, test_worker_canary_fd = test_worker_canary_fd, None
+            os.close(descriptor)
 
-    if credential is not None:
+    if credential is not None or _test_worker_canary is not None:
         runtime_dir = Path(environment["XDG_RUNTIME_DIR"])
         try:
             runtime_info = runtime_dir.lstat()
@@ -1104,12 +1207,21 @@ def start_sandbox_launch_driver(
             raise SandboxLaunchDriverServiceError(
                 "launch-driver credential runtime directory is not private"
             )
-        try:
-            credential_fd = _anonymous_fd(credential.encode("utf-8"), runtime_dir)
-        except OSError as error:
-            raise SandboxLaunchDriverServiceError(
-                "launch-driver credential could not be materialized privately"
-            ) from error
+        if credential is not None:
+            try:
+                credential_fd = _anonymous_fd(credential.encode("utf-8"), runtime_dir)
+            except OSError as error:
+                raise SandboxLaunchDriverServiceError(
+                    "launch-driver credential could not be materialized privately"
+                ) from error
+        if _test_worker_canary is not None:
+            try:
+                test_worker_canary_fd = _anonymous_fd(_test_worker_canary, runtime_dir)
+            except OSError as error:
+                close_credential_fds()
+                raise SandboxLaunchDriverServiceError(
+                    "test worker canary could not be materialized privately"
+                ) from error
     command_line = [
         str(systemd_run),
         "--user",
@@ -1136,6 +1248,14 @@ def start_sandbox_launch_driver(
         command_line.append(
             "--property=LoadCredential="
             f"{_RUNNER_CREDENTIAL_NAME}:/proc/{os.getpid()}/fd/{credential_fd}"
+        )
+    if test_worker_canary_fd is not None:
+        command_line.extend(
+            [
+                "--setenv=ACP_TEST_ALLOW_WORKER_CANARY=1",
+                "--property=LoadCredential="
+                f"{_TEST_WORKER_CANARY_CREDENTIAL_NAME}:/proc/{os.getpid()}/fd/{test_worker_canary_fd}",
+            ]
         )
     try:
         request_digest = _write_request(request_path, request)
@@ -1184,7 +1304,7 @@ def start_sandbox_launch_driver(
                 # ExecStart has crossed the exec boundary and LoadCredential
                 # has been materialized; keep the raw credential FD alive no
                 # longer. --no-block would close it before systemd opens it.
-                close_credential_fd()
+                close_credential_fds()
         except BaseException as activation_error:
             # Even an interruption can arrive after systemd accepted the
             # activation. Reconcile the one-shot intent before returning or
@@ -1235,7 +1355,7 @@ def start_sandbox_launch_driver(
                 ) from activation_error
             raise activation_error
     except BaseException:
-        close_credential_fd()
+        close_credential_fds()
         raise
 
     polling_reconciliation_attempted = False
@@ -1381,7 +1501,7 @@ def start_sandbox_launch_driver(
                     raise startup_error from cancel_error
         raise
     finally:
-        close_credential_fd()
+        close_credential_fds()
 
 
 def _run_driver(
@@ -1416,6 +1536,7 @@ def _run_driver(
         )
     credential = _read_service_runner_credential()
     _reject_runner_credential_in_command(request, credential)
+    test_worker_canary = _read_service_test_worker_canary()
     redemption = collect_launch_driver_start_redemption(
         expected_identity=expected_identity,
         expected_container_id=execution["container_id"],
@@ -1438,7 +1559,13 @@ def _run_driver(
         os.fsync(directory_fd)
     finally:
         os.close(directory_fd)
-    _execute_pinned_request(supervisor, expected_identity, request, credential=credential)
+    _execute_pinned_request(
+        supervisor,
+        expected_identity,
+        request,
+        credential=credential,
+        test_worker_canary=test_worker_canary,
+    )
 
 
 def _request_timeout_stop_and_cancel_monitor(
@@ -1730,6 +1857,7 @@ def _execute_pinned_request(
     request: dict[str, Any],
     *,
     credential: str | None,
+    test_worker_canary: bytes | None = None,
 ) -> None:
     """Keep all launch, attestation, gate, and runc wait capabilities in this process."""
 
@@ -1951,17 +2079,29 @@ def _execute_pinned_request(
 
     handle: oci_worker.RuncLaunchHandle | None = None
     try:
-        handle = oci_worker.spawn_pinned_runc(
-            runtime_binding,
-            state_root,
-            bundle_root,
-            Path(durable["workspace_root_path"]),
-            pid_file,
-            container_id,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            _authorize_runc_submission=authorize,
+        test_worker_credential_fd = (
+            _test_worker_canary_pipe(test_worker_canary) if test_worker_canary is not None else None
         )
+        try:
+            spawn_kwargs: dict[str, Any] = {
+                "stdout": subprocess.DEVNULL,
+                "stderr": subprocess.DEVNULL,
+                "_authorize_runc_submission": authorize,
+            }
+            if test_worker_credential_fd is not None:
+                spawn_kwargs["_test_worker_credential_fd"] = test_worker_credential_fd
+            handle = oci_worker.spawn_pinned_runc(
+                runtime_binding,
+                state_root,
+                bundle_root,
+                Path(durable["workspace_root_path"]),
+                pid_file,
+                container_id,
+                **spawn_kwargs,
+            )
+        finally:
+            if test_worker_credential_fd is not None:
+                os.close(test_worker_credential_fd)
         client_pid = oci_worker._runc_launch_pid(handle)
         client_identity = oci_worker._runc_launch_process_identity(handle)
         if submission is None or client_pid is None or client_identity is None:
@@ -2213,6 +2353,7 @@ def start_registered_no_model_sandbox_worker(
     timeout_seconds: float = 600.0,
     startup_timeout_seconds: float = 15.0,
     credential: str | None = None,
+    _test_worker_canary: bytes | None = None,
     experimental_opt_in: bool = False,
     provider_egress_policy_name: str | None = None,
     provider_egress_destinations: dict[str, Any] | None = None,
@@ -2227,8 +2368,10 @@ def start_registered_no_model_sandbox_worker(
     not call a model/provider or import results; the caller retains the
     cleanup-gated result-import decision.
     An optional labeled UDS egress policy grants only the proxy capability;
-    this helper has no built-in provider-credential delivery channel. Callers
-    remain responsible for secrets embedded in commands or workspaces.
+    this helper has no general provider-credential delivery channel. A private
+    test-only fake-canary path exercises FD4 and is unavailable without the
+    explicit ``ACP_TEST_ALLOW_WORKER_CANARY=1`` opt-in. Callers remain
+    responsible for secrets embedded in commands or workspaces.
 
     The default worker entrypoint remains fail-closed. Every argument that can
     be rejected without side effects is validated before reservation. During
@@ -2256,6 +2399,14 @@ def start_registered_no_model_sandbox_worker(
     ):
         raise SandboxLaunchDriverServiceError("launch-driver startup timeout is invalid")
     _validate_runner_credential(credential)
+    if _test_worker_canary is not None and (
+        os.environ.get("ACP_TEST_ALLOW_WORKER_CANARY") != "1"
+        or type(_test_worker_canary) is not bytes
+        or not 1 <= len(_test_worker_canary) <= _TEST_WORKER_CANARY_LIMIT
+    ):
+        raise SandboxLaunchDriverServiceError(
+            "test worker canary requires the bounded explicit test-only opt-in"
+        )
     preflight_request = _validate_request(
         expected_identity=(attempt_id, claim_token, "preflight"),
         command=command,
@@ -2268,6 +2419,12 @@ def start_registered_no_model_sandbox_worker(
         provider_egress_destinations=provider_egress_destinations,
     )
     _reject_runner_credential_in_command(preflight_request, credential)
+    if _test_worker_canary is not None and any(
+        _test_worker_canary in part.encode("utf-8") for part in preflight_request["command"]
+    ):
+        raise SandboxLaunchDriverServiceError(
+            "test worker canary must not be included in the worker command"
+        )
     validated_command = tuple(preflight_request["command"])
 
     rootfs_pin = supervisor.config.oci_rootfs_pin
@@ -2408,6 +2565,7 @@ def start_registered_no_model_sandbox_worker(
             timeout_seconds=timeout_seconds,
             startup_timeout_seconds=startup_timeout_seconds,
             credential=credential,
+            _test_worker_canary=_test_worker_canary,
             provider_egress_policy_name=preflight_request.get("provider_egress_policy", {}).get(
                 "name"
             ),

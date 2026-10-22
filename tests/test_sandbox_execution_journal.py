@@ -1194,7 +1194,8 @@ def test_launch_binds_rootfs_pins_and_persists_exact_config_digest(repo: Path) -
         == hashlib.sha256(canonical_json(durable["launch_plan"]).encode("utf-8")).hexdigest()
     )
     assert durable["launch_plan"]["reservation"]["bundle_digest"] == execution["bundle_digest"]
-    assert durable["launch_plan"]["version"] == 6
+    assert durable["launch_plan"]["version"] == 7
+    assert durable["launch_plan"]["launch"]["worker_credential_transport"] == "none"
     assert durable["launch_plan"]["reservation"]["bundle_digest_semantics"] == "oci-reservation-v1"
     assert durable["launch_plan"]["launch"]["argv"] == list(target.argv)
     assert durable["launch_plan"]["launch"]["resource_limits"] == {
@@ -1212,6 +1213,7 @@ def test_launch_binds_rootfs_pins_and_persists_exact_config_digest(repo: Path) -
     # plans remain readable after the version 6 identity strengthening.
     legacy_v5_plan = json.loads(canonical_json(durable["launch_plan"]))
     legacy_v5_plan["version"] = 5
+    legacy_v5_plan["launch"].pop("worker_credential_transport")
     legacy_v5_row = dict(durable)
     legacy_v5_row["wrapper_unit"] = "acp-worker.service"
     legacy_v5_row["wrapper_cgroup_path"] = (
@@ -1226,10 +1228,34 @@ def test_launch_binds_rootfs_pins_and_persists_exact_config_digest(repo: Path) -
     ).hexdigest()
     assert journal_module._sandbox_launch_plan_binding_is_self_consistent(legacy_v5_row)
 
+    # Version 6 is the last plan version before the explicit credential
+    # transport binding. It remains readable without the new v7 field.
+    legacy_v6_plan = json.loads(canonical_json(durable["launch_plan"]))
+    legacy_v6_plan["version"] = 6
+    legacy_v6_plan["launch"].pop("worker_credential_transport")
+    legacy_v6_row = dict(durable)
+    legacy_v6_row["launch_plan_json"] = canonical_json(legacy_v6_plan)
+    legacy_v6_row["launch_plan_digest"] = hashlib.sha256(
+        legacy_v6_row["launch_plan_json"].encode("utf-8")
+    ).hexdigest()
+    assert journal_module._sandbox_launch_plan_binding_is_self_consistent(legacy_v6_row)
+
+    # A v7 canary label must agree with the extra descriptor preserved into
+    # runc; changing only the label cannot authorize a one-FD launch.
+    mismatched_canary_plan = json.loads(canonical_json(durable["launch_plan"]))
+    mismatched_canary_plan["launch"]["worker_credential_transport"] = "test_canary_fd4"
+    mismatched_canary_row = dict(durable)
+    mismatched_canary_row["launch_plan_json"] = canonical_json(mismatched_canary_plan)
+    mismatched_canary_row["launch_plan_digest"] = hashlib.sha256(
+        mismatched_canary_row["launch_plan_json"].encode("utf-8")
+    ).hexdigest()
+    assert not journal_module._sandbox_launch_plan_binding_is_self_consistent(mismatched_canary_row)
+
     # Version 4 remains auditable under its original ownership evidence, but
     # does not carry the split-monitor placement contract required for running.
     legacy_v4_plan = json.loads(canonical_json(durable["launch_plan"]))
     legacy_v4_plan["version"] = 4
+    legacy_v4_plan["launch"].pop("worker_credential_transport")
     legacy_v4_plan["launch"]["systemd_ownership"].pop("monitor_placement")
     old_wrapper_cgroup = f"{durable['attempt_slice_cgroup_path']}/{durable['wrapper_unit']}"
     legacy_v4_plan["launch"]["systemd_ownership"]["wrapper_control_group"] = old_wrapper_cgroup

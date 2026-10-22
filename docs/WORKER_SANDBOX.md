@@ -4086,10 +4086,10 @@ service to the existing provider-neutral CONNECT handler, but only through the
 explicit no-model sandbox composition and a separately named destination
 policy. The authenticated launch request contains the normalized policy and
 binds it into the one-shot request digest. Without that field, the existing
-request shape and default OCI config remain unchanged. At the time of this
-initial implementation, `run_worker()` did not expose provider options; the
-later UDS-only forwarding route is recorded above. Fake credentials and a
-provider-backed worker mode remain unimplemented.
+request shape and default OCI config remain unchanged. `run_worker()` has no
+general provider-credential delivery channel and no provider-backed worker
+mode. A separate opt-in, test-only fake-canary path exercises fd 4 with
+synthetic bytes; it is not a production credential API or provider integration.
 
 For an opted-in request, the launch driver derives a short deterministic
 directory name from the exact execution identity beneath the already-private
@@ -4153,10 +4153,58 @@ The probe sent only a disallowed hostname, which the policy rejected before
 DNS resolution; it made no allowed-host connection, provider request, TLS
 handshake, model call, or paid call. No provider credentials were configured
 or used (the harness used its local ACP control-plane credential). No
-TCP-to-UDS bridge, seccomp relaxation, fake-credential channel, or default-path
-enablement was added.
+TCP-to-UDS bridge, seccomp relaxation, general provider-credential channel, or
+default-path enablement was added. A separate test-only fake-canary FD4 path is
+qualified below.
 The general provider-enabled `run_worker()` composition, bridge/credential
 stages, and full task #3441/#2370 acceptance remain open.
+
+### Test-only fake-canary FD4 transport (2026-10-22; live guest pass)
+
+The private test seam stages synthetic bytes through systemd `LoadCredential`,
+then through a bounded read-only pipe inherited as worker fd 4. The existing
+launch gate remains fd 3. Only the opted-in test launch preserves two
+descriptors; the production default remains fd 3 only. Durable launch-plan v7
+binds `worker_credential_transport` as `test_canary_fd4` or `none`; legacy
+plans remain FD3-only. This does not add a general provider-credential API.
+
+On the disposable Debian 12 ARM64 guest (kernel
+`6.12.95+deb12-cloud-arm64`, systemd `252`, Python `3.11.2`, pinned runc
+`1.5.2`), the exact production launch-driver lifecycle test completed natural
+worker execution, pinned-runc deletion, and a `cleanup_reported` receipt. Its
+static C worker read the expected byte count from fd 4, required EOF, computed
+SHA-256, and persisted only the digest. The host compared it with the digest of
+the synthetic canary; no raw canary value appeared in the launch argv or
+environment, event metadata, SQLite database bytes, or systemd service log.
+The test reached natural worker completion, pinned-runc deletion, and a
+`cleanup_reported` receipt. This canary mode intentionally did not exercise the
+separate `cleanup_verified` transition or validated result importer. Postflight
+found no ACP service unit or `acp-live-launch-driver-*` fixture root.
+No real provider credential, DNS/network request, provider/model call, or paid
+call was used. The worker controls its own output and can expose any readable
+value; this test proves transport, not confidentiality from worker code or
+same-UID actors. It does not close the provider-backed `run_worker()` or broader
+#3441/#2370 acceptance gates.
+
+The six guest source/test files matched the local checkout byte-for-byte:
+
+| File | SHA-256 |
+| --- | --- |
+| `oci_worker.py` | `9731bedf92ffc0d6e0f368e23db722bc66d358f9cc025926154eb8c2f2f4f134` |
+| `sandbox_execution_journal.py` | `0000645f92f783fc45cd86b3d5da9d28e56da261f44e84f17391eafea474f70a` |
+| `sandbox_launch_driver_service.py` | `d68c16bbdf0ad86fbbdc6fb6df6bca07db399fa9c61214f159d5e3e867820865` |
+| `test_sandbox_execution_journal.py` | `48c3c4305b7f212c01e1fe117e80b1953351377e3dbc84fddb53ea0fd2df5306` |
+| `test_sandbox_launch_driver_service.py` | `bfc223cfa187d19e1b7e9767cdeef4f6e19e007b43f06910b7f4bb8f7aa07178` |
+| `test_sandbox_worker_lifecycle_integration.py` | `243fe2709284f509b0bec5bde2522c0569f6bf965f3ee4a3edf575d2b771dc84` |
+
+These are the hashes from the guest run. Afterwards, the host-only
+`test_sandbox_execution_journal.py` gained v6 legacy-plan and v7 canary/FD-count
+mismatch regression assertions; that file was not invoked by the guest test.
+Its current checkout SHA-256 is
+`b61edb7dcf5d921e4c7a271f25639b6a15139493d10af6617da1e20c5574cf8d`.
+
+The pinned guest runc binary SHA-256 was
+`d10ecae898361832a059be2089bab92d158aec54661b18ed7346ed79628b46b0`.
 
 ### Single-SDK proxy compatibility prototype (2026-10-22; not production evidence)
 

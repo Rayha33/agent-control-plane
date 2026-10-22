@@ -140,6 +140,7 @@ same-repository cross-attempt workspace isolation or wire ``run_worker``.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import multiprocessing
 import os
@@ -338,6 +339,203 @@ int main(void) {
     }
     return 17;
 #endif
+    return 0;
+}
+"""
+_WORKER_CANARY_FD4_PROBE_SOURCE = r"""
+#include <errno.h>
+#include <fcntl.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+typedef struct {
+    uint32_t state[8];
+    uint64_t bit_length;
+    unsigned char block[64];
+    size_t block_length;
+} sha256_context;
+
+static const uint32_t sha256_round_constants[64] = {
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1,
+    0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
+    0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786,
+    0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147,
+    0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
+    0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+    0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a,
+    0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
+    0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
+};
+
+static uint32_t rotate_right(uint32_t value, unsigned int count) {
+    return (value >> count) | (value << (32 - count));
+}
+
+static void sha256_transform(sha256_context *context, const unsigned char block[64]) {
+    uint32_t words[64];
+    for (size_t index = 0; index < 16; index++) {
+        size_t offset = index * 4;
+        words[index] = ((uint32_t) block[offset] << 24)
+            | ((uint32_t) block[offset + 1] << 16)
+            | ((uint32_t) block[offset + 2] << 8)
+            | (uint32_t) block[offset + 3];
+    }
+    for (size_t index = 16; index < 64; index++) {
+        uint32_t lower = rotate_right(words[index - 15], 7)
+            ^ rotate_right(words[index - 15], 18)
+            ^ (words[index - 15] >> 3);
+        uint32_t upper = rotate_right(words[index - 2], 17)
+            ^ rotate_right(words[index - 2], 19)
+            ^ (words[index - 2] >> 10);
+        words[index] = words[index - 16] + lower + words[index - 7] + upper;
+    }
+
+    uint32_t a = context->state[0];
+    uint32_t b = context->state[1];
+    uint32_t c = context->state[2];
+    uint32_t d = context->state[3];
+    uint32_t e = context->state[4];
+    uint32_t f = context->state[5];
+    uint32_t g = context->state[6];
+    uint32_t h = context->state[7];
+    for (size_t index = 0; index < 64; index++) {
+        uint32_t sum_one = rotate_right(e, 6) ^ rotate_right(e, 11) ^ rotate_right(e, 25);
+        uint32_t choose = (e & f) ^ ((~e) & g);
+        uint32_t temporary_one = h + sum_one + choose
+            + sha256_round_constants[index] + words[index];
+        uint32_t sum_zero = rotate_right(a, 2) ^ rotate_right(a, 13) ^ rotate_right(a, 22);
+        uint32_t majority = (a & b) ^ (a & c) ^ (b & c);
+        uint32_t temporary_two = sum_zero + majority;
+        h = g;
+        g = f;
+        f = e;
+        e = d + temporary_one;
+        d = c;
+        c = b;
+        b = a;
+        a = temporary_one + temporary_two;
+    }
+    context->state[0] += a;
+    context->state[1] += b;
+    context->state[2] += c;
+    context->state[3] += d;
+    context->state[4] += e;
+    context->state[5] += f;
+    context->state[6] += g;
+    context->state[7] += h;
+}
+
+static void sha256_init(sha256_context *context) {
+    static const uint32_t initial_state[8] = {
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+        0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19
+    };
+    memcpy(context->state, initial_state, sizeof(initial_state));
+    context->bit_length = 0;
+    context->block_length = 0;
+}
+
+static void sha256_update(sha256_context *context, const unsigned char *bytes, size_t length) {
+    for (size_t index = 0; index < length; index++) {
+        context->block[context->block_length++] = bytes[index];
+        if (context->block_length == sizeof(context->block)) {
+            sha256_transform(context, context->block);
+            context->bit_length += 512;
+            context->block_length = 0;
+        }
+    }
+}
+
+static void sha256_final(sha256_context *context, unsigned char digest[32]) {
+    size_t index = context->block_length;
+    context->block[index++] = 0x80;
+    if (index > 56) {
+        memset(context->block + index, 0, sizeof(context->block) - index);
+        sha256_transform(context, context->block);
+        memset(context->block, 0, 56);
+    } else {
+        memset(context->block + index, 0, 56 - index);
+    }
+    context->bit_length += (uint64_t) context->block_length * 8;
+    for (size_t offset = 0; offset < 8; offset++) {
+        context->block[63 - offset] = (unsigned char) (context->bit_length >> (offset * 8));
+    }
+    sha256_transform(context, context->block);
+    for (size_t word = 0; word < 8; word++) {
+        for (size_t byte = 0; byte < 4; byte++) {
+            digest[word * 4 + byte] = (unsigned char) (context->state[word] >> (24 - byte * 8));
+        }
+    }
+}
+
+static int write_marker(const char *path, const char *value) {
+    size_t length = 0;
+    while (value[length] != '\0') length++;
+    int descriptor = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+    if (descriptor < 0) return -1;
+    size_t offset = 0;
+    while (offset < length) {
+        ssize_t count = write(descriptor, value + offset, length - offset);
+        if (count < 0 && errno == EINTR) continue;
+        if (count <= 0) {
+            close(descriptor);
+            return -1;
+        }
+        offset += (size_t) count;
+    }
+    return close(descriptor);
+}
+
+int main(int argc, char **argv) {
+    if (write_marker("/workspace/launch-driver-started", "production-driver-started\n") != 0) {
+        return 9;
+    }
+    if (argc != 2) return 10;
+    char *end = NULL;
+    long expected = strtol(argv[1], &end, 10);
+    if (end == argv[1] || *end != '\0' || expected < 1 || expected > 4096) return 11;
+    unsigned char buffer[4096];
+    size_t total = 0;
+    sha256_context digest_context;
+    sha256_init(&digest_context);
+    while (total < (size_t) expected) {
+        ssize_t count = read(4, buffer + total, (size_t) expected - total);
+        if (count < 0 && errno == EINTR) continue;
+        if (count <= 0) return 12;
+        sha256_update(&digest_context, buffer + total, (size_t) count);
+        total += (size_t) count;
+    }
+    unsigned char extra;
+    ssize_t trailing;
+    do {
+        trailing = read(4, &extra, 1);
+    } while (trailing < 0 && errno == EINTR);
+    if (trailing != 0) return 13;
+
+    unsigned char digest[32];
+    char digest_hex[65];
+    static const char hexadecimal[] = "0123456789abcdef";
+    sha256_final(&digest_context, digest);
+    for (size_t index = 0; index < sizeof(digest); index++) {
+        digest_hex[index * 2] = hexadecimal[digest[index] >> 4];
+        digest_hex[index * 2 + 1] = hexadecimal[digest[index] & 0x0f];
+    }
+    digest_hex[64] = '\0';
+    char result_marker[96];
+    if (snprintf(result_marker, sizeof(result_marker), "worker-canary-fd4-sha256=%s\n", digest_hex) < 0) {
+        return 14;
+    }
+    if (write_marker("/workspace/worker-canary-fd4-result", result_marker) != 0) {
+        return 14;
+    }
+    if (write_marker("/workspace/launch-driver-marker", "production-driver-ran\n") != 0) {
+        return 15;
+    }
     return 0;
 }
 """
@@ -699,6 +897,7 @@ def _start_launch_driver_then_crash_controller(
     concurrent_run_root: Path | None = None,
     concurrent_source_worktree: Path | None = None,
     crash_phase: str = "",
+    test_worker_canary: bytes | None = None,
 ) -> None:
     """Exit the launch-driver service at the selected monitor-handoff crash point."""
 
@@ -750,6 +949,14 @@ def _start_launch_driver_then_crash_controller(
                 f"--property=StandardOutput=append:{service_log_path}",
                 f"--property=StandardError=append:{service_log_path}",
             ]
+            if test_worker_canary is not None:
+                canary_text = test_worker_canary.decode("ascii")
+                if canary_text in "\n".join(argv) or any(
+                    canary_text in value for value in environment.values()
+                ):
+                    raise AssertionError(
+                        "fake worker canary appeared in launch-driver argv or environment"
+                    )
             if monitor_acceptance_crash_marker is not None:
                 module_flag = argv.index("-m")
                 python = argv[module_flag - 1]
@@ -942,6 +1149,7 @@ raise SystemExit(sandbox_launch_driver_service.main(driver_args))
                         pids_max=pids_max,
                         timeout_seconds=timeout_seconds,
                         credential=credential,
+                        _test_worker_canary=test_worker_canary,
                         experimental_opt_in=True,
                         provider_egress_policy_name=(
                             "live-uds-only"
@@ -977,6 +1185,8 @@ raise SystemExit(sandbox_launch_driver_service.main(driver_args))
     except BaseException as error:
         exit_code = 1
         detail = str(error).replace(credential, "[redacted]")[:800]
+        if test_worker_canary is not None:
+            detail = detail.replace(test_worker_canary.decode("latin1"), "[redacted]")
         result_sender.send(("error", type(error).__name__, detail))
     finally:
         result_sender.close()
@@ -3107,6 +3317,31 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
     supervised_run_worker = os.environ.get("ACP_LIVE_SUPERVISED_RUN_WORKER") == "1"
     provider_proxy_uds = os.environ.get("ACP_LIVE_PROVIDER_PROXY_UDS") == "1"
     provider_proxy_cancel = os.environ.get("ACP_LIVE_PROVIDER_PROXY_CANCEL") == "1"
+    worker_canary_fd4 = os.environ.get("ACP_LIVE_WORKER_CANARY_FD4") == "1"
+    test_worker_canary = (
+        b"ACP-test-worker-canary-" + os.urandom(24).hex().encode("ascii")
+        if worker_canary_fd4
+        else None
+    )
+    expected_worker_canary_result = (
+        f"worker-canary-fd4-sha256={hashlib.sha256(test_worker_canary).hexdigest()}\n"
+        if test_worker_canary is not None
+        else None
+    )
+    if worker_canary_fd4 and (
+        os.environ.get("ACP_TEST_ALLOW_WORKER_CANARY") != "1"
+        or supervised_run_worker
+        or import_result_after_cleanup
+        or provider_proxy_uds
+        or provider_proxy_cancel
+        or cross_attempt_probes
+        or isolation_probes
+        or os.environ.get("ACP_LIVE_CRASH_AFTER_EXIT_BEFORE_CLEANUP_REPORT") == "1"
+    ):
+        pytest.fail(
+            "FD4 canary proof requires ACP_TEST_ALLOW_WORKER_CANARY=1 and the isolated "
+            "production no-model launch-driver mode"
+        )
     crash_after_exit_before_cleanup_report = (
         os.environ.get("ACP_LIVE_CRASH_AFTER_EXIT_BEFORE_CLEANUP_REPORT") == "1"
     )
@@ -3408,6 +3643,35 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
                         f"{compile_result.stderr[-4000:]}"
                     )
                 provider_client_path.chmod(0o755)
+            if worker_canary_fd4:
+                compiler = shutil.which("cc")
+                if compiler is None:
+                    pytest.fail("worker canary FD4 proof requires the guest C compiler")
+                canary_source_path = run_root / "worker-canary-fd4-probe.c"
+                canary_client_path = rootfs_source / "bin" / "worker-canary-fd4-probe"
+                canary_source_path.write_text(_WORKER_CANARY_FD4_PROBE_SOURCE, encoding="ascii")
+                compile_result = subprocess.run(
+                    [
+                        compiler,
+                        "-static",
+                        "-O2",
+                        "-Wall",
+                        "-Wextra",
+                        "-Werror",
+                        str(canary_source_path),
+                        "-o",
+                        str(canary_client_path),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+                if compile_result.returncode != 0:
+                    pytest.fail(
+                        "worker canary FD4 guest probe failed to compile: "
+                        f"{compile_result.stderr[-4000:]}"
+                    )
+                canary_client_path.chmod(0o755)
             if isolation_probes and "rm" not in busybox_applets:
                 pytest.fail("trusted BusyBox lacks rm for the temporary workspace symlink probe")
             repo_root = run_root / "repo"
@@ -3678,11 +3942,13 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
             if provider_proxy_uds
             else ()
         )
+        worker_canary_resources = ("worker-canary-fd4-result",) if worker_canary_fd4 else ()
         task = make_task(
             supervisor,
             live_marker_resource,
             live_started_resource,
             *provider_probe_resources,
+            *worker_canary_resources,
             *((coding_script_name, coding_test_output_name) if coding_task else ()),
             title=(
                 f"launch-driver producer test {concurrent_control[1]}"
@@ -3871,6 +4137,12 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
                 "/bin/provider-proxy-probe; "
                 "printf 'production-driver-ran\\n' > /workspace/launch-driver-marker",
             )
+        elif worker_canary_fd4:
+            assert test_worker_canary is not None
+            payload_command = (
+                "/bin/worker-canary-fd4-probe",
+                str(len(test_worker_canary)),
+            )
         elif coding_task:
             payload_command = (
                 "/bin/busybox",
@@ -3928,6 +4200,7 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
                 run_root if concurrent_control is not None else None,
                 source_worktree if concurrent_control is not None else None,
                 driver_crash_phase,
+                test_worker_canary,
             ),
         )
         producer_controller.start()
@@ -5248,6 +5521,11 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
         assert runner["credential"] not in service_log
         expected_cleanup_phase = "cleanup_verified" if supervised_run_worker else "cleanup_reported"
         assert durable is not None and durable["phase"] == expected_cleanup_phase, service_log
+        expected_worker_credential_transport = "test_canary_fd4" if worker_canary_fd4 else "none"
+        assert (
+            durable["launch_plan"]["launch"]["worker_credential_transport"]
+            == expected_worker_credential_transport
+        )
         if cross_attempt_probes:
             if concurrent_control is None or execution is None:
                 pytest.fail(
@@ -5378,6 +5656,12 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
             assert "probe-ok:coding-task" in (worker_workspace / "launch-driver-started").read_text(
                 encoding="ascii"
             )
+        if worker_canary_fd4:
+            worker_workspace = Path(durable["workspace_root_path"])
+            assert expected_worker_canary_result is not None
+            assert (worker_workspace / "worker-canary-fd4-result").read_text(
+                encoding="ascii"
+            ) == expected_worker_canary_result
         assert not _entry_is_present(source_worktree / "launch-driver-marker")
         with supervisor.connect() as connection:
             events = connection.execute(
@@ -5415,6 +5699,13 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
             )
         assert runner["credential"] not in event_bodies
         assert runner["credential"].encode("utf-8") not in Path(supervisor.db_path).read_bytes()
+        if test_worker_canary is not None:
+            canary_text = test_worker_canary.decode("ascii")
+            database_bytes = Path(supervisor.db_path).read_bytes()
+            assert canary_text not in event_bodies
+            assert test_worker_canary not in database_bytes
+            if service_log_path.exists():
+                assert test_worker_canary not in service_log_path.read_bytes()
         assert not (Path(execution["state_path"]) / "launch-driver-request.json").exists()
         assert durable["phase"] == expected_cleanup_phase
         assert durable["cleanup_receipt"]["version"] == 3
@@ -5490,6 +5781,8 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
             expected_imported_paths = ["launch-driver-marker", "launch-driver-started"]
             if coding_task:
                 expected_imported_paths.extend([coding_script_name, coding_test_output_name])
+            if worker_canary_fd4:
+                expected_imported_paths.append("worker-canary-fd4-result")
             assert imported_paths == expected_imported_paths
             assert (
                 git_text("show", f"{imported_submission['commit_sha']}:launch-driver-started")
@@ -5517,6 +5810,12 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
                     imported_coding_test_output
                     == (workspace / coding_test_output_name).read_bytes()
                 )
+            if worker_canary_fd4:
+                assert test_worker_canary is not None and expected_worker_canary_result is not None
+                assert git_bytes(
+                    "show",
+                    f"{imported_submission['commit_sha']}:worker-canary-fd4-result",
+                ) == expected_worker_canary_result.encode("ascii")
             assert (
                 subprocess.run(
                     ["git", "-C", str(source_worktree), "status", "--porcelain=v1"],
@@ -5587,6 +5886,7 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
             + (2 if provider_proxy_uds else 0)
             + (1 if provider_proxy_cancel else 0)
             + (2 if coding_task else 0)
+            + (1 if worker_canary_fd4 else 0)
         )
         assert len({row["lease_expires_at"] for row in lease_before.values()}) == 1
         expected_lease_expiry = next(iter(lease_before.values()))["lease_expires_at"]

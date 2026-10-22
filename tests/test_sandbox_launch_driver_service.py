@@ -21,8 +21,10 @@ from agent_control_plane.supervisor.sandbox_launch_driver_service import (
     SandboxLaunchDriverServiceError,
     _read_request,
     _read_service_runner_credential,
+    _read_service_test_worker_canary,
     _request_driver_failure_stop_and_cancel_monitor,
     _request_timeout_stop_and_cancel_monitor,
+    _test_worker_canary_pipe,
     _validate_request,
     _wait_for_driver_running_handoff,
     _wait_for_runc_with_attempt_heartbeat,
@@ -1150,6 +1152,32 @@ def test_runner_credential_is_read_only_from_private_systemd_credential_dir(
         _read_service_runner_credential()
 
 
+def test_test_worker_canary_is_read_only_bounded_and_explicitly_opted_in(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    credential_dir = tmp_path / "credentials"
+    credential_dir.mkdir(mode=0o700)
+    canary = b"fake-only-worker-canary"
+    credential_path = credential_dir / "acp-test-worker-canary"
+    credential_path.write_bytes(canary)
+    credential_path.chmod(0o400)
+    monkeypatch.setenv("CREDENTIALS_DIRECTORY", str(credential_dir))
+
+    assert _read_service_test_worker_canary() is None
+    monkeypatch.setenv("ACP_TEST_ALLOW_WORKER_CANARY", "1")
+    assert _read_service_test_worker_canary() == canary
+    read_fd = _test_worker_canary_pipe(canary)
+    try:
+        assert os.read(read_fd, 4096) == canary
+        assert os.read(read_fd, 1) == b""
+    finally:
+        os.close(read_fd)
+
+    credential_path.chmod(0o600)
+    with pytest.raises(SandboxLaunchDriverServiceError, match="file is unsafe"):
+        _read_service_test_worker_canary()
+
+
 def test_authenticated_producer_uses_systemd_credential_descriptor_only(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1304,11 +1332,31 @@ def test_authenticated_producer_uses_systemd_credential_descriptor_only(
             **_RESOURCES,
         )
 
+    test_worker_canary = b"fake-only-test-worker-canary"
+    with pytest.raises(SandboxLaunchDriverServiceError, match="test-only opt-in"):
+        start_sandbox_launch_driver(
+            supervisor,  # type: ignore[arg-type]
+            expected_identity=_IDENTITY,
+            command=["/bin/busybox", "true"],
+            _test_worker_canary=test_worker_canary,
+            **_RESOURCES,
+        )
+    monkeypatch.setenv("ACP_TEST_ALLOW_WORKER_CANARY", "1")
+    with pytest.raises(SandboxLaunchDriverServiceError, match="worker command"):
+        start_sandbox_launch_driver(
+            supervisor,  # type: ignore[arg-type]
+            expected_identity=_IDENTITY,
+            command=["/bin/busybox", test_worker_canary.decode("ascii")],
+            _test_worker_canary=test_worker_canary,
+            **_RESOURCES,
+        )
+
     receipt = start_sandbox_launch_driver(
         supervisor,  # type: ignore[arg-type]
         expected_identity=_IDENTITY,
         command=["/bin/busybox", "true"],
         credential=credential,
+        _test_worker_canary=test_worker_canary,
         **_RESOURCES,
     )
 
@@ -1320,19 +1368,30 @@ def test_authenticated_producer_uses_systemd_credential_descriptor_only(
     assert supervisor.authorized_credential == credential
     command_text = "\n".join(observed_command)
     assert credential not in command_text
+    assert test_worker_canary.decode("ascii") not in command_text
     assert credential not in observed_environment.values()
+    assert test_worker_canary.decode("ascii") not in "\n".join(observed_environment.values())
     assert any(
         part.startswith("--property=LoadCredential=acp-runner:/proc/") for part in observed_command
     )
-    credential_fd_arg = next(
-        part for part in observed_command if part.startswith("--property=LoadCredential=")
+    assert any(
+        part.startswith("--property=LoadCredential=acp-test-worker-canary:/proc/")
+        for part in observed_command
     )
-    credential_fd = int(credential_fd_arg.rsplit("/", maxsplit=1)[1])
-    with pytest.raises(OSError):
-        os.fstat(credential_fd)
+    assert "--setenv=ACP_TEST_ALLOW_WORKER_CANARY=1" in observed_command
+    credential_fds = [
+        int(part.rsplit("/", maxsplit=1)[1])
+        for part in observed_command
+        if part.startswith("--property=LoadCredential=")
+    ]
+    assert len(credential_fds) == 2
+    for descriptor in credential_fds:
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
     request_path = state_path / "launch-driver-request.json"
     request = json.loads(request_path.read_text(encoding="utf-8"))
     assert credential not in request_path.read_text(encoding="utf-8")
+    assert test_worker_canary.decode("ascii") not in request_path.read_text(encoding="utf-8")
     assert set(request) == {
         "schema",
         "attempt_id",

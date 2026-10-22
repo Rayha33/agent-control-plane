@@ -477,6 +477,8 @@ def _sandbox_launch_submission_digest(row: Any, target: _RuncLaunchTarget) -> st
         or _DIGEST.fullmatch(target.config_sha256) is None
         or not isinstance(target.argv, tuple)
         or any(not isinstance(value, str) or not value for value in target.argv)
+        or type(target.test_worker_canary_fd4) is not bool
+        or target.test_worker_canary_fd4 != (target.argv[9:11] == ("--preserve-fds", "2"))
         or any(
             type(value) is not int or value <= 0
             for value in (
@@ -753,7 +755,7 @@ def _sandbox_launch_plan_material(execution: Any, target: Any) -> dict[str, Any]
     argv = list(target.argv)
     argv_digest = hashlib.sha256(canonical_json(argv).encode("utf-8")).hexdigest()
     return {
-        "version": 6,
+        "version": 7,
         "reservation": {
             "bundle_digest_semantics": _BUNDLE_DIGEST_SEMANTICS,
             **{
@@ -789,6 +791,9 @@ def _sandbox_launch_plan_material(execution: Any, target: Any) -> dict[str, Any]
         },
         "launch": {
             "mode": target.launch_mode,
+            "worker_credential_transport": (
+                "test_canary_fd4" if target.test_worker_canary_fd4 else "none"
+            ),
             "runc_executable_path": target.runc_executable_path,
             "runc_executable_sha256": target.runc_executable_sha256,
             "config_sha256": target.config_sha256,
@@ -925,7 +930,7 @@ def _sandbox_launch_plan_binding_is_self_consistent(row: Any) -> bool:
         if hashlib.sha256(raw_plan.encode("utf-8")).hexdigest() != row["launch_plan_digest"]:
             return False
         plan_version = plan.get("version")
-        if type(plan_version) is not int or plan_version not in {1, 2, 3, 4, 5, 6}:
+        if type(plan_version) is not int or plan_version not in {1, 2, 3, 4, 5, 6, 7}:
             return False
         reservation = plan.get("reservation")
         expected_reservation = {
@@ -958,7 +963,7 @@ def _sandbox_launch_plan_binding_is_self_consistent(row: Any) -> bool:
                 "state_root_ino",
             )
         }
-        if plan_version in {2, 3, 4, 5, 6}:
+        if plan_version in {2, 3, 4, 5, 6, 7}:
             if row["bundle_digest_semantics"] != _BUNDLE_DIGEST_SEMANTICS:
                 return False
             if row["bundle_digest"] != _sandbox_reservation_bundle_digest(row):
@@ -997,6 +1002,13 @@ def _sandbox_launch_plan_binding_is_self_consistent(row: Any) -> bool:
         snapshot = rootfs.get("snapshot")
         if not isinstance(pid_file_path, str) or not isinstance(snapshot, dict):
             return False
+        worker_credential_transport = launch.get("worker_credential_transport")
+        if plan_version >= 7:
+            if worker_credential_transport not in {"none", "test_canary_fd4"}:
+                return False
+        elif "worker_credential_transport" in launch:
+            return False
+        expected_preserved_fds = "2" if worker_credential_transport == "test_canary_fd4" else "1"
         resource_limits = launch.get("resource_limits")
         if plan_version >= 4 and (
             not isinstance(resource_limits, dict)
@@ -1021,7 +1033,7 @@ def _sandbox_launch_plan_binding_is_self_consistent(row: Any) -> bool:
             and re.fullmatch(r"/proc/self/fd/[1-9][0-9]*", argv[6]) is not None
             and argv[7] == "--pid-file"
             and argv[8] == f"{argv[2]}/{Path(pid_file_path).name}"
-            and argv[9:12] == ["--preserve-fds", "1", "--keep"]
+            and argv[9:12] == ["--preserve-fds", expected_preserved_fds, "--keep"]
             and argv[12] == row["container_id"]
             and argv[2] != argv[6]
         )
@@ -3741,6 +3753,11 @@ class SandboxExecutionJournalMixin:
                             "launch_plan": launch_plan,
                             "launch_target": {
                                 "mode": launch_target.launch_mode,
+                                "worker_credential_transport": (
+                                    "test_canary_fd4"
+                                    if launch_target.test_worker_canary_fd4
+                                    else "none"
+                                ),
                                 "runc_executable_path": launch_target.runc_executable_path,
                                 "runc_executable_sha256": launch_target.runc_executable_sha256,
                                 "config_sha256": launch_target.config_sha256,
@@ -3868,7 +3885,7 @@ class SandboxExecutionJournalMixin:
                 "running transition requires a durable trusted launch-plan binding",
             )
         launch_plan = json.loads(row["launch_plan_json"])
-        if launch_plan.get("version") not in {5, 6}:
+        if launch_plan.get("version") not in {5, 6, 7}:
             raise SupervisorError(
                 "sandbox_execution_launch_plan_required",
                 "running transition requires a supported plan with a separate trusted monitor cgroup",
