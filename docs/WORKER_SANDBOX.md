@@ -4086,3 +4086,52 @@ TCP-to-UDS bridge, seccomp relaxation, fake-credential channel, or default-path
 enablement was added.
 The general provider-enabled `run_worker()` composition, bridge/credential
 stages, and full task #3441/#2370 acceptance remain open.
+
+### Single-SDK proxy compatibility prototype (2026-10-22; not production evidence)
+
+Independent architecture QC returned **NO-GO for implementing a generic
+TCP-to-UDS bridge next**, but **GO for a bounded, opt-in compatibility proof
+against one pinned SDK/runtime**. Official docs show materially different proxy
+configuration paths: [OpenAI Python 3.35.1](https://github.com/openai/openai-python/blob/v3.35.1/httpx2.md)
+uses an HTTPX2 client; [OpenAI Node](https://github.com/openai/openai-node/blob/main/docs/configuration.md)
+uses custom `fetch` with Undici's `ProxyAgent`; [Anthropic Python](https://github.com/anthropics/anthropic-sdk-python/blob/main/MIGRATION.md)
+uses a custom HTTPX2 client; and [Google Gen AI Python](https://github.com/googleapis/python-genai)
+documents `HTTPS_PROXY` environment configuration and HTTP client arguments for
+SOCKS5. A claim of generic `HTTP_PROXY` support would overstate what has been
+validated. OpenAI Python was selected as a protocol test vector, not as a
+provider preference or a commitment to support every SDK.
+
+On the disposable Debian 12 ARM64 guest (kernel
+`6.1.0-53-cloud-arm64`, root-owned runc `1.5.2`), a transient Python prototype
+ran inside `unshare --user --map-root-user --net` after bringing up `lo` and
+dropping all capabilities. It used OpenAI Python `3.35.1` with HTTPX2 `2.16.0`
+and the SDK's documented `DefaultHttpx2Client(proxy="http://127.0.0.1:<port>")`
+configuration. The client used a fake local API key and a local TLS mock; its
+`GET /v1/models` returned an empty model list. The prototype loopback TCP bridge
+forwarded the request to a local AF_UNIX mock broker, which accepted only
+`CONNECT api.test:443` and tunneled to the local TLS mock. The exact CONNECT
+request was observed at both the bridge and UDS endpoint. A resolver guard
+rejected every non-loopback hostname, and proxy-related environment variables
+were removed so the explicit client configuration was the only proxy path.
+
+The private network namespace exposed no non-loopback interface or external
+IPv4/IPv6 route. With `CapEff=0`, loopback TCP and the SDK request succeeded;
+direct TCP connect attempts to `203.0.113.1:443` and the guest host gateway
+`192.168.5.2:22` returned `ENETUNREACH` (errno 101). This is a compatibility and
+network-namespace feasibility result only. A separate no-capabilities probe
+showed UDP socket creation still succeeds and raw socket creation fails with
+`EPERM`; this prototype did not load the required TCP-only seccomp policy.
+
+The transient prototype is not committed or content-pinned. It did not use the
+production provider handler, exact `/run/acp` bind mount, cgroup peer
+authorization, registered OCI `run_worker()`, production cleanup/recovery, a
+real provider, or provider credentials. It therefore does not qualify a
+production bridge or provider egress. It supports only the narrow statement
+that this pinned OpenAI Python/HTTPX2 client configuration used HTTPS CONNECT
+through a loopback TCP proxy to a local mock. It does not validate default
+environment proxy discovery, plaintext HTTP forwarding, WebSockets, aiohttp, or
+all SDKs. Before any production bridge work, retain the concrete use case and
+SDK/backend/runtime pin, then independently prove the separate opt-in
+TCP-only seccomp, no external interface/route/capabilities, direct off-net
+denial, exact worker-cgroup-to-UDS authorization, and full cancellation,
+recovery, and cleanup gates. Keep the bridge disabled by default.
