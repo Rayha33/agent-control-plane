@@ -195,7 +195,7 @@ from .trust_bundles import (
 from .worker_trampoline import LIFECYCLE_FDS_PREFIX as LIFECYCLE_FDS_PREFIX
 from .worker_trampoline import MONITOR_MODE as MONITOR_MODE
 
-SCHEMA_VERSION = 32
+SCHEMA_VERSION = 33
 """Schema this binary understands. Raise it in the same commit that adds a MIGRATIONS entry."""
 
 
@@ -260,6 +260,19 @@ def _add_hierarchical_attempt_budget(connection: sqlite3.Connection) -> None:
             "TEXT NOT NULL DEFAULT ''"
         )
     connection.execute("CREATE INDEX IF NOT EXISTS idx_tasks_parent_task ON tasks(parent_task_id)")
+
+
+def _add_worker_admission_policy_identity(connection: sqlite3.Connection) -> None:
+    """Pin each retained worker reservation to the admission policy that allowed it."""
+
+    if "worker_admission_policy_json" not in _columns(connection, "attempts"):
+        connection.execute(
+            "ALTER TABLE attempts ADD COLUMN worker_admission_policy_json TEXT NOT NULL DEFAULT ''"
+        )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_attempts_worker_admission_active "
+        "ON attempts(pid, worker_admission_policy_json) WHERE pid IS NOT NULL"
+    )
 
 
 def _add_attempt_progress_timestamps(connection: sqlite3.Connection) -> None:
@@ -1978,6 +1991,7 @@ MIGRATIONS: tuple[Migration, ...] = (
     (30, _add_task_attempt_budget),
     (31, _add_attempt_budget_exhaustion_marker),
     (32, _add_hierarchical_attempt_budget),
+    (33, _add_worker_admission_policy_identity),
 )
 
 

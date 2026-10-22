@@ -584,6 +584,14 @@ filesystem: it does not attribute space to ACP or other providers, reserve
 capacity, enforce a quota, or authorize cleanup. If the probe fails, its byte
 values are <code>null</code> with status <code>unavailable</code>, never zero.
 
+The <code>worker_admission</code> section reports retained worker slots in the
+shared ACP database and a bounded Linux <code>MemAvailable</code> sample. An
+optional concurrency cap and available-memory floor prevent launches when
+configured thresholds are reached; they do not reserve RAM or guarantee against
+host OOM. See
+[supervised worker admission](docs/WORKER_ADMISSION.md) for supported signals,
+fail-closed conditions, and limits.
+
 JSON remains canonical; <code>--format text</code> renders that same snapshot.
 
 ### Wait for one task transition

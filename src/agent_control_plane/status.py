@@ -1014,6 +1014,44 @@ class StatusView:
                 )
             else:
                 lines.append(f"  filesystem capacity unavailable at {filesystem.get('path', '?')}")
+        worker_admission = snapshot.get("worker_admission")
+        if worker_admission is not None:
+            lines += ["", "WORKER ADMISSION"]
+            maximum_workers = worker_admission.get("configured_max_active_workers")
+            capacity = (
+                f"{worker_admission.get('retained_slots', 0)} retained / {maximum_workers} max"
+                if maximum_workers is not None
+                else f"{worker_admission.get('retained_slots', 0)} retained / unlimited"
+            )
+            lines.append(f"  supervised worker slots: {capacity}")
+            if worker_admission.get("policy_conflict"):
+                lines.append(
+                    "  admission settings: conflict with retained worker policy; launches blocked"
+                )
+            minimum_memory = worker_admission.get("configured_min_available_memory_bytes")
+            if minimum_memory is not None:
+                lines.append(
+                    f"  configured available-memory floor: {_format_bytes(minimum_memory)}"
+                )
+            memory = worker_admission.get("host_memory", {})
+            if memory.get("status") == "available" and type(memory.get("available_bytes")) is int:
+                lines.append(
+                    f"  host memory: {_format_bytes(memory['available_bytes'])} available "
+                    f"from {memory.get('source', 'unknown')} at {memory.get('observed_at', 'unknown')}"
+                )
+            elif memory.get("status") == "not_configured":
+                lines.append("  host memory: policy not configured")
+            else:
+                lines.append(
+                    f"  host memory: {memory.get('status', 'unavailable')} "
+                    f"({memory.get('error', 'no trusted sample')})"
+                )
+            last_refusal = worker_admission.get("last_refusal")
+            if last_refusal is not None:
+                lines.append(
+                    f"  latest launch refusal: {last_refusal['reason']} "
+                    f"at {last_refusal['observed_at']}"
+                )
         worktrees = snapshot.get("git_worktrees")
         if worktrees is not None:
             lines += ["", "GIT WORKTREES"]
