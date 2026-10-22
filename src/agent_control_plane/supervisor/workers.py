@@ -242,7 +242,7 @@ class WorkersMixin:
         self,
         attempt_id: str,
         claim_token: int,
-        command: Sequence[str],
+        command: list[str] | tuple[str, ...],
         credential: str | None = None,
         result_manifest_path: str | None = None,
         *,
@@ -261,14 +261,16 @@ class WorkersMixin:
                 "experimental sandbox opt-in must be a boolean",
             )
 
-        if isinstance(command, (str, bytes)) or not isinstance(command, Sequence):
+        if type(command) is list:
+            command = tuple(command)
+        elif type(command) is not tuple:
             raise SupervisorError(
                 "invalid_command",
-                "worker command must be a non-empty argument sequence of strings without NUL bytes",
+                "worker command must be a list or tuple of strings without NUL bytes",
             )
         # Freeze caller-owned mutable argv before it is logged, expanded into
-        # Popen, or hashed for the pre-exec receipt.
-        command = tuple(command)
+        # Popen, or hashed for the pre-exec receipt. Only built-in containers
+        # are accepted so overridden iteration cannot substitute another argv.
         if (
             not command
             or any(type(argument) is not str or "\x00" in argument for argument in command)
@@ -276,7 +278,7 @@ class WorkersMixin:
         ):
             raise SupervisorError(
                 "invalid_command",
-                "worker command must be a non-empty argument sequence of strings without NUL bytes",
+                "worker command must be a non-empty list or tuple of strings without NUL bytes",
             )
         command_digest = _worker_command_digest(command)
         sandbox_options = (

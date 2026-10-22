@@ -725,6 +725,16 @@ def test_worker_rejects_non_boolean_sandbox_opt_in_before_host_launch(
     assert not worker_log.exists()
 
 
+class _UnstableWorkerCommand(tuple):
+    def __iter__(self):
+        return iter(("/bin/echo", "substituted"))
+
+
+class _UnstableWorkerCommandList(list):
+    def __iter__(self):
+        return iter(("/bin/echo", "substituted"))
+
+
 @pytest.mark.parametrize(
     "command",
     [
@@ -736,6 +746,14 @@ def test_worker_rejects_non_boolean_sandbox_opt_in_before_host_launch(
         ("/bin/echo", "bad\x00argument"),
         ("/bin/echo", 7),
         7,
+        pytest.param(
+            _UnstableWorkerCommand(("/bin/echo", "true")),
+            id="tuple-subclass-with-overridden-iteration",
+        ),
+        pytest.param(
+            _UnstableWorkerCommandList(("/bin/echo", "true")),
+            id="list-subclass-with-overridden-iteration",
+        ),
     ],
 )
 def test_worker_rejects_malformed_argv_before_host_launch(
