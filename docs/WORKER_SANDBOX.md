@@ -12,8 +12,9 @@ Direct lookups of host-absolute peer-workspace and shared-Git sentinel paths
 were not visible; the peer-workspace sentinel was also tested through symlink
 and `..` paths. Cleanup was verified for both attempts. This is specific-path
 and live-mount evidence on one disposable Linux
-guest, not a general kernel-isolation proof. Provider authentication/egress,
-supervisor-daemon restart, logout/linger, and reboot recovery remain unproven.
+guest, not a general kernel-isolation proof. Provider authentication,
+production egress enforcement, supervisor-daemon restart, logout/linger, and
+reboot recovery remain unproven.
 The dated entries below describe evidence and status as of their stated dates;
 the current summary above supersedes older integration-status statements.
 
@@ -53,6 +54,41 @@ retaining that gate. The explicit route is still an experimental no-model
 path: it does not provide provider authentication/egress or enable the default
 OCI `run_worker()` path. This record does not authorize `externalSandbox` for
 ACP workers.
+
+**Test-only loopback TCP-to-UDS bridge probe (2026-10-22):** The opt-in
+`test_live_rootless_runc_mounts_attempt_proxy_socket_directory_read_only`
+passed 1/1 on the disposable Debian 12 ARM64 guest (`6.12.95+deb12-cloud-arm64`)
+with root-owned runc 1.5.2 (SHA-256
+`d10ecae898361832a059be2089bab92d158aec54661b18ed7346ed79628b46b0`) and
+libseccomp 2.6.1. GCC 12.2.0 targeting `aarch64-linux-gnu` built the pinned
+static bridge. The exact test module SHA-256 was
+`57d7b6b7488e5cb1f1a0e1f5846c5816c34c7ff98202596dfc2fee8a3b1950ae`.
+The test-only seccomp profile preserves the base denial of non-Unix
+`socketpair()` and permits `socket()` only for AF_UNIX/AF_INET stream sockets
+with protocol 0 or TCP; its live probes reject IPv4 UDP/raw/other protocols
+(including MPTCP 262), IPv6, packet, netlink, vsock, and a future family value
+300. It does not alter the production worker profile. The worker ran in a
+test-created network namespace with only loopback and no non-local routes;
+probes observed `ENETUNREACH` for `203.0.113.1:443` and `192.168.5.2:22`, and
+could not reach a host-loopback listener.
+
+The complete rootfs was content/inode-pinned. It contained a static TCP-to-UDS
+bridge pinned to SHA-256
+`c8956d969aaddf3e03b6afa6764ff815684cdd445cdab1fe7de8d96028759f33`; it bound
+only `127.0.0.1:18443` and connected only to the mounted
+`/run/acp/provider.sock`. The client was curl 7.88.1 pinned to
+`bf8f7fbd808dcdd8fc5e414ea69700643f66d6d95e709777548cd835cbcf98b4`. A local
+TLS mock returned a redirect to `blocked.example`; the second CONNECT was
+denied before resolver or dial, while only the two expected
+`api.example.com:443` mock resolver/dial operations were observed, with none for
+`blocked.example`. No external DNS, provider call, or real credential was
+used. Peer PIDFD, UID/GID, and exact-cgroup checks ran for both bridge
+channels, but collector-attestation issuance was mocked.
+The worker script explicitly stopped and waited for the bridge on this success
+path. This is one guest's test-only bridge/proxy proof, not production
+`run_worker()` integration, provider authentication, general egress policy,
+active-channel cancellation, or supervisor-crash recovery; the default OCI
+worker route remains disabled/fail-closed.
 
 **Live same-repository concurrent probe (2026-10-22):**
 `test_live_concurrent_attempts_use_distinct_scopes_and_clean_up` passed 1/1 on

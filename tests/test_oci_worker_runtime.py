@@ -27,6 +27,7 @@ import select
 import shutil
 import signal
 import socket
+import ssl
 import stat
 import struct
 import subprocess
@@ -60,6 +61,8 @@ _CONTAINER_PIDS_LIMIT = 16
 _CONTAINER_CPU_QUOTA_US = 50_000
 _CONTAINER_CPU_PERIOD_US = 100_000
 _CONTAINER_FILESIZE_LIMIT_BYTES = 64 * 1024 * 1024
+_TEST_TCP_BRIDGE_SHA256 = "c8956d969aaddf3e03b6afa6764ff815684cdd445cdab1fe7de8d96028759f33"
+_TEST_CURL_SHA256 = "bf8f7fbd808dcdd8fc5e414ea69700643f66d6d95e709777548cd835cbcf98b4"
 _LIVE_PROCESS_STATES = {b"R", b"S", b"D", b"T", b"t", b"W", b"K", b"P", b"I"}
 _ATTEMPT_ROOT_CHILDREN = {
     "bundle",
@@ -1006,6 +1009,179 @@ def _audit_worker_init_runtime_policy(
 
 def _runc_environment() -> dict[str, str]:
     return oci_worker._runc_client_environment()
+
+
+def _test_only_tcp_bridge_seccomp_profile() -> dict[str, Any]:
+    """Permit only Unix/IPv4 stream sockets for the opt-in bridge probe.
+
+    Linux seccomp cannot dereference ``connect(2)``'s sockaddr pointer. This
+    profile therefore constrains socket creation and relies on the private
+    network namespace having only an up loopback interface and no other route.
+    It is deliberately separate from the production worker profile.
+    """
+
+    profile = oci_worker._worker_seccomp_profile()
+    socketpair_rule_seen = False
+    retained: list[dict[str, Any]] = []
+    for rule in profile["syscalls"]:
+        if rule.get("names") == ["socket", "socketpair"]:
+            if socketpair_rule_seen:
+                raise AssertionError("base worker profile has duplicate socket-family rules")
+            socketpair_rule_seen = True
+            retained.append({**rule, "names": ["socketpair"]})
+        else:
+            retained.append(rule)
+    if not socketpair_rule_seen:
+        raise AssertionError("base worker profile no longer denies non-Unix socketpairs")
+
+    # Single-comparison bit rules cover the full syscall argument width; finite
+    # equality tables would leave future family numbers outside their range.
+    allowed_families = {socket.AF_UNIX, socket.AF_INET}
+    allowed_family_bits = socket.AF_UNIX | socket.AF_INET
+    if allowed_families != {1, 2}:
+        raise AssertionError("test bridge expects Linux AF_UNIX=1 and AF_INET=2")
+    for bit in range(64):
+        bit_mask = 1 << bit
+        if allowed_family_bits & bit_mask:
+            continue
+        retained.append(
+            {
+                "names": ["socket"],
+                "action": "SCMP_ACT_ERRNO",
+                "errnoRet": errno.EPERM,
+                "args": [
+                    {
+                        "index": 0,
+                        "value": bit_mask,
+                        "valueTwo": bit_mask,
+                        "op": "SCMP_CMP_MASKED_EQ",
+                    }
+                ],
+            }
+        )
+    for family in range(allowed_family_bits + 1):
+        if family in allowed_families:
+            continue
+        retained.append(
+            {
+                "names": ["socket"],
+                "action": "SCMP_ACT_ERRNO",
+                "errnoRet": errno.EPERM,
+                "args": [{"index": 0, "value": family, "op": "SCMP_CMP_EQ"}],
+            }
+        )
+
+    socket_type_mask = 0xF  # Linux SOCK_TYPE_MASK; flags such as CLOEXEC are outside it.
+    for socket_type in range(socket_type_mask + 1):
+        if socket_type == socket.SOCK_STREAM:
+            continue
+        retained.append(
+            {
+                "names": ["socket", "socketpair"],
+                "action": "SCMP_ACT_ERRNO",
+                "errnoRet": errno.EPERM,
+                "args": [
+                    {
+                        "index": 1,
+                        "value": socket_type_mask,
+                        "valueTwo": socket_type,
+                        "op": "SCMP_CMP_MASKED_EQ",
+                    }
+                ],
+            }
+        )
+
+    # A TCP protocol consists of bits 1 and 2. Deny every other bit, then deny
+    # the partial values 2 and 4 so only protocol 0 or IPPROTO_TCP remains.
+    allowed_protocol_bits = socket.IPPROTO_TCP
+    if allowed_protocol_bits != 0b110:
+        raise AssertionError("test bridge expects Linux IPPROTO_TCP to be 6")
+    for bit in range(64):
+        bit_mask = 1 << bit
+        if allowed_protocol_bits & bit_mask:
+            continue
+        retained.append(
+            {
+                "names": ["socket"],
+                "action": "SCMP_ACT_ERRNO",
+                "errnoRet": errno.EPERM,
+                "args": [
+                    {
+                        "index": 2,
+                        "value": bit_mask,
+                        "valueTwo": bit_mask,
+                        "op": "SCMP_CMP_MASKED_EQ",
+                    }
+                ],
+            }
+        )
+    for protocol in (2, 4):
+        retained.append(
+            {
+                "names": ["socket"],
+                "action": "SCMP_ACT_ERRNO",
+                "errnoRet": errno.EPERM,
+                "args": [{"index": 2, "value": protocol, "op": "SCMP_CMP_EQ"}],
+            }
+        )
+    retained.append(
+        {
+            "names": ["socketpair"],
+            "action": "SCMP_ACT_ERRNO",
+            "errnoRet": errno.EPERM,
+            "args": [{"index": 2, "value": 0, "op": "SCMP_CMP_NE"}],
+        }
+    )
+    return {**profile, "syscalls": retained}
+
+
+def _copy_elf_runtime_closure(binary: Path, rootfs: Path, destination: str) -> str:
+    """Stage one pinned host executable and only its audited ELF closure."""
+
+    trusted_binary = _require_root_owned_file(binary, "test runtime executable")
+    ldd_value = shutil.which("ldd")
+    if ldd_value is None:
+        pytest.fail("ldd is required to stage the pinned test runtime executable")
+    ldd = _require_root_owned_file(Path(ldd_value), "ldd")
+    completed = subprocess.run(
+        [str(ldd), str(trusted_binary)],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=5,
+        env={"LC_ALL": "C", "LANG": "C", "PATH": "/usr/sbin:/usr/bin:/sbin:/bin"},
+    )
+    if completed.returncode != 0 or "not found" in completed.stdout + completed.stderr:
+        pytest.fail("trusted test runtime ELF dependency closure could not be resolved")
+    dependencies: set[Path] = set()
+    for line in completed.stdout.splitlines():
+        for token in line.replace("=>", " ").split():
+            candidate = Path(token)
+            if token.startswith("/") and candidate.is_file():
+                # Preserve the soname path from ldd (for example libcurl.so.4)
+                # even when it is a symlink to a versioned file on the host.
+                dependencies.add(candidate)
+
+    def copy_exact(source: Path, relative: Path, label: str) -> None:
+        trusted = _require_root_owned_file(source, label)
+        target = rootfs / relative
+        target.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
+        if os.path.lexists(target):
+            target_info = target.lstat()
+            if (
+                not stat.S_ISREG(target_info.st_mode)
+                or hashlib.sha256(target.read_bytes()).digest()
+                != hashlib.sha256(trusted.read_bytes()).digest()
+            ):
+                pytest.fail(f"staged runtime closure path conflicts with {label}")
+            return
+        shutil.copyfile(trusted, target)
+        target.chmod(stat.S_IMODE(trusted.stat().st_mode) & 0o755)
+
+    for dependency in sorted(dependencies):
+        copy_exact(dependency, Path(dependency.as_posix().lstrip("/")), "runtime dependency")
+    copy_exact(trusted_binary, Path(destination.lstrip("/")), "test runtime executable")
+    return hashlib.sha256(trusted_binary.read_bytes()).hexdigest()
 
 
 def _safe_run_pinned_runc(
@@ -4197,13 +4373,39 @@ def test_live_rootless_runc_mounts_attempt_proxy_socket_directory_read_only(
         if compiler_value is None:
             pytest.fail("a trusted C compiler is required for the Unix-socket probe client")
         compiler = _require_root_owned_file(Path(compiler_value), "C compiler")
+        compiler_version = subprocess.run(
+            [str(compiler), "-dumpfullversion"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            env=_runc_environment(),
+        )
+        compiler_target = subprocess.run(
+            [str(compiler), "-dumpmachine"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            env=_runc_environment(),
+        )
+        if (
+            compiler_version.stdout.strip() != "12.2.0"
+            or compiler_target.stdout.strip() != "aarch64-linux-gnu"
+        ):
+            pytest.fail(
+                "the TCP bridge prototype requires the pinned Debian GCC 12.2.0 aarch64 toolchain"
+            )
         probe_source = bundle_root / "provider_socket_probe.c"
         probe_source.write_text(
             r"""#define _GNU_SOURCE
+#include <arpa/inet.h>
 #include <dirent.h>
 #include <errno.h>
+#include <netinet/in.h>
 #include <stddef.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -4263,15 +4465,54 @@ static int require_no_inherited_socket_fds(void) {
     return result;
 }
 
-static int require_seccomp_network_socket_denial(int family, int type) {
+static int require_seccomp_network_socket_denial(int family, int type, int protocol) {
     int fd;
     errno = 0;
-    fd = socket(family, type, 0);
+    fd = socket(family, type, protocol);
     if (fd >= 0) {
         close(fd);
         return 1;
     }
     return errno == EPERM ? 0 : 2;
+}
+
+static int require_offnet_tcp_is_denied(const char *ip, unsigned short port) {
+    struct sockaddr_in address = {0};
+    int fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    int connect_error;
+
+    if (fd < 0) return 1;
+    address.sin_family = AF_INET;
+    address.sin_port = htons(port);
+    if (inet_pton(AF_INET, ip, &address.sin_addr) != 1) {
+        close(fd);
+        return 2;
+    }
+    if (connect(fd, (struct sockaddr *)&address, sizeof(address)) == 0) {
+        close(fd);
+        return 3;
+    }
+    connect_error = errno;
+    if (close(fd) != 0) return 4;
+    return connect_error == ENETUNREACH ? 0 : 5;
+}
+
+static int require_host_loopback_isolated(unsigned short port) {
+    struct sockaddr_in address = {0};
+    int fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    int connect_error;
+
+    if (fd < 0) return 1;
+    address.sin_family = AF_INET;
+    address.sin_port = htons(port);
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (connect(fd, (struct sockaddr *)&address, sizeof(address)) == 0) {
+        close(fd);
+        return 2;
+    }
+    connect_error = errno;
+    if (close(fd) != 0) return 3;
+    return connect_error == ECONNREFUSED ? 0 : 4;
 }
 
 static int require_unmounted_host_unix_socket_is_invisible(const char *path) {
@@ -4308,21 +4549,36 @@ int main(int argc, char **argv) {
     static const struct {
         int family;
         int type;
+        int protocol;
         const char *marker;
     } blocked_network_sockets[] = {
-        {AF_INET, SOCK_STREAM, "DIRECT_IPV4_TCP_DENIED\n"},
-        {AF_INET, SOCK_DGRAM, "DIRECT_DNS_IPV4_UDP_DENIED\n"},
-        {AF_INET6, SOCK_STREAM, "DIRECT_IPV6_TCP_DENIED\n"},
-        {AF_INET6, SOCK_DGRAM, "DIRECT_DNS_IPV6_UDP_DENIED\n"},
+        {AF_INET, SOCK_DGRAM, IPPROTO_UDP, "DIRECT_DNS_IPV4_UDP_DENIED\n"},
+        {AF_INET, SOCK_RAW, IPPROTO_ICMP, "DIRECT_IPV4_RAW_DENIED\n"},
+        {AF_INET, SOCK_STREAM, IPPROTO_UDP, "DIRECT_IPV4_UDP_PROTOCOL_DENIED\n"},
+        {AF_INET, SOCK_STREAM, 2, "DIRECT_IPV4_IGMP_PROTOCOL_DENIED\n"},
+        {AF_INET, SOCK_STREAM, 4, "DIRECT_IPV4_IPIP_PROTOCOL_DENIED\n"},
+        {AF_INET, SOCK_STREAM, 262, "DIRECT_IPV4_MPTCP_PROTOCOL_DENIED\n"},
+        {300, SOCK_STREAM, IPPROTO_TCP, "DIRECT_FUTURE_SOCKET_FAMILY_DENIED\n"},
+        {AF_INET6, SOCK_STREAM, IPPROTO_TCP, "DIRECT_IPV6_TCP_DENIED\n"},
+        {17, SOCK_DGRAM, IPPROTO_UDP, "DIRECT_PACKET_DGRAM_DENIED\n"},
+        {17, SOCK_RAW, IPPROTO_RAW, "DIRECT_PACKET_RAW_DENIED\n"},
+        {16, SOCK_RAW, 0, "DIRECT_NETLINK_RAW_DENIED\n"},
+        {40, SOCK_STREAM, 0, "DIRECT_VSOCK_TCP_DENIED\n"},
     };
     struct sockaddr_un address = {0};
     char response[512] = {0};
+    char *end = NULL;
     size_t probe_index;
     size_t path_length;
     size_t received = 0;
+    unsigned long host_loopback_port;
     int fd;
 
-    if (argc != 3) return 2;
+    if (argc != 4) return 2;
+    errno = 0;
+    host_loopback_port = strtoul(argv[3], &end, 10);
+    if (errno != 0 || end == argv[3] || *end != '\0' ||
+        host_loopback_port == 0 || host_loopback_port > 65535) return 2;
     if (require_no_inherited_socket_fds() != 0) {
         static const char failure[] = "INHERITED_SOCKET_FD_PRESENT_OR_SCAN_FAILED\n";
         (void)write_all(STDERR_FILENO, failure, sizeof(failure) - 1);
@@ -4337,7 +4593,8 @@ int main(int argc, char **argv) {
          probe_index++) {
         if (require_seccomp_network_socket_denial(
                 blocked_network_sockets[probe_index].family,
-                blocked_network_sockets[probe_index].type) != 0) {
+                blocked_network_sockets[probe_index].type,
+                blocked_network_sockets[probe_index].protocol) != 0) {
             static const char failure[] = "NON_UNIX_SOCKET_NOT_DENIED\n";
             (void)write_all(STDERR_FILENO, failure, sizeof(failure) - 1);
             return 12 + (int)probe_index;
@@ -4348,6 +4605,25 @@ int main(int argc, char **argv) {
                 strlen(blocked_network_sockets[probe_index].marker)) != 0) {
             return 16;
         }
+    }
+    if (require_offnet_tcp_is_denied("203.0.113.1", 443) != 0 ||
+        require_offnet_tcp_is_denied("192.168.5.2", 22) != 0) {
+        static const char failure[] = "OFFNET_TCP_ROUTE_NOT_DENIED\n";
+        (void)write_all(STDERR_FILENO, failure, sizeof(failure) - 1);
+        return 22;
+    }
+    {
+        static const char marker[] = "OFFNET_IPV4_TCP_ROUTE_DENIED\n";
+        if (write_all(STDOUT_FILENO, marker, sizeof(marker) - 1) != 0) return 23;
+    }
+    if (require_host_loopback_isolated((unsigned short)host_loopback_port) != 0) {
+        static const char failure[] = "HOST_LOOPBACK_SERVICE_REACHED_OR_UNEXPECTED_ERROR\n";
+        (void)write_all(STDERR_FILENO, failure, sizeof(failure) - 1);
+        return 24;
+    }
+    {
+        static const char marker[] = "HOST_LOOPBACK_SERVICE_NOT_REACHABLE\n";
+        if (write_all(STDOUT_FILENO, marker, sizeof(marker) - 1) != 0) return 25;
     }
     if (require_unmounted_host_unix_socket_is_invisible(argv[2]) != 0) {
         static const char failure[] =
@@ -4443,6 +4719,223 @@ int main(int argc, char **argv) {
         ):
             pytest.fail("Unix-socket probe binary is not a test-owned non-set-id executable")
 
+        bridge_source = bundle_root / "provider_tcp_uds_bridge.c"
+        bridge_source.write_text(
+            r"""#define _GNU_SOURCE
+#include <arpa/inet.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <stddef.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <unistd.h>
+
+static int send_all(int fd, const unsigned char *buffer, size_t length) {
+    size_t offset = 0;
+    while (offset < length) {
+        ssize_t sent = send(fd, buffer + offset, length - offset, MSG_NOSIGNAL);
+        if (sent < 0 && errno == EINTR) continue;
+        if (sent <= 0) return 1;
+        offset += (size_t)sent;
+    }
+    return 0;
+}
+
+static int relay_bidirectionally(int tcp_fd, int uds_fd) {
+    unsigned char buffer[16384];
+    int tcp_eof = 0;
+    int uds_eof = 0;
+
+    while (!tcp_eof || !uds_eof) {
+        struct pollfd watched[2] = {
+            {tcp_fd, (short)(tcp_eof ? 0 : POLLIN), 0},
+            {uds_fd, (short)(uds_eof ? 0 : POLLIN), 0},
+        };
+        int ready = poll(watched, 2, 20000);
+        int index;
+
+        if (ready < 0 && errno == EINTR) continue;
+        if (ready <= 0) return 1;
+        for (index = 0; index < 2; index++) {
+            int source;
+            int destination;
+            int *source_eof;
+            ssize_t received;
+
+            if (watched[index].revents & (POLLERR | POLLNVAL)) return 2;
+            if (!(watched[index].revents & (POLLIN | POLLHUP))) continue;
+            source = index == 0 ? tcp_fd : uds_fd;
+            destination = index == 0 ? uds_fd : tcp_fd;
+            source_eof = index == 0 ? &tcp_eof : &uds_eof;
+            received = recv(source, buffer, sizeof(buffer), 0);
+            if (received < 0 && errno == EINTR) continue;
+            if (received < 0) return 3;
+            if (received == 0) {
+                *source_eof = 1;
+                if (shutdown(destination, SHUT_WR) != 0 && errno != ENOTCONN) return 4;
+                continue;
+            }
+            if (send_all(destination, buffer, (size_t)received) != 0) return 5;
+        }
+    }
+    return 0;
+}
+
+static int connect_attempt_socket(const char *path) {
+    struct sockaddr_un address = {0};
+    size_t path_length = strlen(path);
+    int fd;
+
+    if (path_length == 0 || path_length >= sizeof(address.sun_path)) return -1;
+    address.sun_family = AF_UNIX;
+    memcpy(address.sun_path, path, path_length + 1);
+    fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    if (connect(fd, (struct sockaddr *)&address,
+                offsetof(struct sockaddr_un, sun_path) + path_length + 1) != 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+int main(int argc, char **argv) {
+    struct sockaddr_in address = {0};
+    char *end = NULL;
+    unsigned long port;
+    int listener;
+    int ready_fd;
+
+    if (argc != 4) return 2;
+    errno = 0;
+    port = strtoul(argv[2], &end, 10);
+    if (errno != 0 || end == argv[2] || *end != '\0' || port == 0 || port > 65535) return 2;
+
+    listener = socket(AF_INET, SOCK_STREAM, 0);
+    if (listener < 0) return 3;
+    address.sin_family = AF_INET;
+    address.sin_port = htons((unsigned short)port);
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (bind(listener, (struct sockaddr *)&address, sizeof(address)) != 0 ||
+        listen(listener, 4) != 0) {
+        close(listener);
+        return 4;
+    }
+
+    ready_fd = open(argv[3], O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    if (ready_fd < 0) {
+        close(listener);
+        return 5;
+    }
+    if (write(ready_fd, "ready\n", 6) != 6 || close(ready_fd) != 0) {
+        close(listener);
+        return 6;
+    }
+
+    for (;;) {
+        int tcp_fd = accept(listener, NULL, NULL);
+        int uds_fd;
+        int relay_result;
+
+        if (tcp_fd < 0 && errno == EINTR) continue;
+        if (tcp_fd < 0) return 7;
+        uds_fd = connect_attempt_socket(argv[1]);
+        if (uds_fd < 0) {
+            close(tcp_fd);
+            return 8;
+        }
+        relay_result = relay_bidirectionally(tcp_fd, uds_fd);
+        close(uds_fd);
+        close(tcp_fd);
+        if (relay_result != 0) return 9;
+    }
+}
+""",
+            encoding="ascii",
+        )
+        bridge_binary = rootfs / "bin" / "acp-tcp-uds-bridge"
+        bridge_result = subprocess.run(
+            [
+                str(compiler),
+                "-static",
+                "-O2",
+                "-std=c11",
+                "-Wall",
+                "-Wextra",
+                "-Werror",
+                "-fno-ident",
+                "-Wl,--build-id=none",
+                "-o",
+                str(bridge_binary),
+                str(bridge_source),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=20,
+            env=_runc_environment(),
+        )
+        if bridge_result.returncode != 0:
+            pytest.fail(
+                "pinned compiler could not build the static TCP-to-UDS bridge: "
+                f"{bridge_result.stderr[-2048:]}"
+            )
+        bridge_binary.chmod(0o555)
+        bridge_info = bridge_binary.lstat()
+        if (
+            not stat.S_ISREG(bridge_info.st_mode)
+            or bridge_info.st_uid != os.geteuid()
+            or stat.S_IMODE(bridge_info.st_mode) != 0o555
+            or bridge_info.st_mode & (stat.S_ISUID | stat.S_ISGID)
+        ):
+            pytest.fail("TCP-to-UDS bridge is not a test-owned read-only non-set-id executable")
+        bridge_sha256 = hashlib.sha256(bridge_binary.read_bytes()).hexdigest()
+        if bridge_sha256 != _TEST_TCP_BRIDGE_SHA256:
+            pytest.fail(
+                "static TCP-to-UDS bridge digest is not the explicit approved pin: "
+                f"observed={bridge_sha256}, expected={_TEST_TCP_BRIDGE_SHA256}"
+            )
+
+        curl_value = os.environ.get("ACP_OCI_TEST_CURL") or shutil.which("curl")
+        if curl_value is None:
+            pytest.fail("a trusted curl client is required for the local TLS bridge proof")
+        curl = _require_root_owned_file(Path(curl_value), "curl client")
+        curl_version = subprocess.run(
+            [str(curl), "--version"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            env=_runc_environment(),
+        )
+        curl_sha256 = _copy_elf_runtime_closure(curl, rootfs, "/usr/bin/curl")
+        expected_curl = (
+            "curl 7.88.1",
+            _TEST_CURL_SHA256,
+        )
+        if (
+            curl_version.returncode != 0
+            or not curl_version.stdout.startswith(expected_curl[0] + " ")
+            or curl_sha256 != expected_curl[1]
+        ):
+            pytest.fail(
+                "local TLS client does not match the pinned curl 7.88.1 content: "
+                f"version={curl_version.stdout.splitlines()[:1]!r}, sha256={curl_sha256}"
+            )
+
+        rootfs_manifest = oci_worker.rootfs_tree_manifest(rootfs)
+        rootfs_pin = oci_worker._pin_trusted_rootfs(
+            rootfs,
+            rootfs_manifest["rootfs_sha256"],
+            repo_root=repo_root,
+            expected_closure_sha256=rootfs_manifest["closure_sha256"],
+        )
+        if oci_worker._verify_trusted_rootfs(rootfs_pin) != rootfs.resolve(strict=True):
+            pytest.fail("staged loopback bridge rootfs failed its content and inode pin")
+
         if os.path.lexists(socket_dir):
             pytest.fail("unique provider socket directory collided")
         socket_dir.mkdir(mode=0o700)
@@ -4489,9 +4982,44 @@ int main(int argc, char **argv) {
 
         target_listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         target_listener.bind(("127.0.0.1", 0))
-        target_listener.listen(1)
-        target_listener.settimeout(5)
+        target_listener.listen(2)
+        target_listener.settimeout(12)
         target_address = target_listener.getsockname()
+        openssl_value = shutil.which("openssl")
+        if openssl_value is None:
+            pytest.fail("OpenSSL is required for the local TLS CONNECT mock")
+        openssl = _require_root_owned_file(Path(openssl_value), "OpenSSL")
+        certificate_path = bundle_root / "local-tls-server.crt"
+        key_path = bundle_root / "local-tls-server.key"
+        certificate_result = subprocess.run(
+            [
+                str(openssl),
+                "req",
+                "-x509",
+                "-newkey",
+                "rsa:2048",
+                "-nodes",
+                "-keyout",
+                str(key_path),
+                "-out",
+                str(certificate_path),
+                "-days",
+                "1",
+                "-subj",
+                "/CN=api.example.com",
+                "-addext",
+                "subjectAltName=DNS:api.example.com",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=12,
+            env=_runc_environment(),
+        )
+        if certificate_result.returncode != 0:
+            pytest.fail("OpenSSL could not create the ephemeral local TLS mock certificate")
+        server_tls_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        server_tls_context.load_cert_chain(certificate_path, key_path)
         resolver_calls: list[tuple[str, int]] = []
         dial_calls: list[tuple[int, tuple[object, ...]]] = []
 
@@ -4520,6 +5048,7 @@ int main(int argc, char **argv) {
 set -eu
 provider_socket_path=$1
 unmounted_host_socket_path=$2
+host_loopback_port=$3
 mount_line=$(/bin/busybox grep ' /run/acp ' /proc/self/mountinfo)
 set -- $mount_line
 mount_options=$6
@@ -4536,7 +5065,40 @@ done
 if /bin/busybox touch /run/acp/worker-created >/dev/null 2>&1; then exit 63; fi
 if /bin/busybox rm -f /run/acp/provider.sock >/dev/null 2>&1; then exit 64; fi
 printf 'MOUNT_OPTIONS_OK\n'
-/bin/provider-socket-probe "$provider_socket_path" "$unmounted_host_socket_path" || exit 65
+/bin/provider-socket-probe "$provider_socket_path" "$unmounted_host_socket_path" "$host_loopback_port" || exit 65
+/bin/acp-tcp-uds-bridge "$provider_socket_path" 18443 /tmp/acp-tcp-uds-bridge.ready &
+bridge_pid=$!
+cleanup_bridge() {
+  kill "$bridge_pid" 2>/dev/null || true
+  wait "$bridge_pid" 2>/dev/null || true
+}
+trap cleanup_bridge EXIT HUP INT TERM
+ready_attempt=0
+while [ ! -f /tmp/acp-tcp-uds-bridge.ready ]; do
+  ready_attempt=$((ready_attempt + 1))
+  if [ "$ready_attempt" -gt 100000 ]; then exit 66; fi
+done
+printf 'TCP_BRIDGE_READY\n'
+set +e
+/usr/bin/curl --verbose --silent --show-error --insecure --location --max-time 12 \
+  --proxy http://127.0.0.1:18443 https://api.example.com/ \
+  --output /tmp/acp-curl-body 2>/tmp/acp-curl-errors
+curl_rc=$?
+set -e
+if [ "$curl_rc" -ne 56 ]; then
+  /bin/busybox cat /tmp/acp-curl-errors >&2
+  exit 67
+fi
+if ! /bin/busybox grep -q '403' /tmp/acp-curl-errors; then
+  /bin/busybox cat /tmp/acp-curl-errors >&2
+  exit 68
+fi
+printf 'TLS_REDIRECT_SECOND_CONNECT_DENIED\n'
+kill "$bridge_pid"
+if wait "$bridge_pid"; then exit 69; fi
+bridge_pid=
+trap - EXIT HUP INT TERM
+printf 'TCP_BRIDGE_STOPPED_AND_REAPED\n'
 """
         config = {
             "ociVersion": "1.2.0",
@@ -4552,6 +5114,7 @@ printf 'MOUNT_OPTIONS_OK\n'
                     "provider-proxy-probe",
                     "/run/acp/provider.sock",
                     str(unmounted_socket_path),
+                    str(target_address[1]),
                 ],
                 "env": ["PATH=/bin", "HOME=/", "LANG=C", "LC_ALL=C", "TMPDIR=/tmp"],
                 "cwd": "/",
@@ -4591,11 +5154,13 @@ printf 'MOUNT_OPTIONS_OK\n'
                 },
             ],
             "linux": {
-                "uidMappings": [{"containerID": 0, "hostID": os.geteuid(), "size": 1}],
-                "gidMappings": [{"containerID": 0, "hostID": os.getegid(), "size": 1}],
+                # runc itself runs in the outer test-created user namespace;
+                # map worker root to that namespace's root, not the host UID.
+                "uidMappings": [{"containerID": 0, "hostID": 0, "size": 1}],
+                "gidMappings": [{"containerID": 0, "hostID": 0, "size": 1}],
                 "namespaces": [
                     {"type": namespace}
-                    for namespace in ("user", "pid", "mount", "ipc", "uts", "cgroup", "network")
+                    for namespace in ("user", "pid", "mount", "ipc", "uts", "cgroup")
                 ],
                 "resources": {
                     "memory": {"limit": _CONTAINER_MEMORY_BYTES},
@@ -4603,7 +5168,7 @@ printf 'MOUNT_OPTIONS_OK\n'
                     "pids": {"limit": _CONTAINER_PIDS_LIMIT},
                     "devices": [{"allow": False, "access": "rwm"}],
                 },
-                "seccomp": oci_worker._worker_seccomp_profile(),
+                "seccomp": _test_only_tcp_bridge_seccomp_profile(),
                 "cgroupsPath": oci_worker._oci_worker_cgroups_path(container_id),
                 "rootfsPropagation": "rprivate",
                 "maskedPaths": [
@@ -4616,6 +5181,10 @@ printf 'MOUNT_OPTIONS_OK\n'
             },
         }
         config_path = bundle_root / "config.json"
+        try:
+            oci_worker._verify_trusted_rootfs(rootfs_pin)
+        except oci_worker.SupervisorError as error:
+            pytest.fail(f"loopback bridge rootfs changed before runc launch: {error}")
         config_path.write_bytes(oci_worker._canonical_oci_worker_config(config))
         config_path.chmod(0o600)
         pin_path = pin.path
@@ -4633,10 +5202,28 @@ printf 'MOUNT_OPTIONS_OK\n'
             container_id,
         ]
         runc_descriptor = oci_worker._open_verified_runc_executable(pin)
+        unshare_value = shutil.which("unshare")
+        ip_value = shutil.which("ip")
+        if unshare_value is None or ip_value is None:
+            pytest.fail(
+                "trusted unshare and ip tools are required to create loopback-only network state"
+            )
+        unshare_path = _require_root_owned_file(Path(unshare_value), "unshare")
+        ip_path = _require_root_owned_file(Path(ip_value), "ip")
+        inner_launcher = (
+            "import json,os,subprocess,sys; fd=int(sys.argv[1]); "
+            "argv=json.loads(sys.argv[2]); "
+            "subprocess.run([sys.argv[3],'link','set','lo','up'],check=True,"
+            "stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,timeout=5); "
+            "os.set_inheritable(fd,False); os.execve(fd,argv,os.environ)"
+        )
         launcher = (
-            "import json,os,sys; fd=int(sys.argv[1]); "
-            "argv=json.loads(sys.argv[2]); os.set_inheritable(fd,False); "
-            "os.execve(fd,argv,os.environ)"
+            "import json,os,sys; fd=int(sys.argv[1]); argv=json.loads(sys.argv[2]); "
+            "unshare_path=sys.argv[3]; ip_path=sys.argv[4]; "
+            "inner=sys.argv[5]; os.set_inheritable(fd,True); "
+            "args=[unshare_path,'--user','--map-root-user','--net','--fork','--',"
+            "sys.executable,'-I','-S','-c',inner,str(fd),json.dumps(argv),ip_path]; "
+            "os.execv(unshare_path,args)"
         )
         runtime_cleanup_verified = False
         runc_process = subprocess.Popen(
@@ -4648,6 +5235,9 @@ printf 'MOUNT_OPTIONS_OK\n'
                 launcher,
                 str(runc_descriptor),
                 json.dumps(runc_argv),
+                str(unshare_path),
+                str(ip_path),
+                inner_launcher,
             ],
             cwd="/",
             env=_runc_environment(),
@@ -4732,6 +5322,18 @@ printf 'MOUNT_OPTIONS_OK\n'
         }
         if worker_status_fields.get("Seccomp") != "2":
             pytest.fail("live worker did not report an installed seccomp filter")
+        if worker_status_fields.get("CapEff") != "0000000000000000":
+            pytest.fail("live TCP bridge worker did not have an empty effective capability set")
+        if worker_status_fields.get("CapBnd") != "0000000000000000":
+            pytest.fail("live TCP bridge worker retained capabilities in its bounding set")
+        if os.stat(f"/proc/{worker_pid}/ns/net").st_ino == os.stat("/proc/self/ns/net").st_ino:
+            pytest.fail("worker unexpectedly shared the host network namespace")
+        interface_lines = (
+            Path(f"/proc/{worker_pid}/net/dev").read_text(encoding="ascii").splitlines()
+        )
+        interfaces = [line.split(":", 1)[0].strip() for line in interface_lines[2:] if ":" in line]
+        if interfaces != ["lo"]:
+            pytest.fail(f"worker network namespace was not loopback-only: {interfaces!r}")
         try:
             _assert_worker_has_no_non_loopback_routes(worker_pid)
         except (OSError, ValueError, AssertionError) as error:
@@ -4760,6 +5362,50 @@ printf 'MOUNT_OPTIONS_OK\n'
             except BaseException as error:
                 proxy_errors.append(error)
 
+        def verify_additional_attempt_peer(channel: socket.socket, label: str) -> int:
+            channel.settimeout(8)
+            peer_pid, peer_uid, peer_gid = struct.unpack(
+                "3i", channel.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)
+            )
+            if peer_pid <= 0 or peer_uid != os.geteuid() or peer_gid != os.getegid():
+                pytest.fail(f"{label} peer credentials did not match the mapped worker identity")
+            peer_pidfd = provider_proxy._get_peer_pidfd(channel)
+            try:
+                if os.get_inheritable(peer_pidfd):
+                    pytest.fail(f"{label} peer PIDFD was inheritable")
+                peer_fdinfo = Path(f"/proc/self/fdinfo/{peer_pidfd}").read_text(encoding="ascii")
+                if f"Pid:\t{peer_pid}\n" not in peer_fdinfo:
+                    pytest.fail(f"{label} peer PIDFD did not pin SO_PEERCRED")
+            finally:
+                os.close(peer_pidfd)
+            peer_cgroup = _snapshot_cgroup_path(read_linux_process_snapshot(peer_pid))
+            if peer_cgroup.resolve(strict=True) != attempt_cgroup.resolve(strict=True):
+                pytest.fail(f"{label} peer did not remain inside the exact attempt cgroup")
+            peer_status = Path(f"/proc/{peer_pid}/status").read_text(encoding="ascii")
+            peer_fields = {
+                key: value.strip()
+                for key, separator, value in (
+                    line.partition(":") for line in peer_status.splitlines()
+                )
+                if separator
+            }
+            if (
+                peer_fields.get("Seccomp") != "2"
+                or peer_fields.get("CapEff") != "0000000000000000"
+                or peer_fields.get("CapBnd") != "0000000000000000"
+            ):
+                pytest.fail(f"{label} peer did not retain the no-capability seccomp boundary")
+            if not authorize(channel):
+                pytest.fail(f"attempt cgroup authorizer rejected {label} peer")
+            return peer_pid
+
+        def start_proxy_handler(channel: socket.socket) -> threading.Thread:
+            handler = threading.Thread(target=handle_proxy_channel, args=(channel,), daemon=True)
+            proxy_channels.append(channel)
+            handler.start()
+            proxy_threads.append(handler)
+            return handler
+
         worker_handler = threading.Thread(
             target=handle_proxy_channel, args=(worker_channel,), daemon=True
         )
@@ -4783,8 +5429,59 @@ printf 'MOUNT_OPTIONS_OK\n'
         target_connection.shutdown(socket.SHUT_WR)
         target_connection.close()
         target_connection = None
+
+        bridge_channel = listener.accept(timeout=12)
+        if bridge_channel is None:
+            if runc_process.poll() is None:
+                _kill_runc_group(runc_process)
+            try:
+                bridge_stdout, bridge_stderr = runc_process.communicate(timeout=3)
+            except subprocess.TimeoutExpired:
+                bridge_stdout, bridge_stderr = (
+                    b"",
+                    b"runc process group remained after exact teardown",
+                )
+            pytest.fail(
+                "TCP bridge did not open its approved attempt-scoped UDS channel: "
+                f"runc_exit={runc_process.returncode}, stdout={bridge_stdout[-2048:]!r}, "
+                f"stderr={bridge_stderr[-2048:]!r}"
+            )
+        verify_additional_attempt_peer(bridge_channel, "TCP bridge")
+        bridge_handler = start_proxy_handler(bridge_channel)
+
+        target_connection, _target_peer = target_listener.accept()
+        target_connection.settimeout(8)
+        target_connection = server_tls_context.wrap_socket(target_connection, server_side=True)
+        tls_request = bytearray()
+        while b"\r\n\r\n" not in tls_request:
+            chunk = target_connection.recv(4096)
+            if not chunk:
+                pytest.fail("local TLS mock closed before receiving the HTTP request")
+            tls_request.extend(chunk)
+        if not tls_request.startswith(b"GET / HTTP/1.1\r\n"):
+            pytest.fail(f"local TLS mock received an unexpected request: {bytes(tls_request)!r}")
+        target_connection.sendall(
+            b"HTTP/1.1 302 Found\r\n"
+            b"Location: https://blocked.example/redirected\r\n"
+            b"Content-Length: 0\r\n"
+            b"Connection: close\r\n\r\n"
+        )
+        target_connection.close()
+        target_connection = None
         target_listener.close()
         target_listener = None
+        bridge_handler.join(timeout=8)
+        if bridge_handler.is_alive():
+            pytest.fail("approved TLS bridge handler did not finish after the mock redirect")
+
+        redirect_channel = listener.accept(timeout=12)
+        if redirect_channel is None:
+            pytest.fail("TLS redirect did not create a second CONNECT through the bridge")
+        verify_additional_attempt_peer(redirect_channel, "TLS redirect")
+        redirect_handler = start_proxy_handler(redirect_channel)
+        redirect_handler.join(timeout=8)
+        if redirect_handler.is_alive():
+            pytest.fail("disallowed redirect CONNECT did not receive a bounded proxy denial")
 
         outside_client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         outside_client.settimeout(4)
@@ -4842,12 +5539,20 @@ printf 'MOUNT_OPTIONS_OK\n'
         required_worker_markers = (
             b"MOUNT_OPTIONS_OK\n",
             b"NO_INHERITED_SOCKET_FDS\n",
-            b"DIRECT_IPV4_TCP_DENIED\n",
             b"DIRECT_DNS_IPV4_UDP_DENIED\n",
+            b"DIRECT_IPV4_RAW_DENIED\n",
+            b"DIRECT_PACKET_DGRAM_DENIED\n",
+            b"DIRECT_PACKET_RAW_DENIED\n",
+            b"DIRECT_NETLINK_RAW_DENIED\n",
+            b"DIRECT_VSOCK_TCP_DENIED\n",
             b"DIRECT_IPV6_TCP_DENIED\n",
-            b"DIRECT_DNS_IPV6_UDP_DENIED\n",
+            b"OFFNET_IPV4_TCP_ROUTE_DENIED\n",
+            b"HOST_LOOPBACK_SERVICE_NOT_REACHABLE\n",
             b"UNMOUNTED_HOST_UNIX_SOCKET_NOT_VISIBLE\n",
             b"CONNECT_OK\n",
+            b"TCP_BRIDGE_READY\n",
+            b"TLS_REDIRECT_SECOND_CONNECT_DENIED\n",
+            b"TCP_BRIDGE_STOPPED_AND_REAPED\n",
         )
         if any(marker not in stdout for marker in required_worker_markers):
             pytest.fail(
@@ -4860,9 +5565,12 @@ printf 'MOUNT_OPTIONS_OK\n'
                 pytest.fail("attempt proxy handler did not finish after the worker exited")
         if proxy_errors:
             pytest.fail(f"attempt proxy handler raised unexpectedly: {proxy_errors!r}")
-        if resolver_calls != [("api.example.com.", 443)]:
+        if resolver_calls != [("api.example.com.", 443), ("api.example.com.", 443)]:
             pytest.fail(f"unexpected provider resolver calls: {resolver_calls!r}")
-        if dial_calls != [(socket.AF_INET, ("8.8.8.8", 443))]:
+        if dial_calls != [
+            (socket.AF_INET, ("8.8.8.8", 443)),
+            (socket.AF_INET, ("8.8.8.8", 443)),
+        ]:
             pytest.fail(f"unexpected vetted provider pins dialed: {dial_calls!r}")
         if busybox_version == "":
             pytest.fail("BusyBox version evidence is empty")
