@@ -725,6 +725,43 @@ def test_worker_rejects_non_boolean_sandbox_opt_in_before_host_launch(
     assert not worker_log.exists()
 
 
+def test_experimental_sandbox_worker_fails_closed_without_pinned_runtime(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write_config(repo)
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "sandbox-worker")
+    attempt_before = supervisor.attempt(attempt["id"])
+    worker_log = supervisor.state_dir / "logs" / f"worker-{attempt['id']}.log"
+
+    def launch_must_not_run(*_args, **_kwargs):
+        pytest.fail("missing sandbox runtime prerequisites must not fall back to host launch")
+
+    monkeypatch.setattr(workers_module.sys, "platform", "linux")
+    monkeypatch.setattr(supervisor, "heartbeat", launch_must_not_run)
+    monkeypatch.setattr(supervisor, "_reserve_worker_launch", launch_must_not_run)
+    monkeypatch.setattr(workers_module.subprocess, "Popen", launch_must_not_run)
+
+    with pytest.raises(SupervisorError) as unavailable:
+        supervisor.run_worker(
+            attempt["id"],
+            attempt["claim_token"],
+            [sys.executable, "-c", "pass"],
+            sandbox_experimental_opt_in=True,
+            sandbox_memory_max_bytes=64 * 1024 * 1024,
+            sandbox_cpu_quota=50_000,
+            sandbox_cpu_period=100_000,
+            sandbox_pids_max=32,
+            sandbox_timeout_seconds=10,
+        )
+
+    assert unavailable.value.code == "sandbox_executor_unavailable"
+    assert "requires configured pinned runc and rootfs" in str(unavailable.value)
+    assert supervisor.attempt(attempt["id"]) == attempt_before
+    assert not worker_log.exists()
+
+
 def test_experimental_sandbox_worker_never_imports_nonzero_exit(
     repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
