@@ -3996,7 +3996,13 @@ provider-egress mode, staged behind independent gates:
    channel. This intentionally makes the fake value readable to worker code;
    it does not protect a real secret from that code, root, or hostile
    same-host-UID activity. A real provider credential remains out of scope and
-   needs a brokered design.
+   needs a brokered design. ACP must not inject the canary into launcher or
+   supervisor arguments, environment, receipts, or supervisor-authored log
+   metadata. A malicious worker can deliberately print or copy the readable
+   fake value into stdout/stderr; captured worker output and results are not
+   confidential. Tests must separate ACP-side leak assertions from
+   worker-controlled output and must not claim the latter can never contain
+   the canary.
 6. Make the supervisor own bridge, accepted channels, and upstream tunnels as
    one attempt lifecycle. Cancellation must close active channels, reap the
    bridge, verify socket/credential teardown, and only then permit the existing
