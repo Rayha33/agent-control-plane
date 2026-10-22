@@ -725,6 +725,49 @@ def test_worker_rejects_non_boolean_sandbox_opt_in_before_host_launch(
     assert not worker_log.exists()
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        "echo hello",
+        b"echo hello",
+        (),
+        ("",),
+        ("/bin/echo\x00bad",),
+        ("/bin/echo", "bad\x00argument"),
+        ("/bin/echo", 7),
+        7,
+    ],
+)
+def test_worker_rejects_malformed_argv_before_host_launch(
+    repo: Path, monkeypatch: pytest.MonkeyPatch, command: object
+) -> None:
+    write_config(repo)
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "worker")
+    attempt_before = supervisor.attempt(attempt["id"])
+    worker_log = supervisor.state_dir / "logs" / f"worker-{attempt['id']}.log"
+
+    def launch_must_not_run(*_args, **_kwargs):
+        pytest.fail("malformed worker argv must fail before host worker side effects")
+
+    monkeypatch.setattr(workers_module.sys, "platform", "linux")
+    monkeypatch.setattr(supervisor, "heartbeat", launch_must_not_run)
+    monkeypatch.setattr(supervisor, "_reserve_worker_launch", launch_must_not_run)
+    monkeypatch.setattr(workers_module.subprocess, "Popen", launch_must_not_run)
+
+    with pytest.raises(SupervisorError) as invalid_command:
+        supervisor.run_worker(
+            attempt["id"],
+            attempt["claim_token"],
+            command,  # type: ignore[arg-type]
+        )
+
+    assert invalid_command.value.code == "invalid_command"
+    assert supervisor.attempt(attempt["id"]) == attempt_before
+    assert not worker_log.exists()
+
+
 def test_experimental_sandbox_worker_fails_closed_without_pinned_runtime(
     repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

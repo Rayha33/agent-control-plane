@@ -261,11 +261,23 @@ class WorkersMixin:
                 "experimental sandbox opt-in must be a boolean",
             )
 
+        if isinstance(command, (str, bytes)) or not isinstance(command, Sequence):
+            raise SupervisorError(
+                "invalid_command",
+                "worker command must be a non-empty argument sequence of strings without NUL bytes",
+            )
         # Freeze caller-owned mutable argv before it is logged, expanded into
         # Popen, or hashed for the pre-exec receipt.
         command = tuple(command)
-        if not command:
-            raise SupervisorError("invalid_command", "worker command is required")
+        if (
+            not command
+            or any(type(argument) is not str or "\x00" in argument for argument in command)
+            or not command[0]
+        ):
+            raise SupervisorError(
+                "invalid_command",
+                "worker command must be a non-empty argument sequence of strings without NUL bytes",
+            )
         command_digest = _worker_command_digest(command)
         sandbox_options = (
             sandbox_memory_max_bytes,
