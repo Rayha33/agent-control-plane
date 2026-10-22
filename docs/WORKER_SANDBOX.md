@@ -3952,3 +3952,70 @@ following redirects inside the OCI worker, credential handoff, crash recovery,
 cleanup verification, result transfer, or production `run_worker()`
 integration. Provider-boundary subtask #3112 is complete; parent task #2370
 remains open, and configured OCI worker execution remains fail-closed.
+
+### Generic provider-proxy integration design gate (2026-10-22)
+
+Independent architecture review of follow-up #3441 returned **NO-GO for direct
+integration as currently specified**. The existing live socket probe proves
+that this exact rootless OCI policy allows AF_UNIX to the one bind-mounted
+attempt socket while seccomp denies AF_INET/AF_INET6 TCP and UDP socket
+creation. It does not prove a normal agent HTTP client can use a TCP
+`HTTP_PROXY`; the probe's static C client speaks CONNECT directly over AF_UNIX.
+The documented guest observation is that BusyBox 1.35 lacks `nc -U`; the live
+probe therefore compiled a test-only C client. This is an environment
+observation, not an automated assertion or a production bridge.
+
+The minimally supportable direction is a separate, explicit experimental
+provider-egress mode, staged behind independent gates:
+
+1. Keep the host-side attempt proxy as the policy authority. Its exact
+   normalized host/port allowlist, full DNS-answer classification, pinned
+   numeric dialing, and exact worker-cgroup peer authorization stay mandatory.
+   The client-side bridge must forward only HTTP CONNECT authority and opaque
+   tunnel bytes; it must not resolve names or choose an upstream destination.
+2. Retain AF_UNIX as the sole host capability, mounted read-only from one
+   private per-attempt directory. Verify the canonical directory and socket
+   inode before bind, at mount/readback, and during teardown. Do not describe
+   the mount as defending against hostile concurrent same-UID mutation.
+3. If generic TCP-proxy clients are required, pin and review a tiny
+   production bridge binary as trusted sandbox content; do not rely on an
+   unpinned BusyBox command or caller-provided executable. The bridge may
+   listen only on loopback in the worker's private network namespace and
+   connect to the mounted AF_UNIX channel. A separate opt-in seccomp policy
+   must permit only the TCP socket families/types required for that bridge,
+   while denying UDP, raw/packet sockets, and other unnecessary network APIs.
+   Keep the namespace without an external interface or non-loopback route,
+   with no network capabilities, and live-test non-loopback connection denial.
+   If that bounded policy cannot be demonstrated on a supported guest, refuse
+   generic `HTTP_PROXY` and retain the UDS-only capability.
+4. Treat the complete attempt cgroup as the egress principal: any process in
+   that cgroup can reach the mounted socket. PIDFD/UID/GID/cgroup checks reject
+   same-UID peers outside it; the bridge itself is not an authorization
+   boundary. Do not claim process-only access control.
+5. Give the fake credential only through a private read-only execution-scoped
+   channel. This intentionally makes the fake value readable to worker code;
+   it does not protect a real secret from that code, root, or hostile
+   same-host-UID activity. A real provider credential remains out of scope and
+   needs a brokered design.
+6. Make the supervisor own bridge, accepted channels, and upstream tunnels as
+   one attempt lifecycle. Cancellation must close active channels, reap the
+   bridge, verify socket/credential teardown, and only then permit the existing
+   independent `cleanup_verified` and result-import gates.
+
+The broker policy authorizes only the CONNECT hostname and port. TLS bytes stay
+opaque: it cannot inspect TLS SNI, redirects, URL paths, HTTP methods, or API
+semantics. A redirect to another authority is blocked only when the client
+opens a new CONNECT and that authority is not allowlisted; no TLS-path or
+redirect-inspection claim is warranted. Plain HTTP forward-proxy requests are
+not supported by the current CONNECT handler and must not be implied by
+`HTTP_PROXY` compatibility claims.
+
+Before integration, split and prove these stages on the disposable supported
+Linux guest: (a) production listener ownership plus exact directory bind-mount
+and teardown lifecycle; (b) a reproducibly built and pinned bridge with the
+separate loopback-only seccomp/network policy; and (c) fake-credential
+visibility/leak tests. Then exercise the composition through registered
+`run_worker()`, including cancellation and crash recovery. The current direct
+OCI test, test receipt, and injected resolver/dial hooks are not production
+integration evidence. No provider policy, worker seccomp rule, mount policy,
+or configured-OCI default was changed by this design review.
