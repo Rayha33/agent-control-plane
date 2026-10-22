@@ -18,6 +18,7 @@ import socket
 import stat
 import struct
 import sys
+import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -36,6 +37,7 @@ _REQUEST_TIMEOUT_SECONDS = 10.0
 _RELAY_CHUNK_BYTES = 64 * 1024
 _MAX_BUFFERED_BYTES = 1024 * 1024
 _DEFAULT_IDLE_TIMEOUT_SECONDS = 300.0
+_RELAY_CANCEL_POLL_SECONDS = 0.1
 # Use the narrower sockaddr_un.sun_path size across Linux and Darwin.
 _MAX_UNIX_SOCKET_PATH_BYTES = 103
 # Linux UAPI value from include/uapi/asm-generic/socket.h. Python versions
@@ -397,6 +399,259 @@ class AttemptProviderProxyListener:
             raise
 
 
+class AttemptProviderProxyService:
+    """Own an attempt listener, accepted channels, and bounded handler threads.
+
+    This service only composes the existing CONNECT policy primitives. The
+    caller still owns the worker mount and must stop this service before the
+    attempt can be recorded as cleaned up. Closing it shuts down accepted
+    client streams, signals the CONNECT relay, and waits for every handler; a
+    handler that cannot drain before the deadline makes shutdown unverified.
+    The listener must be exclusively owned by this service while it runs; do
+    not call ``accept`` concurrently. Synchronous name resolution cannot be
+    interrupted, so a stalled resolver can still make shutdown unverified. It
+    does not create a network namespace, bridge TCP to AF_UNIX, or provide a
+    broader lifecycle than the caller gives it.
+    """
+
+    _ACCEPT_POLL_SECONDS = 0.1
+    _MAX_CONNECTIONS = 128
+    _MAX_SHUTDOWN_SECONDS = 60.0
+
+    def __init__(
+        self,
+        listener: AttemptProviderProxyListener,
+        policy: ProviderEgressPolicy,
+        *,
+        authorize_peer: _PeerAuthorizer,
+        max_connections: int = 8,
+    ) -> None:
+        if type(listener) is not AttemptProviderProxyListener:
+            raise SupervisorError(
+                "provider_proxy_listener_invalid",
+                "attempt proxy service requires its owned listener",
+            )
+        if type(policy) is not ProviderEgressPolicy:
+            raise SupervisorError(
+                "provider_proxy_policy_invalid", "attempt proxy service requires an egress policy"
+            )
+        if not callable(authorize_peer):
+            raise SupervisorError(
+                "provider_proxy_authorizer_invalid",
+                "attempt proxy service requires a peer authorizer",
+            )
+        if type(max_connections) is not int or not 1 <= max_connections <= self._MAX_CONNECTIONS:
+            raise SupervisorError(
+                "provider_proxy_connection_limit_invalid",
+                "attempt proxy connection limit is outside the supported bound",
+            )
+
+        self.listener = listener
+        self.policy = policy
+        self.authorize_peer = authorize_peer
+        self.max_connections = max_connections
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._accept_thread: threading.Thread | None = None
+        self._handler_threads: set[threading.Thread] = set()
+        self._channels: set[socket.socket] = set()
+        self._failure: SupervisorError | None = None
+        self._started = False
+        self._closed = False
+
+    def start(self) -> None:
+        """Start the bounded accept loop exactly once."""
+        with self._lock:
+            if self._started or self._closed:
+                raise SupervisorError(
+                    "provider_proxy_service_state_invalid",
+                    "attempt proxy service cannot be started in its current state",
+                )
+            thread = threading.Thread(
+                target=self._accept_loop,
+                name="acp-attempt-provider-proxy",
+                daemon=False,
+            )
+            self._accept_thread = thread
+            self._started = True
+            try:
+                thread.start()
+            except BaseException as error:
+                self._started = False
+                self._accept_thread = None
+                raise SupervisorError(
+                    "provider_proxy_service_start_failed",
+                    "attempt proxy accept loop could not be started",
+                ) from error
+
+    def _remember_failure(self, error: SupervisorError) -> None:
+        with self._lock:
+            if self._failure is None:
+                self._failure = error
+
+    def _prune_finished_handlers_locked(self) -> None:
+        finished = tuple(thread for thread in self._handler_threads if not thread.is_alive())
+        for thread in finished:
+            thread.join(timeout=0)
+        self._handler_threads.difference_update(finished)
+
+    def _close_channel(self, channel: socket.socket) -> None:
+        try:
+            channel.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
+            channel.close()
+        except OSError:
+            if channel.fileno() >= 0:
+                self._remember_failure(
+                    SupervisorError(
+                        "provider_proxy_channel_close_unverified",
+                        "accepted provider proxy channel did not close",
+                    )
+                )
+
+    def _stop_accepting(self) -> None:
+        self._stop.set()
+        try:
+            self.listener.close()
+        except SupervisorError as error:
+            self._remember_failure(error)
+        with self._lock:
+            channels = tuple(self._channels)
+        for channel in channels:
+            self._close_channel(channel)
+
+    def _fail(self, message: str) -> None:
+        self._remember_failure(SupervisorError("provider_proxy_service_failed", message))
+        self._stop_accepting()
+
+    def _handle_channel(self, channel: socket.socket) -> None:
+        try:
+            serve_connect_connection(
+                channel,
+                self.policy,
+                authorize_peer=self.authorize_peer,
+                cancel_event=self._stop,
+            )
+        except OSError:
+            if not self._stop.is_set():
+                self._fail("attempt proxy request handler failed")
+        except BaseException:
+            self._fail("attempt proxy request handler failed")
+        finally:
+            self._close_channel(channel)
+            with self._lock:
+                self._channels.discard(channel)
+
+    def _accept_loop(self) -> None:
+        try:
+            while not self._stop.is_set():
+                try:
+                    channel = self.listener.accept(timeout=self._ACCEPT_POLL_SECONDS)
+                except (OSError, SupervisorError):
+                    if self._stop.is_set():
+                        break
+                    self._fail("attempt proxy listener failed while accepting a channel")
+                    break
+                if channel is None:
+                    continue
+
+                close_channel = False
+                with self._lock:
+                    self._prune_finished_handlers_locked()
+                    if self._stop.is_set() or len(self._channels) >= self.max_connections:
+                        close_channel = True
+                    else:
+                        thread = threading.Thread(
+                            target=self._handle_channel,
+                            args=(channel,),
+                            name="acp-attempt-provider-proxy-channel",
+                            daemon=False,
+                        )
+                        self._channels.add(channel)
+                        self._handler_threads.add(thread)
+                        try:
+                            thread.start()
+                        except BaseException:
+                            self._channels.discard(channel)
+                            self._handler_threads.discard(thread)
+                            close_channel = True
+                            self._failure = self._failure or SupervisorError(
+                                "provider_proxy_handler_start_failed",
+                                "attempt proxy request handler could not be started",
+                            )
+                            self._stop.set()
+                if close_channel:
+                    self._close_channel(channel)
+                    if self._stop.is_set():
+                        self._stop_accepting()
+                        break
+        except BaseException:
+            self._fail("attempt proxy accept loop failed")
+
+    def close(self, *, timeout: float = 10.0) -> None:
+        """Stop accepting, close streams, and join every handler by deadline.
+
+        Failure to close the listener or drain all handlers is reported as
+        unverified so callers can retain the attempt's cleanup fence.
+        """
+        if type(timeout) not in {int, float}:
+            raise SupervisorError(
+                "provider_proxy_shutdown_timeout_invalid",
+                "attempt proxy shutdown timeout is outside the supported bound",
+            )
+        try:
+            timeout_seconds = float(timeout)
+        except (OverflowError, ValueError):
+            timeout_seconds = math.inf
+        if (
+            not math.isfinite(timeout_seconds)
+            or not 0 < timeout_seconds <= self._MAX_SHUTDOWN_SECONDS
+        ):
+            raise SupervisorError(
+                "provider_proxy_shutdown_timeout_invalid",
+                "attempt proxy shutdown timeout is outside the supported bound",
+            )
+        current_thread = threading.current_thread()
+        with self._lock:
+            if self._closed:
+                if self._failure is not None:
+                    raise self._failure
+                return
+            if current_thread is self._accept_thread or current_thread in self._handler_threads:
+                raise SupervisorError(
+                    "provider_proxy_shutdown_unverified",
+                    "attempt proxy service cannot join itself during shutdown",
+                )
+            accept_thread = self._accept_thread
+
+        self._stop_accepting()
+        deadline = time.monotonic() + timeout_seconds
+        if accept_thread is not None:
+            accept_thread.join(max(0.0, deadline - time.monotonic()))
+        with self._lock:
+            threads = tuple(self._handler_threads)
+        for thread in threads:
+            thread.join(max(0.0, deadline - time.monotonic()))
+
+        with self._lock:
+            self._prune_finished_handlers_locked()
+            handlers_alive = tuple(self._handler_threads)
+            accept_alive = accept_thread is not None and accept_thread.is_alive()
+            channels_remain = bool(self._channels)
+            if not handlers_alive and not accept_alive and not channels_remain:
+                self._closed = True
+            failure = self._failure
+        if handlers_alive or accept_alive or channels_remain:
+            raise SupervisorError(
+                "provider_proxy_shutdown_unverified",
+                "attempt proxy listener or accepted channels did not drain before the deadline",
+            )
+        if failure is not None:
+            raise failure
+
+
 def _read_connect_request(client: socket.socket) -> str:
     received = bytearray()
     deadline = time.monotonic() + _REQUEST_TIMEOUT_SECONDS
@@ -498,7 +753,12 @@ def _reject_queued_tunnel_data(client: socket.socket) -> None:
         client.settimeout(previous_timeout)
 
 
-def _relay(client: socket.socket, upstream: socket.socket) -> None:
+def _relay(
+    client: socket.socket,
+    upstream: socket.socket,
+    *,
+    cancel_event: threading.Event | None = None,
+) -> None:
     peers = {client: upstream, upstream: client}
     buffers = {client: bytearray(), upstream: bytearray()}
     read_open = {client, upstream}
@@ -511,6 +771,8 @@ def _relay(client: socket.socket, upstream: socket.socket) -> None:
         for stream in sockets:
             stream.setblocking(False)
         while True:
+            if cancel_event is not None and cancel_event.is_set():
+                return
             if not read_open and not any(buffers.values()):
                 return
 
@@ -532,9 +794,19 @@ def _relay(client: socket.socket, upstream: socket.socket) -> None:
             remaining = _DEFAULT_IDLE_TIMEOUT_SECONDS - (time.monotonic() - last_activity)
             if remaining <= 0:
                 return
-            ready = selector.select(remaining)
-            if not ready:
+            select_timeout = remaining
+            if cancel_event is not None:
+                select_timeout = min(remaining, _RELAY_CANCEL_POLL_SECONDS)
+            ready = selector.select(select_timeout)
+            if cancel_event is not None and cancel_event.is_set():
                 return
+            if not ready:
+                if (
+                    cancel_event is None
+                    or time.monotonic() - last_activity >= _DEFAULT_IDLE_TIMEOUT_SECONDS
+                ):
+                    return
+                continue
 
             for key, mask in ready:
                 stream = key.fileobj
@@ -591,6 +863,7 @@ def serve_connect_connection(
     policy: ProviderEgressPolicy,
     *,
     authorize_peer: _PeerAuthorizer,
+    cancel_event: threading.Event | None = None,
 ) -> None:
     """Handle one CONNECT request on a caller-authenticated stream channel.
 
@@ -603,6 +876,7 @@ def serve_connect_connection(
         client,
         dial=policy.connect_authority,
         authorize_peer=authorize_peer,
+        cancel_event=cancel_event,
     )
 
 
@@ -611,6 +885,7 @@ def _serve_connect_connection(
     *,
     dial: _Dialer,
     authorize_peer: _PeerAuthorizer,
+    cancel_event: threading.Event | None = None,
 ) -> None:
     upstream: socket.socket | None = None
     try:
@@ -620,6 +895,8 @@ def _serve_connect_connection(
             authorized = False
         if not authorized:
             _send_error(client, "403 Forbidden")
+            return
+        if cancel_event is not None and cancel_event.is_set():
             return
         authority = _read_connect_request(client)
         try:
@@ -633,9 +910,11 @@ def _serve_connect_connection(
                 _send_error(client, "502 Bad Gateway")
             return
         upstream = pinned.socket
+        if cancel_event is not None and cancel_event.is_set():
+            return
         _reject_queued_tunnel_data(client)
         client.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-        _relay(client, upstream)
+        _relay(client, upstream, cancel_event=cancel_event)
     except _ConnectRequestError:
         _send_error(client, "400 Bad Request")
     except TimeoutError:

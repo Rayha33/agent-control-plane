@@ -309,6 +309,153 @@ def test_attempt_proxy_listener_does_not_call_missing_directory_cleaned(
     )
 
 
+def test_attempt_proxy_service_cancels_and_joins_active_channel(
+    private_attempt_directory: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    listener = provider_proxy.AttemptProviderProxyListener(private_attempt_directory)
+    handler_started = threading.Event()
+
+    def wait_for_close(
+        channel: socket.socket,
+        _policy: ProviderEgressPolicy,
+        *,
+        authorize_peer,
+        cancel_event: threading.Event | None,
+    ) -> None:
+        assert authorize_peer is not None
+        assert cancel_event is not None
+        handler_started.set()
+        assert channel.recv(1) == b""
+        assert cancel_event.is_set()
+
+    monkeypatch.setattr(provider_proxy, "serve_connect_connection", wait_for_close)
+    service = provider_proxy.AttemptProviderProxyService(
+        listener,
+        _policy(),
+        authorize_peer=lambda _channel: True,
+        max_connections=1,
+    )
+    service.start()
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    client.settimeout(2)
+    client.connect(str(listener.path))
+    try:
+        assert handler_started.wait(2)
+        service.close(timeout=2)
+        assert client.recv(1) == b""
+        assert not os.path.lexists(listener.path)
+        assert not service._channels
+        assert not service._handler_threads
+        with pytest.raises(SupervisorError, match="cannot be started"):
+            service.start()
+        service.close(timeout=2)
+    finally:
+        client.close()
+
+
+def test_attempt_proxy_service_closes_real_relay_tunnel_on_shutdown(
+    private_attempt_directory: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    listener = provider_proxy.AttemptProviderProxyListener(private_attempt_directory)
+    policy = _policy()
+    upstream, target = socket.socketpair()
+    target.settimeout(2)
+    endpoint = PinnedEndpoint("api.example.com", 443, socket.AF_INET, ("192.0.2.10", 443))
+
+    def dial(authority: str) -> PinnedConnection:
+        assert authority == "api.example.com:443"
+        return PinnedConnection(endpoint, upstream)
+
+    monkeypatch.setattr(policy, "connect_authority", dial)
+    service = provider_proxy.AttemptProviderProxyService(
+        listener,
+        policy,
+        authorize_peer=lambda _channel: True,
+    )
+    service.start()
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    client.settimeout(2)
+    try:
+        client.connect(str(listener.path))
+        client.sendall(_request())
+        assert _read_response_headers(client) == b"HTTP/1.1 200 Connection Established\r\n\r\n"
+        service.close(timeout=2)
+        assert upstream.fileno() == -1
+        assert target.recv(1) == b""
+        assert not service._handler_threads
+    except SupervisorError:
+        upstream.close()
+        try:
+            service.close(timeout=2)
+        except SupervisorError:
+            pass
+        raise
+    finally:
+        client.close()
+        upstream.close()
+        target.close()
+
+
+def test_attempt_proxy_service_timeout_keeps_shutdown_unverified_until_drained(
+    private_attempt_directory: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    listener = provider_proxy.AttemptProviderProxyListener(private_attempt_directory)
+    handler_started = threading.Event()
+    allow_handler_exit = threading.Event()
+
+    def blocked_handler(
+        _channel: socket.socket,
+        _policy: ProviderEgressPolicy,
+        *,
+        authorize_peer,
+        cancel_event: threading.Event | None,
+    ) -> None:
+        assert authorize_peer is not None
+        assert cancel_event is not None
+        handler_started.set()
+        allow_handler_exit.wait(2)
+
+    monkeypatch.setattr(provider_proxy, "serve_connect_connection", blocked_handler)
+    service = provider_proxy.AttemptProviderProxyService(
+        listener,
+        _policy(),
+        authorize_peer=lambda _channel: True,
+    )
+    service.start()
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    client.settimeout(2)
+    client.connect(str(listener.path))
+    try:
+        assert handler_started.wait(2)
+        with pytest.raises(SupervisorError, match="did not drain"):
+            service.close(timeout=0.05)
+        assert service._closed is False
+        assert service._handler_threads
+        assert not os.path.lexists(listener.path)
+        allow_handler_exit.set()
+        service.close(timeout=2)
+        assert service._closed is True
+        assert not service._handler_threads
+    finally:
+        allow_handler_exit.set()
+        client.close()
+
+
+def test_attempt_proxy_service_rejects_invalid_shutdown_timeout(
+    private_attempt_directory: Path,
+) -> None:
+    listener = provider_proxy.AttemptProviderProxyListener(private_attempt_directory)
+    service = provider_proxy.AttemptProviderProxyService(
+        listener,
+        _policy(),
+        authorize_peer=lambda _channel: True,
+    )
+    for timeout in (0, -1, float("nan"), float("inf"), 10**1000, True):
+        with pytest.raises(SupervisorError, match="shutdown timeout"):
+            service.close(timeout=timeout)
+    service.close(timeout=2)
+
+
 def test_attempt_proxy_listener_caches_descriptor_close_failure(
     private_attempt_directory: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
