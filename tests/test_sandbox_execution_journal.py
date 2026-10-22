@@ -7667,6 +7667,7 @@ def test_reaper_retries_cleanup_verification_but_legacy_receipt_stays_fenced(
     ("phase", "submission_state"),
     [
         ("reserved", "absent"),
+        ("ambiguous", "absent"),
         ("running", "recorded"),
         ("exited", "recorded"),
         ("cleanup_reported", "recorded"),
@@ -7682,7 +7683,11 @@ def test_reaper_quarantine_diagnoses_proxy_artifact_hold(
     supervisor = GitSupervisor(repo)
     attempt = claimed(supervisor)
     reserve(supervisor, attempt)
-    if phase != "reserved":
+    if phase == "ambiguous":
+        supervisor._sandbox_execution_mark_ambiguous(
+            attempt["id"], attempt["claim_token"], "injected restart ambiguity"
+        )
+    elif phase != "reserved":
         record_launch(supervisor, attempt)
     if phase in {"running", "exited", "cleanup_reported"}:
         record_running(supervisor, attempt)
