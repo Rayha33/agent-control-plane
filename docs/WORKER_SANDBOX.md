@@ -4359,3 +4359,38 @@ executable digest is unchanged; no cleanup action is performed by the result
 readers. This increment does not enable the provider route or prove registered
 provider-backed `run_worker()` execution. PR #42 remains draft/open, and
 #2370/#3441 remain open for their broader acceptance.
+
+### Registered no-provider `run_worker()` completion and result import (2026-10-22)
+
+At commit `0698ceddc6cb4ae0d5be5155270897efcb998272`, on the same disposable
+Debian 12 ARM64 guest (kernel
+`6.12.95+deb12-cloud-arm64`, systemd `252.39`, Python `3.11.2`, rootless
+runc `1.5.2`), the exact pinned-runc lifecycle test passed **1/1 in 2.24s**
+with `ACP_LIVE_SUPERVISED_RUN_WORKER=1` and
+`ACP_LIVE_IMPORT_RESULT_AFTER_CLEANUP=1`. The opt-in path entered registered
+`GitSupervisor.run_worker()`, returned `status=pending_qc` with
+`sandbox_cleanup_verified=true`, then passed the host-side result importer.
+Assertions verified the cleanup receipt and empty runtime state before import,
+that the submitted commit was based on the task's exact base and contained only
+the expected coding-task/driver outputs, and that the source worktree remained
+clean. The test used a cleared environment with only the live-test settings;
+there was no provider proxy, FD4 canary, real provider credential, DNS/network
+request, model call, or paid call. Its generated local ACP control-plane
+credential is not a provider credential.
+
+The guest and host matched these exact source/test SHA-256 values:
+
+| File | SHA-256 |
+| --- | --- |
+| `oci_worker.py` | `9731bedf92ffc0d6e0f368e23db722bc66d358f9cc025926154eb8c2f2f4f134` |
+| `sandbox_execution_journal.py` | `0000645f92f783fc45cd86b3d5da9d28e56da261f44e84f17391eafea474f70a` |
+| `sandbox_launch_driver_service.py` | `d68c16bbdf0ad86fbbdc6fb6df6bca07db399fa9c61214f159d5e3e867820865` |
+| `test_sandbox_worker_lifecycle_integration.py` | `243fe2709284f509b0bec5bde2522c0569f6bf965f3ee4a3edf575d2b771dc84` |
+
+Postflight found no test-specific driver/monitor unit, matching process, or
+`acp-live-launch-driver-*` fixture root; the user manager remained running.
+This proves only the opt-in **no-provider natural-completion/import** path. It
+does not exercise provider credential delivery or egress, cancellation or
+crash-recovery through `run_worker()`, nor enable configured OCI execution by
+default. Provider-backed composition and broader task #3441/#2370 acceptance
+remain open.
