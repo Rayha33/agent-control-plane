@@ -10,6 +10,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from dataclasses import replace
@@ -24,6 +25,7 @@ from referencing import Registry, Resource
 from referencing.jsonschema import DRAFT4
 
 import agent_control_plane.supervisor.oci_worker as oci_worker
+from agent_control_plane.supervisor import provider_proxy
 from agent_control_plane.supervisor.common import SupervisorError
 from agent_control_plane.supervisor.oci_worker import (
     build_oci_worker_config,
@@ -639,6 +641,92 @@ def test_bundle_rootfs_copy_accepts_matching_tree_and_closure_pins(tmp_path: Pat
     )
 
     assert config["root"] == {"path": "rootfs", "readonly": True}
+
+
+def test_compiler_issues_read_only_provider_socket_mount_only_when_requested(
+    tmp_path: Path, request: pytest.FixtureRequest
+) -> None:
+    bundle, workspace = oci_fixture(tmp_path)
+    rootfs = bundle / "rootfs"
+    (rootfs / "run" / "acp").mkdir(parents=True)
+    rootfs_pin = _pin_test_rootfs(rootfs)
+    temporary = tempfile.TemporaryDirectory(prefix="acp-px-", dir="/tmp")
+    request.addfinalizer(temporary.cleanup)
+    provider_directory = Path(temporary.name).resolve() / "proxy"
+    provider_directory.mkdir(mode=0o700)
+    provider_directory.chmod(0o700)
+    listener = provider_proxy.AttemptProviderProxyListener(provider_directory)
+
+    try:
+        config = build_oci_worker_config(
+            bundle,
+            workspace,
+            ("/usr/bin/busybox",),
+            rootfs_pin=rootfs_pin,
+            container_id="acp-worker-123",
+            memory_bytes=256 * 1024 * 1024,
+            pids_limit=32,
+            cpu_quota_us=100_000,
+            provider_proxy_listener=listener,
+        )
+        decoded, _, _ = oci_worker._compiler_issued_oci_worker_config(config)
+        provider_mount = decoded["mounts"][-1]
+        assert provider_mount == {
+            "destination": "/run/acp",
+            "type": "bind",
+            "source": str(provider_directory),
+            "options": ["bind", "ro", "nosuid", "nodev", "noexec"],
+        }
+        assert "ACP_PROVIDER_PROXY_UNIX_SOCKET=/run/acp/provider.sock" in decoded["process"]["env"]
+
+        malformed = copy.deepcopy(decoded)
+        malformed["mounts"][-1]["options"] = ["bind", "rw", "nosuid", "nodev", "noexec"]
+        with pytest.raises(SupervisorError, match="complete worker policy"):
+            oci_worker._validate_complete_oci_worker_policy(malformed)
+    finally:
+        listener.close()
+
+
+def test_provider_socket_mount_requires_rootfs_mountpoint_and_owned_listener(
+    tmp_path: Path, request: pytest.FixtureRequest
+) -> None:
+    bundle, workspace = oci_fixture(tmp_path)
+    rootfs_pin = _pin_test_rootfs(bundle / "rootfs")
+    temporary = tempfile.TemporaryDirectory(prefix="acp-px-", dir="/tmp")
+    request.addfinalizer(temporary.cleanup)
+    provider_directory = Path(temporary.name).resolve() / "proxy"
+    provider_directory.mkdir(mode=0o700)
+    provider_directory.chmod(0o700)
+    listener = provider_proxy.AttemptProviderProxyListener(provider_directory)
+
+    try:
+        with pytest.raises(SupervisorError, match="mount target /run/acp is unavailable"):
+            build_oci_worker_config(
+                bundle,
+                workspace,
+                ("/usr/bin/busybox",),
+                rootfs_pin=rootfs_pin,
+                container_id="acp-worker-123",
+                memory_bytes=256 * 1024 * 1024,
+                pids_limit=32,
+                cpu_quota_us=100_000,
+                provider_proxy_listener=listener,
+            )
+
+        with pytest.raises(SupervisorError, match="exact owned attempt listener"):
+            build_oci_worker_config(
+                bundle,
+                workspace,
+                ("/usr/bin/busybox",),
+                rootfs_pin=rootfs_pin,
+                container_id="acp-worker-123",
+                memory_bytes=256 * 1024 * 1024,
+                pids_limit=32,
+                cpu_quota_us=100_000,
+                provider_proxy_listener=object(),
+            )
+    finally:
+        listener.close()
 
 
 @pytest.mark.parametrize("private_git", [False, True])

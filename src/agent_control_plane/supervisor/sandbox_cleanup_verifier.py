@@ -169,6 +169,14 @@ def _sandbox_cleanup_verification_json_is_self_consistent(row: Any, encoded: Any
         processes = observations["processes"]
         cgroups = observations["cgroups"]
         paths = observations["paths"]
+        legacy_paths = {
+            "runc_state_entry_absent",
+            "bundle_absent",
+            "state_root_absent",
+            "execution_root",
+            "monitor_socket",
+        }
+        provider_paths = legacy_paths | {"provider_proxy_directory"}
         expected_container_id = sandbox_monitor_receipt.sandbox_container_id(
             row["attempt_id"], row["claim_token"], row["execution_id"]
         )
@@ -195,14 +203,7 @@ def _sandbox_cleanup_verification_json_is_self_consistent(row: Any, encoded: Any
             or any(not isinstance(path, str) or not path.startswith("/") for path in cgroups)
             or any(value is not True for value in cgroups.values())
             or not isinstance(paths, dict)
-            or set(paths)
-            != {
-                "runc_state_entry_absent",
-                "bundle_absent",
-                "state_root_absent",
-                "execution_root",
-                "monitor_socket",
-            }
+            or set(paths) not in (legacy_paths, provider_paths)
             or any(
                 paths.get(name) is not True
                 for name in ("runc_state_entry_absent", "bundle_absent", "state_root_absent")
@@ -260,6 +261,58 @@ def _sandbox_cleanup_verification_json_is_self_consistent(row: Any, encoded: Any
             or socket_inode <= 0
         ):
             return False
+        provider_directory = paths.get("provider_proxy_directory")
+        if provider_directory is not None:
+            expected_provider_path = monitor_socket_path.parent / (
+                sandbox_monitor_lifecycle.sandbox_provider_proxy_directory_name(
+                    (row["attempt_id"], row["claim_token"], row["execution_id"])
+                )
+            )
+            if (
+                not isinstance(provider_directory, dict)
+                or set(provider_directory)
+                != {
+                    "path",
+                    "socket_path",
+                    "device",
+                    "inode",
+                    "socket_device",
+                    "socket_inode",
+                    "removed",
+                    "absent",
+                }
+                or provider_directory.get("path") != str(expected_provider_path)
+                or provider_directory.get("socket_path")
+                != str(expected_provider_path / "provider.sock")
+                or provider_directory.get("absent") is not True
+                or type(provider_directory.get("removed")) is not bool
+                or len(os.fsencode(expected_provider_path / "provider.sock")) >= 103
+            ):
+                return False
+            directory_device = provider_directory.get("device")
+            directory_inode = provider_directory.get("inode")
+            provider_socket_device = provider_directory.get("socket_device")
+            provider_socket_inode = provider_directory.get("socket_inode")
+            if (directory_device is None) != (directory_inode is None) or (
+                directory_device is not None
+                and (
+                    type(directory_device) is not int
+                    or directory_device < 0
+                    or type(directory_inode) is not int
+                    or directory_inode <= 0
+                )
+            ):
+                return False
+            if (provider_socket_device is None) != (provider_socket_inode is None) or (
+                provider_socket_device is not None
+                and (
+                    type(provider_socket_device) is not int
+                    or provider_socket_device < 0
+                    or type(provider_socket_inode) is not int
+                    or provider_socket_inode <= 0
+                )
+            ):
+                return False
         expected_units = {
             "monitor": (
                 row["wrapper_unit"],
@@ -972,6 +1025,199 @@ def _remove_monitor_socket(row: Any) -> dict[str, Any]:
     }
 
 
+def _remove_provider_proxy_directory(row: Any) -> dict[str, Any]:
+    """Remove the exact attempt's dedicated proxy directory after its cgroup dies.
+
+    The launch-driver-owned listener normally removes its socket first. This
+    independent postflight also removes a stale socket after driver failure,
+    but only from the deterministic, exact-attempt private runtime directory.
+    Unknown entries and replaced directories remain fenced.
+    """
+
+    expected_identity = (row["attempt_id"], row["claim_token"], row["execution_id"])
+    try:
+        directory, socket_path = sandbox_monitor_lifecycle.sandbox_provider_proxy_control_paths(
+            state_path=row["state_path"], expected_identity=expected_identity
+        )
+    except Exception as error:
+        raise SupervisorError(
+            "sandbox_cleanup_verification_unknown", "provider proxy path could not be derived"
+        ) from error
+    parent = directory.parent
+    if (
+        socket_path.parent != directory
+        or socket_path.name != "provider.sock"
+        or len(os.fsencode(socket_path)) >= 103
+        or not directory.is_absolute()
+        or str(directory) != os.path.normpath(str(directory))
+    ):
+        raise SupervisorError(
+            "sandbox_cleanup_verification_unknown", "provider proxy path is noncanonical"
+        )
+    try:
+        if parent.resolve(strict=True) != parent:
+            raise SupervisorError(
+                "sandbox_cleanup_verification_unknown", "provider runtime directory is aliased"
+            )
+        parent_info = parent.lstat()
+    except OSError as error:
+        raise SupervisorError(
+            "sandbox_cleanup_verification_unknown", "provider runtime directory is unavailable"
+        ) from error
+    if (
+        not stat.S_ISDIR(parent_info.st_mode)
+        or stat.S_ISLNK(parent_info.st_mode)
+        or parent_info.st_uid != os.geteuid()
+        or stat.S_IMODE(parent_info.st_mode) != 0o700
+    ):
+        raise SupervisorError(
+            "sandbox_cleanup_verification_unknown", "provider runtime directory is not private"
+        )
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    try:
+        parent_fd = os.open(parent, flags)
+    except OSError as error:
+        raise SupervisorError(
+            "sandbox_cleanup_verification_unknown", "provider runtime directory changed"
+        ) from error
+    directory_info: os.stat_result | None = None
+    socket_info: os.stat_result | None = None
+    removed_socket = False
+    removed_directory = False
+    try:
+        opened_parent = os.fstat(parent_fd)
+        if (
+            (opened_parent.st_dev, opened_parent.st_ino) != (parent_info.st_dev, parent_info.st_ino)
+            or not stat.S_ISDIR(opened_parent.st_mode)
+            or opened_parent.st_uid != os.geteuid()
+            or stat.S_IMODE(opened_parent.st_mode) != 0o700
+        ):
+            raise SupervisorError(
+                "sandbox_cleanup_verification_unknown",
+                "provider runtime directory identity changed",
+            )
+        try:
+            directory_info = os.stat(directory.name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            directory_info = None
+        except OSError as error:
+            raise SupervisorError(
+                "sandbox_cleanup_verification_unknown", "provider directory identity is unavailable"
+            ) from error
+        if directory_info is not None:
+            if (
+                not stat.S_ISDIR(directory_info.st_mode)
+                or directory_info.st_uid != os.geteuid()
+                or stat.S_IMODE(directory_info.st_mode) != 0o700
+                or directory_info.st_dev != opened_parent.st_dev
+            ):
+                raise SupervisorError(
+                    "sandbox_cleanup_verification_unknown", "provider directory identity is unsafe"
+                )
+            directory_fd = os.open(directory.name, flags, dir_fd=parent_fd)
+            try:
+                opened_directory = os.fstat(directory_fd)
+                if (opened_directory.st_dev, opened_directory.st_ino) != (
+                    directory_info.st_dev,
+                    directory_info.st_ino,
+                ):
+                    raise SupervisorError(
+                        "sandbox_cleanup_verification_unknown",
+                        "provider directory changed before removal",
+                    )
+                names = os.listdir(directory_fd)
+                if names not in ([], ["provider.sock"]):
+                    raise SupervisorError(
+                        "sandbox_cleanup_verification_unknown",
+                        "provider directory contains unknown entries",
+                    )
+                if names:
+                    try:
+                        socket_info = os.stat(
+                            "provider.sock", dir_fd=directory_fd, follow_symlinks=False
+                        )
+                    except OSError as error:
+                        raise SupervisorError(
+                            "sandbox_cleanup_verification_unknown",
+                            "provider socket identity is unavailable",
+                        ) from error
+                    if (
+                        not stat.S_ISSOCK(socket_info.st_mode)
+                        or socket_info.st_uid != os.geteuid()
+                        or socket_info.st_dev != opened_directory.st_dev
+                        or stat.S_IMODE(socket_info.st_mode) != 0o600
+                    ):
+                        raise SupervisorError(
+                            "sandbox_cleanup_verification_unknown",
+                            "provider socket identity is unsafe",
+                        )
+                    current_socket = os.stat(
+                        "provider.sock", dir_fd=directory_fd, follow_symlinks=False
+                    )
+                    if (current_socket.st_dev, current_socket.st_ino) != (
+                        socket_info.st_dev,
+                        socket_info.st_ino,
+                    ):
+                        raise SupervisorError(
+                            "sandbox_cleanup_verification_unknown",
+                            "provider socket changed before removal",
+                        )
+                    os.unlink("provider.sock", dir_fd=directory_fd)
+                    os.fsync(directory_fd)
+                    removed_socket = True
+                if os.listdir(directory_fd):
+                    raise SupervisorError(
+                        "sandbox_cleanup_verification_unknown", "provider directory is not empty"
+                    )
+            finally:
+                os.close(directory_fd)
+            current_directory = os.stat(directory.name, dir_fd=parent_fd, follow_symlinks=False)
+            if (current_directory.st_dev, current_directory.st_ino) != (
+                directory_info.st_dev,
+                directory_info.st_ino,
+            ):
+                raise SupervisorError(
+                    "sandbox_cleanup_verification_unknown",
+                    "provider directory changed before rmdir",
+                )
+            os.rmdir(directory.name, dir_fd=parent_fd)
+            os.fsync(parent_fd)
+            removed_directory = True
+        try:
+            os.stat(directory.name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        except OSError as error:
+            raise SupervisorError(
+                "sandbox_cleanup_verification_unknown", "provider directory absence is unknown"
+            ) from error
+        else:
+            raise SupervisorError(
+                "sandbox_cleanup_verification_unknown", "provider directory remains after removal"
+            )
+    except OSError as error:
+        raise SupervisorError(
+            "sandbox_cleanup_verification_unknown", "provider socket directory cleanup failed"
+        ) from error
+    finally:
+        os.close(parent_fd)
+    return {
+        "path": str(directory),
+        "socket_path": str(socket_path),
+        "device": directory_info.st_dev if directory_info is not None else None,
+        "inode": directory_info.st_ino if directory_info is not None else None,
+        "socket_device": socket_info.st_dev if socket_info is not None else None,
+        "socket_inode": socket_info.st_ino if socket_info is not None else None,
+        "removed": removed_directory or removed_socket,
+        "absent": True,
+    }
+
+
 def _row_cgroup_paths(row: Any) -> dict[str, str]:
     paths = {
         "monitor": row["wrapper_cgroup_path"],
@@ -1222,6 +1468,7 @@ def verify_sandbox_execution_cleanup(
             cgroups[control_group] = _cgroup_tree_is_unpopulated(control_group)
         paths = _remove_bound_private_paths(row)
         paths["runc_state_entry_absent"] = True
+        paths["provider_proxy_directory"] = _remove_provider_proxy_directory(row)
         paths["execution_root"] = {
             "path": root_identity[0],
             "device": root_identity[1],

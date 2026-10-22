@@ -7,8 +7,10 @@ started by the journal outside the attempt slice. The explicit
 with this service; ``WorkersMixin.run_worker`` exposes that composition only
 behind the explicit sandbox experimental opt-in. This supervisor function
 makes no model/provider calls; callers must supply a local fake-worker command
-for the no-model experiment. Provider egress, full workspace/Git isolation,
-and default worker enablement remain separate gates.
+for the no-model experiment. An explicit named provider-egress policy can opt
+that helper into the per-attempt UDS proxy. Generic ``run_worker`` exposes no
+provider options, and the route remains disabled by default. Full workspace/Git
+isolation and general worker enablement remain separate gates.
 """
 
 from __future__ import annotations
@@ -29,8 +31,9 @@ from typing import Any
 
 from ..credential_providers import _anonymous_fd
 from ..git_supervisor import GitSupervisor
-from . import oci_worker
+from . import oci_worker, provider_proxy, sandbox_monitor_lifecycle
 from .common import SupervisorError, canonical_json
+from .provider_egress import EgressPolicyError, ProviderEgressPolicy
 from .sandbox_attestation import (
     _run_trusted_runtime_command,
     _trusted_systemctl_executable,
@@ -52,6 +55,7 @@ _REQUEST_LIMIT = 16 * 1024
 _REQUEST_SCHEMA = 1
 _DIGEST = re.compile(r"[0-9a-f]{64}\Z")
 _IDENTIFIER = re.compile(r"[a-z0-9][a-z0-9._-]{0,127}\Z")
+_PROVIDER_POLICY_NAME = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}\Z")
 _MAX_TIMEOUT_SECONDS = 3540
 _RUNNER_CREDENTIAL_NAME = "acp-runner"
 _RUNNER_CREDENTIAL_LIMIT = 4096
@@ -224,6 +228,32 @@ def _execution_identity(value: Any) -> tuple[str, int, str]:
     return value
 
 
+def _normalize_provider_egress_policy(name: Any, destinations: Any) -> dict[str, Any] | None:
+    """Return the exact named policy data that can be bound to a launch digest."""
+
+    if name is None and destinations is None:
+        return None
+    if (
+        type(name) is not str
+        or _PROVIDER_POLICY_NAME.fullmatch(name) is None
+        or type(destinations) is not dict
+        or not destinations
+        or len(destinations) > 128
+        or any(type(ports) not in {list, tuple, set, frozenset} for ports in destinations.values())
+    ):
+        raise SandboxLaunchDriverServiceError(
+            "provider egress policy name or destinations are invalid"
+        )
+    try:
+        policy = ProviderEgressPolicy(destinations)
+    except (EgressPolicyError, TypeError, ValueError) as error:
+        raise SandboxLaunchDriverServiceError("provider egress policy is invalid") from error
+    return {
+        "name": name,
+        "destinations": {host: list(ports) for host, ports in policy.destinations.items()},
+    }
+
+
 def _validate_request(
     *,
     expected_identity: tuple[str, int, str],
@@ -233,6 +263,8 @@ def _validate_request(
     cpu_period: Any,
     pids_max: Any,
     timeout_seconds: Any,
+    provider_egress_policy_name: Any = None,
+    provider_egress_destinations: Any = None,
 ) -> dict[str, Any]:
     if type(command) is list:
         command = tuple(command)
@@ -257,7 +289,7 @@ def _validate_request(
         or not 0.2 <= timeout_seconds <= _MAX_TIMEOUT_SECONDS
     ):
         raise SandboxLaunchDriverServiceError("launch-driver request is invalid")
-    return {
+    request = {
         "schema": _REQUEST_SCHEMA,
         "attempt_id": expected_identity[0],
         "claim_token": expected_identity[1],
@@ -271,6 +303,12 @@ def _validate_request(
         },
         "timeout_seconds": float(timeout_seconds),
     }
+    provider_policy = _normalize_provider_egress_policy(
+        provider_egress_policy_name, provider_egress_destinations
+    )
+    if provider_policy is not None:
+        request["provider_egress_policy"] = provider_policy
+    return request
 
 
 def _reject_runner_credential_in_command(request: dict[str, Any], credential: str | None) -> None:
@@ -425,8 +463,10 @@ def _read_request(
         "resource_limits",
         "timeout_seconds",
     }
+    provider_policy = request.get("provider_egress_policy")
+    policy_keys = expected_keys | {"provider_egress_policy"}
     if (
-        set(request) != expected_keys
+        set(request) not in (expected_keys, policy_keys)
         or type(request.get("schema")) is not int
         or request.get("schema") != _REQUEST_SCHEMA
         or type(request.get("claim_token")) is not int
@@ -442,6 +482,10 @@ def _read_request(
         "pids_max",
     }:
         raise SandboxLaunchDriverServiceError("launch-driver resource policy is malformed")
+    if "provider_egress_policy" in request and (
+        type(provider_policy) is not dict or set(provider_policy) != {"name", "destinations"}
+    ):
+        raise SandboxLaunchDriverServiceError("launch-driver provider policy is malformed")
     validated = _validate_request(
         expected_identity=expected_identity,
         command=request.get("command"),
@@ -450,6 +494,12 @@ def _read_request(
         cpu_period=resources["cpu_period"],
         pids_max=resources["pids_max"],
         timeout_seconds=request.get("timeout_seconds"),
+        provider_egress_policy_name=(
+            provider_policy.get("name") if provider_policy is not None else None
+        ),
+        provider_egress_destinations=(
+            provider_policy.get("destinations") if provider_policy is not None else None
+        ),
     )
     if validated != request:
         raise SandboxLaunchDriverServiceError("launch-driver request changed during validation")
@@ -941,6 +991,8 @@ def start_sandbox_launch_driver(
     timeout_seconds: float = 600.0,
     startup_timeout_seconds: float = 15.0,
     credential: str | None = None,
+    provider_egress_policy_name: str | None = None,
+    provider_egress_destinations: dict[str, Any] | None = None,
 ) -> SandboxLaunchDriverReceipt:
     """Start one exact driver service and wait for durable launch handoff.
 
@@ -968,6 +1020,8 @@ def start_sandbox_launch_driver(
         cpu_period=cpu_period,
         pids_max=pids_max,
         timeout_seconds=timeout_seconds,
+        provider_egress_policy_name=provider_egress_policy_name,
+        provider_egress_destinations=provider_egress_destinations,
     )
     _reject_runner_credential_in_command(request, credential)
     _validate_runner_credential(credential)
@@ -1590,6 +1644,86 @@ def _record_driver_exit_with_lease_recovery(
     return record(allow_quarantined_failure=True)
 
 
+def _remove_empty_provider_proxy_directory(
+    directory: Path, expected_identity: tuple[int, int]
+) -> None:
+    """Remove only the exact, empty provider directory after its listener closes."""
+
+    if (
+        not directory.is_absolute()
+        or directory != directory.resolve(strict=False)
+        or directory.parent == directory
+        or type(expected_identity) is not tuple
+        or len(expected_identity) != 2
+        or any(type(part) is not int or part < 0 for part in expected_identity)
+    ):
+        raise SandboxLaunchDriverServiceError("provider proxy directory identity is invalid")
+    parent = directory.parent
+    try:
+        parent_info = parent.lstat()
+    except OSError as error:
+        raise SandboxLaunchDriverServiceError(
+            "provider runtime directory is unavailable"
+        ) from error
+    if (
+        parent.resolve(strict=True) != parent
+        or not stat.S_ISDIR(parent_info.st_mode)
+        or stat.S_ISLNK(parent_info.st_mode)
+        or parent_info.st_uid != os.geteuid()
+        or stat.S_IMODE(parent_info.st_mode) != 0o700
+    ):
+        raise SandboxLaunchDriverServiceError("provider runtime directory is unsafe")
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    try:
+        parent_fd = os.open(parent, flags)
+    except OSError as error:
+        raise SandboxLaunchDriverServiceError("provider runtime directory changed") from error
+    try:
+        opened_parent = os.fstat(parent_fd)
+        if (opened_parent.st_dev, opened_parent.st_ino) != (parent_info.st_dev, parent_info.st_ino):
+            raise SandboxLaunchDriverServiceError("provider runtime directory identity changed")
+        try:
+            directory_info = os.stat(directory.name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        if (
+            not stat.S_ISDIR(directory_info.st_mode)
+            or directory_info.st_uid != os.geteuid()
+            or stat.S_IMODE(directory_info.st_mode) != 0o700
+            or (directory_info.st_dev, directory_info.st_ino) != expected_identity
+        ):
+            raise SandboxLaunchDriverServiceError("provider proxy directory identity changed")
+        directory_fd = os.open(directory.name, flags, dir_fd=parent_fd)
+        try:
+            opened_directory = os.fstat(directory_fd)
+            if (opened_directory.st_dev, opened_directory.st_ino) != expected_identity:
+                raise SandboxLaunchDriverServiceError(
+                    "provider proxy directory changed before removal"
+                )
+            if os.listdir(directory_fd):
+                raise SandboxLaunchDriverServiceError("provider proxy directory is not empty")
+            os.rmdir(directory.name, dir_fd=parent_fd)
+            os.fsync(parent_fd)
+        finally:
+            os.close(directory_fd)
+        try:
+            os.stat(directory.name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        raise SandboxLaunchDriverServiceError("provider proxy directory remains after removal")
+    except OSError as error:
+        raise SandboxLaunchDriverServiceError(
+            "provider proxy directory cleanup is unverified"
+        ) from error
+    finally:
+        os.close(parent_fd)
+
+
 def _execute_pinned_request(
     supervisor: GitSupervisor,
     expected_identity: tuple[str, int, str],
@@ -1638,22 +1772,84 @@ def _execute_pinned_request(
     if pid_file.exists():
         raise SandboxLaunchDriverServiceError("runc init PID file already exists")
     resources = request["resource_limits"]
-    config = oci_worker.build_oci_worker_config(
-        bundle_root,
-        workspace_snapshot,
-        request["command"],
-        rootfs_pin=rootfs_pin,
-        container_id=container_id,
-        memory_bytes=resources["memory_max_bytes"],
-        cpu_quota_us=resources["cpu_quota"],
-        cpu_period_us=resources["cpu_period"],
-        pids_limit=resources["pids_max"],
-    )
-    runtime_binding = oci_worker._apply_pinned_runc_recursive_private_policy(
-        config,
-        runc_pin,
-        expected_version=supervisor.config.oci_runc_version,
-    )
+    provider_policy_spec = request.get("provider_egress_policy")
+    provider_egress_policy: ProviderEgressPolicy | None = None
+    provider_proxy_directory: Path | None = None
+    provider_proxy_directory_identity: tuple[int, int] | None = None
+    provider_proxy_listener: provider_proxy.AttemptProviderProxyListener | None = None
+    provider_proxy_service: provider_proxy.AttemptProviderProxyService | None = None
+    provider_proxy_closed = False
+
+    def close_provider_proxy() -> None:
+        nonlocal provider_proxy_closed
+        if provider_proxy_closed:
+            return
+        if provider_proxy_service is not None:
+            provider_proxy_service.close(timeout=10.0)
+        elif provider_proxy_listener is not None:
+            provider_proxy_listener.close()
+        if provider_proxy_directory is not None and provider_proxy_directory_identity is not None:
+            _remove_empty_provider_proxy_directory(
+                provider_proxy_directory, provider_proxy_directory_identity
+            )
+        provider_proxy_closed = True
+
+    try:
+        if provider_policy_spec is not None:
+            provider_egress_policy = ProviderEgressPolicy(provider_policy_spec["destinations"])
+            provider_proxy_directory, expected_socket_path = (
+                sandbox_monitor_lifecycle.sandbox_provider_proxy_control_paths(
+                    state_path=state_root,
+                    expected_identity=expected_identity,
+                )
+            )
+            try:
+                provider_proxy_directory.mkdir(mode=0o700)
+            except FileExistsError as error:
+                raise SandboxLaunchDriverServiceError(
+                    "provider proxy directory already exists; refusing takeover"
+                ) from error
+            directory_info = provider_proxy_directory.lstat()
+            if (
+                not stat.S_ISDIR(directory_info.st_mode)
+                or stat.S_ISLNK(directory_info.st_mode)
+                or directory_info.st_uid != os.geteuid()
+                or stat.S_IMODE(directory_info.st_mode) != 0o700
+            ):
+                raise SandboxLaunchDriverServiceError("provider proxy directory is unsafe")
+            provider_proxy_directory_identity = (directory_info.st_dev, directory_info.st_ino)
+            provider_proxy_listener = provider_proxy.AttemptProviderProxyListener(
+                provider_proxy_directory
+            )
+            if provider_proxy_listener.path != expected_socket_path:
+                raise SandboxLaunchDriverServiceError(
+                    "provider proxy listener path differs from its exact attempt path"
+                )
+        config = oci_worker.build_oci_worker_config(
+            bundle_root,
+            workspace_snapshot,
+            request["command"],
+            rootfs_pin=rootfs_pin,
+            container_id=container_id,
+            memory_bytes=resources["memory_max_bytes"],
+            cpu_quota_us=resources["cpu_quota"],
+            cpu_period_us=resources["cpu_period"],
+            pids_limit=resources["pids_max"],
+            provider_proxy_listener=provider_proxy_listener,
+        )
+        runtime_binding = oci_worker._apply_pinned_runc_recursive_private_policy(
+            config,
+            runc_pin,
+            expected_version=supervisor.config.oci_runc_version,
+        )
+    except BaseException as setup_error:
+        try:
+            close_provider_proxy()
+        except BaseException as close_error:
+            setup_error.add_note(
+                f"provider proxy setup cleanup is unverified: {type(close_error).__name__}"
+            )
+        raise
     submission: Any | None = None
 
     def authorize(target: oci_worker._RuncLaunchTarget) -> Any:
@@ -1761,6 +1957,15 @@ def _execute_pinned_request(
         )
         if running["phase"] != "running":
             raise SandboxLaunchDriverServiceError("running transition was not durable")
+        if provider_proxy_listener is not None and provider_egress_policy is not None:
+            provider_proxy_service = provider_proxy.AttemptProviderProxyService(
+                provider_proxy_listener,
+                provider_egress_policy,
+                authorize_peer=provider_proxy.attempt_scoped_peer_authorizer(attestation),
+            )
+            # Start only after collector-issued runtime attestation is durable,
+            # but before candidate code can pass the inherited launch gate.
+            provider_proxy_service.start()
         handle.release_gate()
         supervisor.heartbeat(attempt_id, claim_token, None, credential=credential)
         try:
@@ -1780,6 +1985,7 @@ def _execute_pinned_request(
                 monitor_client=handle._monitor_client,
             )
             wait_receipt = handle.wait()
+        close_provider_proxy()
         _record_driver_exit_with_lease_recovery(
             supervisor,
             expected_identity,
@@ -1810,7 +2016,13 @@ def _execute_pinned_request(
             credential=credential,
             _allow_quarantined_failure=lease_loss_quarantine,
         )
-    except BaseException:
+    except BaseException as launch_error:
+        try:
+            close_provider_proxy()
+        except BaseException as close_error:
+            launch_error.add_note(
+                f"provider proxy shutdown is unverified: {type(close_error).__name__}"
+            )
         if handle is not None:
             try:
                 handle.close_gate()
@@ -1894,6 +2106,8 @@ def start_registered_no_model_sandbox_worker(
     startup_timeout_seconds: float = 15.0,
     credential: str | None = None,
     experimental_opt_in: bool = False,
+    provider_egress_policy_name: str | None = None,
+    provider_egress_destinations: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], SandboxLaunchDriverReceipt]:
     """Compose a registered attempt with the production OCI launch service.
 
@@ -1939,6 +2153,8 @@ def start_registered_no_model_sandbox_worker(
         cpu_period=cpu_period,
         pids_max=pids_max,
         timeout_seconds=timeout_seconds,
+        provider_egress_policy_name=provider_egress_policy_name,
+        provider_egress_destinations=provider_egress_destinations,
     )
     _reject_runner_credential_in_command(preflight_request, credential)
     validated_command = tuple(preflight_request["command"])
@@ -2081,6 +2297,12 @@ def start_registered_no_model_sandbox_worker(
             timeout_seconds=timeout_seconds,
             startup_timeout_seconds=startup_timeout_seconds,
             credential=credential,
+            provider_egress_policy_name=preflight_request.get("provider_egress_policy", {}).get(
+                "name"
+            ),
+            provider_egress_destinations=preflight_request.get("provider_egress_policy", {}).get(
+                "destinations"
+            ),
         )
         try:
             _wait_for_driver_running_handoff(

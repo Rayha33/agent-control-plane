@@ -4025,3 +4025,41 @@ visibility/leak tests. Then exercise the composition through registered
 OCI test, test receipt, and injected resolver/dial hooks are not production
 integration evidence. No provider policy, worker seccomp rule, mount policy,
 or configured-OCI default was changed by this design review.
+
+### Attempt-scoped provider UDS lifecycle (2026-10-22; source and unit proof)
+
+The first implementation stage now connects the production launch-driver
+service to the existing provider-neutral CONNECT handler, but only through the
+explicit no-model sandbox composition and a separately named destination
+policy. The authenticated launch request contains the normalized policy and
+binds it into the one-shot request digest. Without that field, the existing
+request shape and default OCI config remain unchanged. `run_worker()` does not
+yet expose provider options, fake credentials, or a provider-enabled worker
+mode.
+
+For an opted-in request, the launch driver derives a short deterministic
+directory name from the exact execution identity beneath the already-private
+`XDG_RUNTIME_DIR`; it refuses collisions instead of taking over an existing
+path. It binds one AF_UNIX listener and adds only that directory as a
+read-only `ro,nosuid,nodev,noexec` mount at `/run/acp`, with the socket path
+passed as a fixed worker environment value. The listener service starts only
+after collector-issued runtime attestation and the durable `running` record,
+but before the inherited runc gate is released. The existing peer authorizer
+still treats the exact worker cgroup as the principal and fails closed when
+kernel PIDFD or proc/cgroup checks are unavailable. After the exact runc wait,
+the normal path closes tracked channels and tunnels, joins handlers, and
+removes only its empty directory. The error path first closes/revokes the
+proxy, then uses the existing exact-monitor stop/cancel flow; an unverified
+close is recorded and does not satisfy cleanup. Independent postflight can
+remove a stale mode-0600 socket and mode-0700 directory only after the
+recorded units, processes, and cgroup are quiescent; unknown entries or
+identity changes remain fenced.
+
+This is not end-to-end Linux qualification: the current increment has focused
+source/unit coverage, but has not exercised this launch-driver composition on
+the disposable guest. It adds no TCP-to-UDS bridge, no seccomp relaxation, no
+fake-credential channel, no real provider credential or paid call, and no
+default-path enablement. The earlier direct-runc UDS test remains primitive
+evidence; the next gate is a disposable-Linux test of this exact service
+lifecycle and cancellation path, then separately reviewed bridge/credential
+stages before any general `run_worker()` composition.

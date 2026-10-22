@@ -517,6 +517,333 @@ def test_request_is_canonical_private_and_bound_to_the_execution(tmp_path: Path)
         _read_request(path, ("attempt-1", 8, "execution-1"))
 
 
+def test_named_provider_policy_is_canonical_and_bound_to_the_launch_request(
+    tmp_path: Path,
+) -> None:
+    tmp_path.chmod(0o700)
+    request = _validate_request(
+        expected_identity=_IDENTITY,
+        command=("/bin/busybox", "true"),
+        timeout_seconds=30,
+        provider_egress_policy_name="openai-api",
+        provider_egress_destinations={
+            "API.Example.com.": [443],
+            "static.example.com": [8443, 443],
+        },
+        **_RESOURCES,
+    )
+
+    assert request["provider_egress_policy"] == {
+        "name": "openai-api",
+        "destinations": {
+            "api.example.com": [443],
+            "static.example.com": [443, 8443],
+        },
+    }
+    path = tmp_path / "provider-launch-request.json"
+    digest = _write_request(path, request)
+    restored, restored_digest = _read_request(path, _IDENTITY)
+    assert restored == request
+    assert restored_digest == digest
+
+
+@pytest.mark.parametrize(
+    ("name", "destinations"),
+    [
+        (None, {"api.example.com": [443]}),
+        ("openai-api", None),
+        ("OpenAI API", {"api.example.com": [443]}),
+        ("openai-api", {}),
+        ("openai-api", {"127.0.0.1": [443]}),
+        ("openai-api", {"api.example.com": [True]}),
+    ],
+)
+def test_invalid_named_provider_policy_fails_before_request_creation(
+    name: Any, destinations: Any
+) -> None:
+    with pytest.raises(SandboxLaunchDriverServiceError, match="provider egress policy"):
+        _validate_request(
+            expected_identity=_IDENTITY,
+            command=("/bin/busybox", "true"),
+            timeout_seconds=30,
+            provider_egress_policy_name=name,
+            provider_egress_destinations=destinations,
+            **_RESOURCES,
+        )
+
+
+@pytest.mark.parametrize("cancel_after_release", [False, True])
+def test_pinned_request_starts_provider_proxy_before_gate_and_closes_after_wait_or_cancel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cancel_after_release: bool
+) -> None:
+    from agent_control_plane.supervisor import sandbox_launch_driver_service as service
+
+    events: list[str] = []
+    state_root = tmp_path / "state"
+    state_root.mkdir(mode=0o700)
+    bundle_root = tmp_path / "bundle"
+    workspace_root = tmp_path / "workspace"
+    rootfs_pin = SimpleNamespace(sha256="a" * 64)
+    runc_pin = SimpleNamespace(sha256="b" * 64)
+    resources = {
+        "memory_max_bytes": _RESOURCES["memory_max_bytes"],
+        "cpu_quota": _RESOURCES["cpu_quota"],
+        "cpu_period": _RESOURCES["cpu_period"],
+        "pids_max": _RESOURCES["pids_max"],
+    }
+    attempt_slice = sandbox_attempt_slice_unit(*_IDENTITY)
+    container_id = "test-container"
+    scope_unit = f"acp-{container_id}.scope"
+    slice_cgroup = f"/user.slice/user-acp.slice/{attempt_slice}"
+    scope_cgroup = f"{slice_cgroup}/{scope_unit}"
+    execution: dict[str, Any] = {
+        "attempt_id": _IDENTITY[0],
+        "claim_token": _IDENTITY[1],
+        "execution_id": _IDENTITY[2],
+        "phase": "reserved",
+        "launch_driver_start_redeemed_pid": os.getpid(),
+        "launch_driver_start_unit": "acp-launch-driver.service",
+        "monitor_pid": 4321,
+        "monitor_identity": "linux:4321:12345",
+        "wrapper_unit": "acp-monitor.service",
+        "wrapper_invocation_id": "1" * 32,
+    }
+    state_info = state_root.lstat()
+    durable = {
+        "workspace_root_path": str(workspace_root),
+        "baseline_manifest_json": "{}",
+        "workspace_root_dev": 1,
+        "workspace_root_ino": 2,
+        "baseline_manifest_digest": "c" * 64,
+        "bundle_path": str(bundle_root),
+        "state_path": str(state_root),
+        "state_root_dev": state_info.st_dev,
+        "state_root_ino": state_info.st_ino,
+        "container_id": container_id,
+    }
+
+    class Connection:
+        def __enter__(self) -> Connection:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        @staticmethod
+        def execute(*_args: object) -> Connection:
+            return Connection()
+
+        @staticmethod
+        def fetchone() -> dict[str, Any]:
+            return durable
+
+    supervisor = SimpleNamespace(
+        config=SimpleNamespace(
+            oci_rootfs_pin=rootfs_pin,
+            oci_runc_executable=runc_pin,
+            oci_runc_version="1.5.2",
+        ),
+        connect=lambda: Connection(),
+        _sandbox_execution_get=lambda _attempt_id: execution,
+        _sandbox_execution_restore_workspace_binding=lambda *_args, **_kwargs: None,
+        _sandbox_execution_authorize_launch_submission=lambda *_args, **_kwargs: object(),
+        _sandbox_execution_record_launch=lambda *_args, **_kwargs: (
+            events.append("record_launched") or execution.update(phase="launched")
+        ),
+        _sandbox_execution_record_running=lambda *_args, **_kwargs: (
+            events.append("record_running") or {"phase": "running"}
+        ),
+        _sandbox_execution_record_cleanup_report=lambda *_args, **_kwargs: events.append(
+            "record_cleanup"
+        ),
+        heartbeat=lambda *_args, **_kwargs: None,
+    )
+
+    class Listener:
+        def __init__(self, directory: Path) -> None:
+            self.path = directory / "provider.sock"
+
+        def close(self) -> None:
+            events.append("listener_close")
+
+    class ProxyService:
+        def __init__(self, listener: Listener, _policy: object, *, authorize_peer: object) -> None:
+            self.listener = listener
+            assert authorize_peer is peer_authorizer
+
+        def start(self) -> None:
+            events.append("proxy_start")
+
+        def close(self, *, timeout: float) -> None:
+            assert timeout == 10.0
+            events.append("proxy_close")
+            self.listener.close()
+
+    peer_authorizer = object()
+    proxy_directory = state_root / "provider-proxy"
+    proxy_socket = proxy_directory / "provider.sock"
+    config_listener: list[object] = []
+
+    monkeypatch.setattr(
+        service.sandbox_monitor_lifecycle,
+        "sandbox_provider_proxy_control_paths",
+        lambda **_kwargs: (proxy_directory, proxy_socket),
+    )
+    monkeypatch.setattr(service.provider_proxy, "AttemptProviderProxyListener", Listener)
+    monkeypatch.setattr(service.provider_proxy, "AttemptProviderProxyService", ProxyService)
+    monkeypatch.setattr(
+        service.provider_proxy,
+        "attempt_scoped_peer_authorizer",
+        lambda attestation: (
+            (events.append("authorize_attested_peer") or peer_authorizer)
+            if attestation is attestation_token
+            else pytest.fail("peer authorizer did not receive the collector attestation")
+        ),
+    )
+    monkeypatch.setattr(
+        service, "_restore_snapshot_from_record", lambda *_args, **_kwargs: object()
+    )
+
+    def build_config(*_args: object, **kwargs: object) -> object:
+        config_listener.append(kwargs["provider_proxy_listener"])
+        return object()
+
+    monkeypatch.setattr(service.oci_worker, "build_oci_worker_config", build_config)
+    monkeypatch.setattr(
+        service.oci_worker,
+        "_apply_pinned_runc_recursive_private_policy",
+        lambda *_args, **_kwargs: object(),
+    )
+
+    class Process:
+        @staticmethod
+        def poll() -> None:
+            return None
+
+    class Handle:
+        _monitor_client = object()
+
+        @staticmethod
+        def release_gate() -> None:
+            events.append("release_gate")
+
+        @staticmethod
+        def close_gate() -> None:
+            events.append("close_gate")
+
+        @staticmethod
+        def wait(*, timeout: float | None = None) -> object:
+            if timeout is not None:
+                assert timeout == 15.0
+                events.append("cancel_wait")
+            return object()
+
+    handle = Handle()
+
+    def spawn(
+        _binding: object, _state: Path, _bundle: Path, *args: object, **kwargs: object
+    ) -> Handle:
+        Path(args[1]).write_text("4322\n", encoding="ascii")
+        kwargs["_authorize_runc_submission"](object())
+        events.append("spawn_runc")
+        return handle
+
+    monkeypatch.setattr(service.oci_worker, "spawn_pinned_runc", spawn)
+    monkeypatch.setattr(service.oci_worker, "_runc_launch_pid", lambda _handle: 4322)
+    monkeypatch.setattr(
+        service.oci_worker, "_runc_launch_process_identity", lambda _handle: "linux:4322:12346"
+    )
+    monkeypatch.setattr(
+        service.oci_worker, "_runc_launch_process_for_testing", lambda _handle: Process()
+    )
+    monkeypatch.setattr(
+        service,
+        "_unit_properties",
+        lambda name, _properties: {
+            "ActiveState": "active",
+            "ControlGroup": slice_cgroup if name == attempt_slice else scope_cgroup,
+            "Id": name,
+            "InvocationID": "2" * 32,
+        },
+    )
+    attestation_token = object()
+    monkeypatch.setattr(
+        service,
+        "collect_running_runtime_attestation",
+        lambda **_kwargs: events.append("collect_attestation") or attestation_token,
+    )
+
+    def record_running(*_args: object, **_kwargs: object) -> dict[str, str]:
+        events.append("record_running")
+        execution["phase"] = "running"
+        return {"phase": "running"}
+
+    supervisor._sandbox_execution_record_running = record_running
+
+    def wait_for_runc(*_args: object, **_kwargs: object) -> object:
+        events.append("wait")
+        if cancel_after_release:
+            raise KeyboardInterrupt
+        return object()
+
+    monkeypatch.setattr(service, "_wait_for_runc_with_attempt_heartbeat", wait_for_runc)
+
+    def record_exit(*_args: object, **_kwargs: object) -> None:
+        events.append("record_exit")
+        execution["phase"] = "exited"
+
+    monkeypatch.setattr(service, "_record_driver_exit_with_lease_recovery", record_exit)
+    if cancel_after_release:
+
+        def cancel_exact_attempt(*_args: object, **_kwargs: object) -> None:
+            events.append("cancel_exact_attempt")
+            execution["phase"] = "stopping"
+
+        monkeypatch.setattr(
+            service, "_request_driver_failure_stop_and_cancel_monitor", cancel_exact_attempt
+        )
+    monkeypatch.setattr(
+        service.oci_worker, "_delete_pinned_runc_container", lambda *_args, **_kwargs: object()
+    )
+
+    def execute_request() -> None:
+        service._execute_pinned_request(
+            supervisor,  # type: ignore[arg-type]
+            _IDENTITY,
+            {
+                "command": ["fake-worker", "--no-model"],
+                "resource_limits": resources,
+                "timeout_seconds": 30,
+                "provider_egress_policy": {
+                    "name": "openai-api",
+                    "destinations": {"api.example.com": [443]},
+                },
+            },
+            credential=None,
+        )
+
+    if cancel_after_release:
+        with pytest.raises(KeyboardInterrupt):
+            execute_request()
+    else:
+        execute_request()
+
+    assert len(config_listener) == 1 and isinstance(config_listener[0], Listener)
+    assert events.index("record_running") < events.index("proxy_start")
+    assert events.index("authorize_attested_peer") < events.index("proxy_start")
+    assert events.index("proxy_start") < events.index("release_gate")
+    assert events.index("release_gate") < events.index("wait")
+    assert events.index("wait") < events.index("proxy_close")
+    assert events.index("proxy_close") < events.index("record_exit")
+    assert events.index("listener_close") < events.index("record_exit")
+    if cancel_after_release:
+        assert events.index("proxy_close") < events.index("close_gate")
+        assert events.index("close_gate") < events.index("cancel_exact_attempt")
+        assert events.index("cancel_exact_attempt") < events.index("cancel_wait")
+        assert events.index("cancel_wait") < events.index("record_exit")
+    assert not proxy_directory.exists()
+
+
 def test_timeout_records_exact_stop_intent_before_monitor_cancel() -> None:
     events: list[tuple[object, ...]] = []
     credential = "runner-secret"

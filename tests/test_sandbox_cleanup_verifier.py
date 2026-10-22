@@ -21,6 +21,11 @@ if not _RUNTIME_TMP_DIR.is_dir() or _RUNTIME_TMP_DIR.is_symlink():
 def _proof(report_json: str) -> str:
     report_digest = hashlib.sha256(report_json.encode("utf-8")).hexdigest()
     container_id = verifier.sandbox_monitor_receipt.sandbox_container_id("attempt-1", 7, "exec-1")
+    provider_directory = Path("/run/user/1000") / (
+        verifier.sandbox_monitor_lifecycle.sandbox_provider_proxy_directory_name(
+            ("attempt-1", 7, "exec-1")
+        )
+    )
 
     def snapshot(unit: str, invocation: str, cgroup: str, active: str = "inactive"):
         return {
@@ -107,6 +112,16 @@ def _proof(report_json: str) -> str:
                         "removed": False,
                         "absent": True,
                     },
+                    "provider_proxy_directory": {
+                        "path": str(provider_directory),
+                        "socket_path": str(provider_directory / "provider.sock"),
+                        "device": None,
+                        "inode": None,
+                        "socket_device": None,
+                        "socket_inode": None,
+                        "removed": False,
+                        "absent": True,
+                    },
                 },
             },
         }
@@ -160,6 +175,7 @@ def _verification_row(report_json: str, exit_code: int = 0) -> dict[str, object]
         "init_pid": 24,
         "init_identity": "linux:24:104",
         "bundle_path": "/tmp/acp/attempt-1/bundle",
+        "state_path": "/tmp/acp/attempt-1/state",
         "execution_root_dev": 1,
         "execution_root_ino": 2,
     }
@@ -179,6 +195,20 @@ def test_persisted_verification_receipt_is_bound_to_exact_cleanup_report(exit_co
     forged["observations"]["paths"]["monitor_socket"]["path"] = "/run/user/1000/acpmon-wrong.sock"
     assert not verifier._sandbox_cleanup_verification_json_is_self_consistent(
         row, canonical_json(forged)
+    )
+
+    forged_proxy_path = json.loads(proof)
+    forged_proxy_path["observations"]["paths"]["provider_proxy_directory"]["socket_path"] = (
+        "/run/user/1000/other.sock"
+    )
+    assert not verifier._sandbox_cleanup_verification_json_is_self_consistent(
+        row, canonical_json(forged_proxy_path)
+    )
+
+    legacy = json.loads(proof)
+    del legacy["observations"]["paths"]["provider_proxy_directory"]
+    assert verifier._sandbox_cleanup_verification_json_is_self_consistent(
+        row, canonical_json(legacy)
     )
 
     failed_service = json.loads(proof)
@@ -618,3 +648,78 @@ def test_monitor_socket_cleanup_refuses_non_socket_target(
     with pytest.raises(SupervisorError, match="socket identity is unsafe"):
         verifier._remove_monitor_socket(row)
     assert socket_path.read_text(encoding="ascii") == "keep"
+
+
+def test_cleanup_removes_only_the_exact_stale_provider_proxy_directory(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime_context = tempfile.TemporaryDirectory(prefix="acppx-", dir=_RUNTIME_TMP_DIR)
+    request.addfinalizer(runtime_context.cleanup)
+    runtime_directory = Path(runtime_context.name) / "runtime"
+    runtime_directory.mkdir(mode=0o700)
+    runtime_directory.chmod(0o700)
+    directory_name = verifier.sandbox_monitor_lifecycle.sandbox_provider_proxy_directory_name(
+        ("attempt-1", 7, "exec-1")
+    )
+    provider_directory = runtime_directory / directory_name
+    provider_directory.mkdir(mode=0o700)
+    provider_directory.chmod(0o700)
+    socket_path = provider_directory / "provider.sock"
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(socket_path))
+    socket_path.chmod(0o600)
+    listener.close()
+    monkeypatch.setattr(
+        verifier.sandbox_monitor_lifecycle,
+        "sandbox_provider_proxy_control_paths",
+        lambda **_kwargs: (provider_directory, socket_path),
+    )
+    row = {
+        "attempt_id": "attempt-1",
+        "claim_token": 7,
+        "execution_id": "exec-1",
+        "state_path": "/tmp/acp/attempt-1/state",
+    }
+
+    removed = verifier._remove_provider_proxy_directory(row)
+
+    assert removed["removed"] is True
+    assert removed["absent"] is True
+    assert removed["socket_device"] is not None
+    assert not os.path.lexists(socket_path)
+    assert not os.path.lexists(provider_directory)
+
+
+def test_cleanup_refuses_unknown_provider_directory_entries(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime_context = tempfile.TemporaryDirectory(prefix="acppx-", dir=_RUNTIME_TMP_DIR)
+    request.addfinalizer(runtime_context.cleanup)
+    runtime_directory = Path(runtime_context.name) / "runtime"
+    runtime_directory.mkdir(mode=0o700)
+    runtime_directory.chmod(0o700)
+    directory_name = verifier.sandbox_monitor_lifecycle.sandbox_provider_proxy_directory_name(
+        ("attempt-1", 7, "exec-1")
+    )
+    provider_directory = runtime_directory / directory_name
+    provider_directory.mkdir(mode=0o700)
+    provider_directory.chmod(0o700)
+    unknown = provider_directory / "not-the-proxy.sock"
+    unknown.write_text("preserve", encoding="ascii")
+    monkeypatch.setattr(
+        verifier.sandbox_monitor_lifecycle,
+        "sandbox_provider_proxy_control_paths",
+        lambda **_kwargs: (provider_directory, provider_directory / "provider.sock"),
+    )
+    row = {
+        "attempt_id": "attempt-1",
+        "claim_token": 7,
+        "execution_id": "exec-1",
+        "state_path": "/tmp/acp/attempt-1/state",
+    }
+
+    with pytest.raises(SupervisorError, match="unknown entries"):
+        verifier._remove_provider_proxy_directory(row)
+
+    assert unknown.read_text(encoding="ascii") == "preserve"
+    assert provider_directory.is_dir()

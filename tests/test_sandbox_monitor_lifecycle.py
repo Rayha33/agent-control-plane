@@ -23,6 +23,7 @@ from agent_control_plane.supervisor.sandbox_monitor_ipc import (
 from agent_control_plane.supervisor.sandbox_monitor_lifecycle import (
     sandbox_monitor_cancel_request_id,
     sandbox_monitor_control_paths,
+    sandbox_provider_proxy_control_paths,
 )
 from agent_control_plane.supervisor.sandbox_monitor_receipt import (
     SandboxMonitorReceipt,
@@ -231,6 +232,32 @@ def test_execution_control_paths_are_deterministic_and_socket_is_short(
     assert sandbox_monitor_cancel_request_id(identity) != sandbox_monitor_cancel_request_id(
         (identity[0], identity[1] + 1, identity[2])
     )
+
+
+def test_provider_proxy_control_paths_are_private_and_attempt_unique(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime_directory = Path("/run/user/1000")
+    state_path = tmp_path / "state"
+    identity = ("attempt-provider-path", 17, "a" * 32)
+    monkeypatch.setattr(
+        lifecycle,
+        "_trusted_systemd_command_environment",
+        lambda: {"XDG_RUNTIME_DIR": str(runtime_directory)},
+    )
+
+    first = sandbox_provider_proxy_control_paths(state_path=state_path, expected_identity=identity)
+    second = sandbox_provider_proxy_control_paths(state_path=state_path, expected_identity=identity)
+    other_attempt = sandbox_provider_proxy_control_paths(
+        state_path=state_path,
+        expected_identity=(identity[0], identity[1] + 1, identity[2]),
+    )
+
+    assert first == second
+    assert first[0].parent == runtime_directory
+    assert first[1] == first[0] / "provider.sock"
+    assert len(os.fsencode(first[1])) < 103
+    assert other_attempt[0] != first[0]
 
 
 def test_monitor_status_payload_binds_exact_scope_identity() -> None:

@@ -1,11 +1,13 @@
-"""Fail-closed destination policy primitives for a future provider egress proxy.
+"""Fail-closed destination policy primitives for the opt-in provider proxy.
 
-This module does not create a proxy, grant a worker network access, or wire into
-``run_worker``.  It provides the part that must be independently correct before
-any proxy can safely dial a provider: exact CONNECT-authority matching,
-whole-answer IP classification, and a numeric endpoint that can be connected
-without another DNS lookup.  TLS and certificate validation remain the worker
-client's responsibility.
+This module does not create a proxy or grant a worker network access. The
+explicit ``start_registered_no_model_sandbox_worker`` helper can bind a named
+policy into an attempt-scoped UDS proxy; generic ``run_worker`` exposes no
+provider options. This module provides the part that must be independently
+correct before the proxy can safely dial a provider: exact CONNECT-authority
+matching, whole-answer IP classification, and a numeric endpoint that can be
+connected without another DNS lookup. TLS and certificate validation remain
+the worker client's responsibility.
 """
 
 from __future__ import annotations
@@ -201,6 +203,17 @@ class ProviderEgressPolicy:
         if not normalized:
             raise EgressPolicyError("invalid_policy", "at least one exact destination is required")
         self._destinations = MappingProxyType(normalized)
+
+    @property
+    def destinations(self) -> dict[str, tuple[int, ...]]:
+        """Return a canonical, detached representation suitable for sealing.
+
+        The mutable input mapping is never retained. This copy is safe to place
+        in the authenticated launch request; each hostname and port set is
+        normalized and deterministically ordered.
+        """
+
+        return {host: tuple(sorted(ports)) for host, ports in sorted(self._destinations.items())}
 
     def resolve_connect_authority(self, authority: str) -> tuple[PinnedEndpoint, ...]:
         """Authorize a CONNECT authority and pin every system-resolver answer.

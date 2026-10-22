@@ -206,6 +206,50 @@ def sandbox_monitor_control_paths(
     return control_directory, receipt_path, socket_path
 
 
+def sandbox_provider_proxy_control_paths(
+    *, state_path: str | Path, expected_identity: tuple[str, int, str]
+) -> tuple[Path, Path]:
+    """Derive a short, attempt-unique provider socket directory and socket path.
+
+    The execution state path can be too long for ``sun_path``. The dedicated
+    directory therefore lives in the already-private systemd user runtime
+    directory, is derived from the exact execution identity, and is mounted
+    alone into the worker. It must never share the monitor's own control
+    socket directory contents with the worker.
+    """
+
+    directory_name = sandbox_provider_proxy_directory_name(expected_identity)
+    _, _, monitor_socket = sandbox_monitor_control_paths(
+        state_path=state_path, expected_identity=expected_identity
+    )
+    runtime_directory = monitor_socket.parent
+    directory = runtime_directory / directory_name
+    socket_path = directory / "provider.sock"
+    if (
+        not directory.is_absolute()
+        or str(directory) != os.path.normpath(str(directory))
+        or directory.parent != runtime_directory
+        or len(os.fsencode(socket_path)) >= 103
+    ):
+        raise SandboxMonitorReceiptError("provider proxy socket path is noncanonical or too long")
+    return directory, socket_path
+
+
+def sandbox_provider_proxy_directory_name(
+    expected_identity: tuple[str, int, str],
+) -> str:
+    """Derive a short, stable directory name from the exact execution identity."""
+
+    try:
+        container_id = sandbox_container_id(*expected_identity)
+    except (TypeError, SandboxMonitorReceiptError) as error:
+        raise SandboxMonitorReceiptError("provider proxy execution identity is invalid") from error
+    suffix = hashlib.sha256(
+        b"acp-provider-proxy-directory-v1\0" + container_id.encode("ascii")
+    ).hexdigest()[:32]
+    return f"acpprx-{suffix}"
+
+
 def sandbox_monitor_cancel_request_id(expected_identity: tuple[str, int, str]) -> str:
     """Return one execution-bound cancellation ID reusable after any timeout."""
 

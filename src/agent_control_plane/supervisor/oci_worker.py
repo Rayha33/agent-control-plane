@@ -2636,6 +2636,7 @@ def build_oci_worker_config(
     home_bytes: int = _DEFAULT_HOME_BYTES,
     private_git: bool = False,
     apparmor_profile: str | None = None,
+    provider_proxy_listener: Any | None = None,
     host_uid: int | None = None,
     host_gid: int | None = None,
 ) -> dict[str, Any]:
@@ -2713,6 +2714,37 @@ def build_oci_worker_config(
     read_snapshot_files(workspace_snapshot)
     if type(private_git) is not bool:
         raise SupervisorError("invalid_oci_worker_policy", "private_git must be a boolean")
+    provider_proxy_directory: Path | None = None
+    if provider_proxy_listener is not None:
+        from .provider_proxy import AttemptProviderProxyListener
+
+        if type(provider_proxy_listener) is not AttemptProviderProxyListener:
+            raise SupervisorError(
+                "invalid_oci_worker_policy",
+                "provider proxy mount requires an exact owned attempt listener",
+            )
+        provider_proxy_directory = _private_directory(
+            provider_proxy_listener.directory,
+            code="invalid_oci_provider_proxy",
+            label="OCI worker provider proxy directory",
+        )
+        try:
+            socket_info = provider_proxy_listener.path.lstat()
+        except OSError as error:
+            raise SupervisorError(
+                "invalid_oci_provider_proxy", "provider proxy socket is unavailable"
+            ) from error
+        if (
+            provider_proxy_listener._closed
+            or provider_proxy_listener.path != provider_proxy_directory / "provider.sock"
+            or not stat.S_ISSOCK(socket_info.st_mode)
+            or socket_info.st_uid != os.geteuid()
+            or stat.S_IMODE(socket_info.st_mode) != 0o600
+            or (socket_info.st_dev, socket_info.st_ino) != provider_proxy_listener.identity
+        ):
+            raise SupervisorError(
+                "invalid_oci_provider_proxy", "provider proxy socket identity is unsafe"
+            )
     private_git_paths: dict[str, str] = {}
     if not isinstance(container_id, str) or not _CONTAINER_ID.fullmatch(container_id):
         raise SupervisorError("invalid_oci_worker_policy", "OCI container ID is invalid")
@@ -2765,7 +2797,12 @@ def build_oci_worker_config(
             "OCI worker mappings must match the non-root caller's effective identity",
         )
 
-    for destination in _MOUNT_DESTINATIONS:
+    mount_destinations = (
+        (*_MOUNT_DESTINATIONS, "/run/acp")
+        if provider_proxy_directory is not None
+        else _MOUNT_DESTINATIONS
+    )
+    for destination in mount_destinations:
         target = rootfs
         for component in Path(destination).parts[1:]:
             target = target / component
@@ -2801,6 +2838,8 @@ def build_oci_worker_config(
                 "GIT_CEILING_DIRECTORIES=/workspace",
             )
         )
+    if provider_proxy_directory is not None:
+        env.append("ACP_PROVIDER_PROXY_UNIX_SOCKET=/run/acp/provider.sock")
     namespace_types = ("user", "pid", "mount", "ipc", "uts", "cgroup", "network")
     launch_gate_script = _LAUNCH_GATE_SCRIPT
     if private_git:
@@ -2808,6 +2847,53 @@ def build_oci_worker_config(
             git_path=private_git_paths["git"],
             mkdir_path=private_git_paths["mkdir"],
             rmdir_path=private_git_paths["rmdir"],
+        )
+    worker_mounts = [
+        {
+            "destination": "/proc",
+            "type": "proc",
+            "source": "proc",
+            "options": ["nosuid", "nodev", "noexec", "ro"],
+        },
+        {
+            "destination": "/dev",
+            "type": "tmpfs",
+            "source": "tmpfs",
+            "options": [
+                "nosuid",
+                "noexec",
+                "mode=0755",
+                f"size={_DEFAULT_DEV_TMPFS_BYTES}",
+                f"nr_inodes={_DEFAULT_DEV_TMPFS_INODES}",
+            ],
+        },
+        {
+            "destination": "/workspace",
+            "type": "bind",
+            "source": str(workspace),
+            "options": ["bind", "rprivate", "rw", "nosuid", "nodev"],
+        },
+        {
+            "destination": "/tmp",
+            "type": "tmpfs",
+            "source": "tmpfs",
+            "options": ["nosuid", "nodev", "mode=1777", f"size={tmpfs}"],
+        },
+        {
+            "destination": "/home/agent",
+            "type": "tmpfs",
+            "source": "tmpfs",
+            "options": ["nosuid", "nodev", "mode=0700", f"size={home}"],
+        },
+    ]
+    if provider_proxy_directory is not None:
+        worker_mounts.append(
+            {
+                "destination": "/run/acp",
+                "type": "bind",
+                "source": str(provider_proxy_directory),
+                "options": ["bind", "ro", "nosuid", "nodev", "noexec"],
+            }
         )
     return _issue_compiler_oci_worker_config(
         {
@@ -2840,44 +2926,7 @@ def build_oci_worker_config(
                     "ambient": [],
                 },
             },
-            "mounts": [
-                {
-                    "destination": "/proc",
-                    "type": "proc",
-                    "source": "proc",
-                    "options": ["nosuid", "nodev", "noexec", "ro"],
-                },
-                {
-                    "destination": "/dev",
-                    "type": "tmpfs",
-                    "source": "tmpfs",
-                    "options": [
-                        "nosuid",
-                        "noexec",
-                        "mode=0755",
-                        f"size={_DEFAULT_DEV_TMPFS_BYTES}",
-                        f"nr_inodes={_DEFAULT_DEV_TMPFS_INODES}",
-                    ],
-                },
-                {
-                    "destination": "/workspace",
-                    "type": "bind",
-                    "source": str(workspace),
-                    "options": ["bind", "rprivate", "rw", "nosuid", "nodev"],
-                },
-                {
-                    "destination": "/tmp",
-                    "type": "tmpfs",
-                    "source": "tmpfs",
-                    "options": ["nosuid", "nodev", "mode=1777", f"size={tmpfs}"],
-                },
-                {
-                    "destination": "/home/agent",
-                    "type": "tmpfs",
-                    "source": "tmpfs",
-                    "options": ["nosuid", "nodev", "mode=0700", f"size={home}"],
-                },
-            ],
+            "mounts": worker_mounts,
             "linux": {
                 "uidMappings": [{"containerID": 0, "hostID": uid, "size": 1}],
                 "gidMappings": [{"containerID": 0, "hostID": gid, "size": 1}],
@@ -3042,11 +3091,23 @@ def _validate_complete_oci_worker_policy(config: dict[str, Any]) -> None:
         if not separator or not name or name in environment:
             reject()
         environment[name] = value
-    if environment not in (base_environment, base_environment | git_environment):
+    provider_proxy_environment = {"ACP_PROVIDER_PROXY_UNIX_SOCKET": "/run/acp/provider.sock"}
+    allowed_environments = (
+        base_environment,
+        base_environment | git_environment,
+        base_environment | provider_proxy_environment,
+        base_environment | git_environment | provider_proxy_environment,
+    )
+    if environment not in allowed_environments:
         reject()
+    provider_proxy_enabled = "ACP_PROVIDER_PROXY_UNIX_SOCKET" in environment
 
     mounts = config.get("mounts")
-    if type(mounts) is not list or len(mounts) != 5:
+    if (
+        type(mounts) is not list
+        or len(mounts) not in {5, 6}
+        or provider_proxy_enabled != (len(mounts) == 6)
+    ):
         reject()
     if not exact(
         mounts[0],
@@ -3114,6 +3175,21 @@ def _validate_complete_oci_worker_policy(config: dict[str, Any]) -> None:
         max_size_text = str(_MAX_INT64)
         if len(size_text) > len(max_size_text) or (
             len(size_text) == len(max_size_text) and size_text > max_size_text
+        ):
+            reject()
+
+    if provider_proxy_enabled:
+        provider_mount = mounts[5]
+        if (
+            type(provider_mount) is not dict
+            or set(provider_mount) != {"destination", "type", "source", "options"}
+            or provider_mount.get("destination") != "/run/acp"
+            or provider_mount.get("type") != "bind"
+            or not isinstance(provider_mount.get("source"), str)
+            or not Path(provider_mount["source"]).is_absolute()
+            or str(Path(provider_mount["source"])) != provider_mount["source"]
+            or ".." in Path(provider_mount["source"]).parts
+            or not exact(provider_mount.get("options"), ["bind", "ro", "nosuid", "nodev", "noexec"])
         ):
             reject()
 

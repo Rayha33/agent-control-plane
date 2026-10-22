@@ -54,6 +54,17 @@ def test_hostname_normalization_is_ascii_only_and_exact() -> None:
             normalize_hostname(value)
 
 
+def test_policy_destinations_are_canonical_detached_copy() -> None:
+    source = {"API.Example.com.": [8443, 443]}
+    egress = ProviderEgressPolicy(source)
+
+    normalized = egress.destinations
+    source["API.Example.com."][0] = 1
+    normalized["api.example.com"] = (2,)
+
+    assert egress.destinations == {"api.example.com": (443, 8443)}
+
+
 @pytest.mark.parametrize(
     ("authority", "expected"),
     [
