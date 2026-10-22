@@ -572,9 +572,12 @@ def test_invalid_named_provider_policy_fails_before_request_creation(
         )
 
 
-@pytest.mark.parametrize("cancel_after_release", [False, True])
-def test_pinned_request_starts_provider_proxy_before_gate_and_closes_after_wait_or_cancel(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cancel_after_release: bool
+@pytest.mark.parametrize(
+    "scenario",
+    ["complete", "cancel", "authorization_rejected", "authorization_commit_uncertain"],
+)
+def test_pinned_request_leaves_provider_directory_for_independent_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, scenario: str
 ) -> None:
     from agent_control_plane.supervisor import sandbox_launch_driver_service as service
 
@@ -684,6 +687,20 @@ def test_pinned_request_starts_provider_proxy_before_gate_and_closes_after_wait_
     proxy_socket = proxy_directory / "provider.sock"
     config_listener: list[object] = []
 
+    def authorize_submission(*_args: object, **_kwargs: object) -> object:
+        if scenario == "authorization_rejected":
+            raise RuntimeError("authorization rejected before commit")
+        if scenario == "authorization_commit_uncertain":
+            execution.update(
+                launch_submission_id="d" * 32,
+                launch_submission_digest="e" * 64,
+                launch_submission_at="2026-10-22T00:00:00Z",
+            )
+            raise RuntimeError("authorization response failed after commit")
+        return object()
+
+    supervisor._sandbox_execution_authorize_launch_submission = authorize_submission
+
     monkeypatch.setattr(
         service.sandbox_monitor_lifecycle,
         "sandbox_provider_proxy_control_paths",
@@ -782,7 +799,7 @@ def test_pinned_request_starts_provider_proxy_before_gate_and_closes_after_wait_
 
     def wait_for_runc(*_args: object, **_kwargs: object) -> object:
         events.append("wait")
-        if cancel_after_release:
+        if scenario == "cancel":
             raise KeyboardInterrupt
         return object()
 
@@ -793,7 +810,7 @@ def test_pinned_request_starts_provider_proxy_before_gate_and_closes_after_wait_
         execution["phase"] = "exited"
 
     monkeypatch.setattr(service, "_record_driver_exit_with_lease_recovery", record_exit)
-    if cancel_after_release:
+    if scenario == "cancel":
 
         def cancel_exact_attempt(*_args: object, **_kwargs: object) -> None:
             events.append("cancel_exact_attempt")
@@ -822,9 +839,19 @@ def test_pinned_request_starts_provider_proxy_before_gate_and_closes_after_wait_
             credential=None,
         )
 
-    if cancel_after_release:
+    if scenario == "cancel":
         with pytest.raises(KeyboardInterrupt):
             execute_request()
+    elif scenario in {"authorization_rejected", "authorization_commit_uncertain"}:
+        with pytest.raises(RuntimeError, match="authorization"):
+            execute_request()
+        assert events == ["listener_close"]
+        if scenario == "authorization_rejected":
+            assert not proxy_directory.exists()
+        else:
+            assert proxy_directory.is_dir()
+            assert list(proxy_directory.iterdir()) == []
+        return
     else:
         execute_request()
 
@@ -836,12 +863,15 @@ def test_pinned_request_starts_provider_proxy_before_gate_and_closes_after_wait_
     assert events.index("wait") < events.index("proxy_close")
     assert events.index("proxy_close") < events.index("record_exit")
     assert events.index("listener_close") < events.index("record_exit")
-    if cancel_after_release:
+    if scenario == "cancel":
         assert events.index("proxy_close") < events.index("close_gate")
         assert events.index("close_gate") < events.index("cancel_exact_attempt")
         assert events.index("cancel_exact_attempt") < events.index("cancel_wait")
         assert events.index("cancel_wait") < events.index("record_exit")
-    assert not proxy_directory.exists()
+    assert proxy_directory.is_dir()
+    assert list(proxy_directory.iterdir()) == []
+    # Directory deletion belongs to the independent postflight verifier, not
+    # this launch-driver process. Cleanup-verifier tests cover exact removal.
 
 
 def test_timeout_records_exact_stop_intent_before_monitor_cancel() -> None:

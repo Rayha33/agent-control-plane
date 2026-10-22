@@ -1779,6 +1779,31 @@ def _execute_pinned_request(
     provider_proxy_listener: provider_proxy.AttemptProviderProxyListener | None = None
     provider_proxy_service: provider_proxy.AttemptProviderProxyService | None = None
     provider_proxy_closed = False
+    launch_submission_attempted = False
+    submission: Any | None = None
+
+    def no_launch_submission_was_recorded() -> bool:
+        if not launch_submission_attempted:
+            return True
+        if submission is not None:
+            return False
+        try:
+            current = supervisor._sandbox_execution_get(attempt_id)
+        except Exception:
+            return False
+        return bool(
+            isinstance(current, dict)
+            and (
+                current.get("attempt_id"),
+                current.get("claim_token"),
+                current.get("execution_id"),
+            )
+            == expected_identity
+            and current.get("phase") == "reserved"
+            and not current.get("launch_submission_id")
+            and not current.get("launch_submission_digest")
+            and not current.get("launch_submission_at")
+        )
 
     def close_provider_proxy() -> None:
         nonlocal provider_proxy_closed
@@ -1788,7 +1813,17 @@ def _execute_pinned_request(
             provider_proxy_service.close(timeout=10.0)
         elif provider_proxy_listener is not None:
             provider_proxy_listener.close()
-        if provider_proxy_directory is not None and provider_proxy_directory_identity is not None:
+        # Once the durable runc-submission callback begins, its commit outcome
+        # may be ambiguous to this caller. Remove the directory here only if an
+        # exact durable reread proves the reserved execution has no submission
+        # latch; otherwise the independent cleanup verifier owns deletion.
+        # Runc's wait result alone does not prove that descendants have left the
+        # attempt cgroup.
+        if (
+            no_launch_submission_was_recorded()
+            and provider_proxy_directory is not None
+            and provider_proxy_directory_identity is not None
+        ):
             _remove_empty_provider_proxy_directory(
                 provider_proxy_directory, provider_proxy_directory_identity
             )
@@ -1850,10 +1885,10 @@ def _execute_pinned_request(
                 f"provider proxy setup cleanup is unverified: {type(close_error).__name__}"
             )
         raise
-    submission: Any | None = None
 
     def authorize(target: oci_worker._RuncLaunchTarget) -> Any:
-        nonlocal submission
+        nonlocal launch_submission_attempted, submission
+        launch_submission_attempted = True
         submission = supervisor._sandbox_execution_authorize_launch_submission(
             attempt_id, claim_token, launch_target=target, credential=credential
         )
