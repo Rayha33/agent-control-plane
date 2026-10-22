@@ -4394,3 +4394,44 @@ does not exercise provider credential delivery or egress, cancellation or
 crash-recovery through `run_worker()`, nor enable configured OCI execution by
 default. Provider-backed composition and broader task #3441/#2370 acceptance
 remain open.
+
+### Composed test-only FD4 canary through supervised `run_worker()` (2026-10-22)
+
+On base commit `e82f5f29e20b343bc9f0d84f354cd0fc89f3d221` plus the test-only
+harness diff (independent diff SHA-256
+`22da642d90b7cc7c7fc47eede36c022788f45c6efdb66bb46e433d66d8067206`), the
+exact pinned-runc lifecycle test passed **1/1** in the disposable Debian 12
+ARM64 guest `acp-2370-live-sandbox-kernel612-20261021` (kernel
+`6.12.95+deb12-cloud-arm64`, systemd `252.39`, Python `3.11.2`, rootless runc
+`1.5.2`). It ran with `ACP_LIVE_SUPERVISED_RUN_WORKER=1`,
+`ACP_LIVE_IMPORT_RESULT_AFTER_CLEANUP=1`, and the explicitly test-only
+`ACP_TEST_ALLOW_WORKER_CANARY=1` / `ACP_LIVE_WORKER_CANARY_FD4=1` settings.
+
+The composed path entered registered `GitSupervisor.run_worker()` through its
+existing private test seam, delivered a synthetic canary over FD4, completed
+the deterministic coding task, and returned `pending_qc` for the exact
+execution with cleanup verified. The host importer ran only after the
+independent cleanup verifier passed. Assertions checked the exact imported
+base and output paths, clean source worktree, and the canary's SHA-256-only
+result; the raw canary was absent from launch argv/environment, event payloads,
+SQLite, and the service log. This is test-only injection, not a production
+credential API. The guest and host matched these source/test hashes:
+
+| File | SHA-256 |
+| --- | --- |
+| `oci_worker.py` | `9731bedf92ffc0d6e0f368e23db722bc66d358f9cc025926154eb8c2f2f4f134` |
+| `sandbox_execution_journal.py` | `0000645f92f783fc45cd86b3d5da9d28e56da261f44e84f17391eafea474f70a` |
+| `sandbox_launch_driver_service.py` | `d68c16bbdf0ad86fbbdc6fb6df6bca07db399fa9c61214f159d5e3e867820865` |
+| `test_sandbox_worker_lifecycle_integration.py` | `c6d97d57d7d84d7f4781f93c1ce0b14598548ee0f7925aa26981aca8ea6aaae4` |
+
+Independent exact-diff review returned GO after correcting a test-payload
+marker collision; the reviewer did not run the guest. No provider proxy,
+provider credential, DNS/network request, model call, or paid call was used by
+the live worker run.
+Postflight found no test-specific ACP unit, worker process, or lifecycle temp
+root. The test's user manager remained active and the exact guest was stopped
+after cleanup. This proves only the opt-in synthetic-canary/no-provider
+composition and cleanup-gated import path. It does not prove provider-backed
+`run_worker()`, production credential delivery or egress, cancellation/crash
+recovery through `run_worker()`, or default-path enablement; broader #2370/#3441
+acceptance remains open.

@@ -14,8 +14,11 @@ test inside the private workspace, then imports the host-captured result into
 the normal pending-QC submission path. An explicit opt-in mode drives that
 fixture through ``WorkersMixin.run_worker`` and its verified-import boundary;
 it can be combined with the host-path probes to test those denials through the
-public supervisor path. These are no-model executor proofs; they do not start a
-provider/model worker or enable the default ``run_worker`` path.
+public supervisor path. A separate synthetic FD4 canary may be combined only
+with that supervised/import mode, proving the test-only descriptor handoff,
+cleanup verification, and digest-only result import in one no-provider run.
+These are no-model executor proofs; they do not start a provider/model worker
+or enable the default ``run_worker`` path.
 
 The legacy direct-monitor lifecycle fixture is intentionally skipped: it starts
 runc from a monitor-owned service and cannot satisfy the current launch-driver
@@ -1118,18 +1121,43 @@ raise SystemExit(sandbox_launch_driver_service.main(driver_args))
             capture_driver_service_output,
         ):
             if os.environ.get("ACP_LIVE_SUPERVISED_RUN_WORKER") == "1":
-                result = supervisor.run_worker(
-                    attempt_id,
-                    claim_token,
-                    command,
-                    credential,
-                    sandbox_experimental_opt_in=True,
-                    sandbox_memory_max_bytes=memory_max_bytes,
-                    sandbox_cpu_quota=cpu_quota,
-                    sandbox_cpu_period=cpu_period,
-                    sandbox_pids_max=pids_max,
-                    sandbox_timeout_seconds=timeout_seconds,
-                )
+                run_worker_kwargs = {
+                    "sandbox_experimental_opt_in": True,
+                    "sandbox_memory_max_bytes": memory_max_bytes,
+                    "sandbox_cpu_quota": cpu_quota,
+                    "sandbox_cpu_period": cpu_period,
+                    "sandbox_pids_max": pids_max,
+                    "sandbox_timeout_seconds": timeout_seconds,
+                }
+                if test_worker_canary is None:
+                    result = supervisor.run_worker(
+                        attempt_id,
+                        claim_token,
+                        command,
+                        credential,
+                        **run_worker_kwargs,
+                    )
+                else:
+                    original_start_registered = (
+                        sandbox_launch_driver_service.start_registered_no_model_sandbox_worker
+                    )
+
+                    def start_registered_with_test_canary(*args: Any, **kwargs: Any) -> Any:
+                        kwargs["_test_worker_canary"] = test_worker_canary
+                        return original_start_registered(*args, **kwargs)
+
+                    with patch.object(
+                        sandbox_launch_driver_service,
+                        "start_registered_no_model_sandbox_worker",
+                        start_registered_with_test_canary,
+                    ):
+                        result = supervisor.run_worker(
+                            attempt_id,
+                            claim_token,
+                            command,
+                            credential,
+                            **run_worker_kwargs,
+                        )
                 receipt_payload = result["sandbox_launch_receipt"]
                 result_summary = {
                     "status": result["status"],
@@ -3330,8 +3358,7 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
     )
     if worker_canary_fd4 and (
         os.environ.get("ACP_TEST_ALLOW_WORKER_CANARY") != "1"
-        or supervised_run_worker
-        or import_result_after_cleanup
+        or supervised_run_worker != import_result_after_cleanup
         or provider_proxy_uds
         or provider_proxy_cancel
         or cross_attempt_probes
@@ -3339,8 +3366,9 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
         or os.environ.get("ACP_LIVE_CRASH_AFTER_EXIT_BEFORE_CLEANUP_REPORT") == "1"
     ):
         pytest.fail(
-            "FD4 canary proof requires ACP_TEST_ALLOW_WORKER_CANARY=1 and the isolated "
-            "production no-model launch-driver mode"
+            "FD4 canary proof requires ACP_TEST_ALLOW_WORKER_CANARY=1 and either the isolated "
+            "production no-model launch-driver mode or the supervised run_worker plus "
+            "cleanup-verified import mode"
         )
     crash_after_exit_before_cleanup_report = (
         os.environ.get("ACP_LIVE_CRASH_AFTER_EXIT_BEFORE_CLEANUP_REPORT") == "1"
@@ -4135,6 +4163,24 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
                 "set -eu; "
                 "printf 'production-driver-started\\n' > /workspace/launch-driver-started; "
                 "/bin/provider-proxy-probe; "
+                "printf 'production-driver-ran\\n' > /workspace/launch-driver-marker",
+            )
+        elif worker_canary_fd4 and coding_task:
+            assert test_worker_canary is not None
+            payload_command = (
+                "/bin/busybox",
+                "sh",
+                "-c",
+                "set -eu; "
+                "/bin/busybox printf %s "
+                f"{shlex.quote(coding_source)} > /workspace/{coding_script_name}; "
+                f"coding_output=$(/bin/busybox sh /workspace/{coding_script_name}); "
+                "test \"$coding_output\" = 'coding-task-pass'; "
+                f"/bin/busybox printf '%s\\n' \"$coding_output\" > "
+                f"/workspace/{coding_test_output_name}; "
+                f"/bin/worker-canary-fd4-probe {len(test_worker_canary)}; "
+                "/bin/busybox printf 'probe-ok:coding-task\\n' "
+                ">> /workspace/launch-driver-started; "
                 "printf 'production-driver-ran\\n' > /workspace/launch-driver-marker",
             )
         elif worker_canary_fd4:
