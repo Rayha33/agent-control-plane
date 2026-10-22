@@ -4435,3 +4435,40 @@ composition and cleanup-gated import path. It does not prove provider-backed
 `run_worker()`, production credential delivery or egress, cancellation/crash
 recovery through `run_worker()`, or default-path enablement; broader #2370/#3441
 acceptance remains open.
+
+### Supervised result import with host-path isolation probes (2026-10-22)
+
+At commit `4ed4b73deab99ff2e83401492708fcec0125b97c`, the exact pinned-runc
+lifecycle test passed **1/1** in the same disposable Debian 12 ARM64 guest
+(kernel `6.12.95+deb12-cloud-arm64`, systemd `252.39`, Python `3.11.2`, rootless
+runc `1.5.2`) with `ACP_LIVE_ISOLATION_PROBES=1`, supervised `run_worker()`,
+and cleanup-gated result import enabled. The guest checkout matched the source
+and test hashes in the preceding section; the lifecycle test module was
+`c6d97d57d7d84d7f4781f93c1ce0b14598548ee0f7925aa26981aca8ea6aaae4`.
+
+In addition to the exact pending-QC import checks, the worker proved its
+assigned workspace writable and `.git` absent; `/tmp` and `/home/agent` were
+private tmpfs mounts; the minimal rootfs exposed only the copied BusyBox closure
+but not host `/usr`, and its `/etc` was read-only. Existence (`test -e`) and
+readability (`test -r`) checks could not see or read unique sentinels in host
+`/etc`, `/usr/local/share`, home,
+home config and SSH credential paths, host temp, the harness checkout, task
+base checkout, a sibling worktree, and an unrelated project; write probes
+against those sentinel paths were denied. Symlink and
+canonical-path escapes were denied; the worker could not see the host process
+sentinel, host-only UDS, or systemd socket. A direct-IP TCP attempt to the
+reserved test address failed with the expected permission-denied error. Only the
+expected task/driver outputs were imported, from the exact base, and the source
+worktree remained clean.
+
+Postflight found no ACP test units, worker process, fixture root, or remaining
+`acp-live-*` sentinel; the user manager was active and the exact guest was
+stopped after the run. The test uses privileged, uniquely named sentinels only
+inside this disposable guest and removes them by exact identity/content checks.
+It used no provider proxy or credential and made no DNS, provider/model, or
+paid request; the direct-IP probe is an expected denied attempt. This advances
+the opt-in Linux workspace/process/socket boundary and result-import evidence,
+but does not prove arbitrary hostile-kernel resistance, same-UID concurrent
+filesystem-mutation defense, provider-backed execution/egress, full crash or
+cancellation recovery through `run_worker()`, or default-path enablement.
+Acceptance #2370 remains open.
