@@ -641,6 +641,43 @@ def test_bundle_rootfs_copy_accepts_matching_tree_and_closure_pins(tmp_path: Pat
     assert config["root"] == {"path": "rootfs", "readonly": True}
 
 
+@pytest.mark.parametrize("private_git", [False, True])
+def test_worker_config_uses_fixed_provider_free_environment(
+    tmp_path: Path, private_git: bool
+) -> None:
+    bundle, workspace = oci_fixture(tmp_path)
+    if private_git:
+        for executable_name in ("git", "mkdir", "rmdir"):
+            executable = bundle / "rootfs" / "usr" / "bin" / executable_name
+            executable.write_text("fixture executable\n", encoding="ascii")
+            executable.chmod(0o700)
+
+    config = compile_config(bundle, workspace, private_git=private_git)
+
+    expected_environment = {
+        "ACP_PHASE=worker",
+        "ACP_REPO_ROOT=/workspace",
+        "ACP_RUNTIME_DIR=/tmp/acp-runtime",
+        "ACP_WORKTREE=/workspace",
+        "HOME=/home/agent",
+        "PATH=/usr/bin:/bin",
+        "TMPDIR=/tmp",
+    }
+    if private_git:
+        expected_environment.update(
+            {
+                "GIT_CONFIG_NOSYSTEM=1",
+                "GIT_CONFIG_GLOBAL=/dev/null",
+                "GIT_ATTR_NOSYSTEM=1",
+                "GIT_TERMINAL_PROMPT=0",
+                "GIT_CEILING_DIRECTORIES=/workspace",
+            }
+        )
+    actual_environment = config["process"]["env"]
+    assert len(actual_environment) == len(expected_environment)
+    assert set(actual_environment) == expected_environment
+
+
 def pinned_runc(repo_root: Path) -> oci_worker._TrustedRuncExecutable:
     return oci_worker._pin_trusted_runc_executable("/bin/sh", repo_root)
 
