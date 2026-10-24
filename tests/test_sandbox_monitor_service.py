@@ -468,6 +468,7 @@ def test_cancel_stops_only_the_bound_scope_and_verifies_inactive_empty_state(
         "_trusted_systemd_command_environment",
         lambda: {"XDG_RUNTIME_DIR": "/run/user/1000"},
     )
+    monkeypatch.setattr(monitor_service, "_SCOPE_CANCEL_GRACE_SECONDS", 0.0)
 
     response = monitor_service._cancel_scope(binding)
 
@@ -478,7 +479,7 @@ def test_cancel_stops_only_the_bound_scope_and_verifies_inactive_empty_state(
     assert binding.attempt_slice_unit not in calls[0]
 
 
-def test_cancel_accepts_an_already_stopping_exact_scope_without_another_stop_job(
+def test_cancel_escalates_an_already_stopping_exact_scope_only_after_grace(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     binding = _binding()
@@ -498,11 +499,124 @@ def test_cancel_accepts_an_already_stopping_exact_scope_without_another_stop_job
         "_run_trusted_runtime_command",
         lambda argv, **_kwargs: calls.append(argv) or b"",
     )
+    monkeypatch.setattr(
+        monitor_service, "_trusted_systemctl_executable", lambda: Path("/usr/bin/systemctl")
+    )
+    monkeypatch.setattr(
+        monitor_service,
+        "_trusted_systemd_command_environment",
+        lambda: {"XDG_RUNTIME_DIR": "/run/user/1000"},
+    )
+    monkeypatch.setattr(monitor_service, "_SCOPE_CANCEL_GRACE_SECONDS", 0.0)
+    monkeypatch.setattr(monitor_service, "_SCOPE_CANCEL_FORCE_WAIT_SECONDS", 0.0)
 
     response = monitor_service._cancel_scope(binding)
 
     assert response["phase"] == "stopping"
-    assert calls == []
+    assert len(calls) == 1
+    assert calls[0] == [
+        "/usr/bin/systemctl",
+        "--user",
+        "kill",
+        "--signal=SIGKILL",
+        "--kill-whom=all",
+        "--",
+        binding.scope_unit,
+    ]
+
+
+def test_cancel_force_kills_only_the_exact_scope_after_graceful_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    binding = _binding()
+    phases = iter(("running", "stopping", "exited"))
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        monitor_service,
+        "_scope_status",
+        lambda current: {
+            "phase": next(phases),
+            "scope_unit": current.scope_unit,
+            "scope_invocation_id": current.scope_invocation_id,
+            "scope_control_group": current.scope_control_group,
+        },
+    )
+    monkeypatch.setattr(
+        monitor_service,
+        "_run_trusted_runtime_command",
+        lambda argv, **_kwargs: calls.append(argv) or b"",
+    )
+    monkeypatch.setattr(
+        monitor_service, "_trusted_systemctl_executable", lambda: Path("/usr/bin/systemctl")
+    )
+    monkeypatch.setattr(
+        monitor_service,
+        "_trusted_systemd_command_environment",
+        lambda: {"XDG_RUNTIME_DIR": "/run/user/1000"},
+    )
+    monkeypatch.setattr(monitor_service, "_SCOPE_CANCEL_GRACE_SECONDS", 0.0)
+    monkeypatch.setattr(monitor_service, "_SCOPE_CANCEL_FORCE_WAIT_SECONDS", 0.0)
+
+    response = monitor_service._cancel_scope(binding)
+
+    assert response["phase"] == "exited"
+    assert calls == [
+        [
+            "/usr/bin/systemctl",
+            "--user",
+            "--no-block",
+            "stop",
+            "--",
+            binding.scope_unit,
+        ],
+        [
+            "/usr/bin/systemctl",
+            "--user",
+            "kill",
+            "--signal=SIGKILL",
+            "--kill-whom=all",
+            "--",
+            binding.scope_unit,
+        ],
+    ]
+
+
+def test_cancel_does_not_escalate_after_scope_identity_becomes_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    binding = _binding()
+    phases = iter(("running", "unknown"))
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        monitor_service,
+        "_scope_status",
+        lambda current: {
+            "phase": next(phases),
+            "scope_unit": current.scope_unit,
+            "scope_invocation_id": current.scope_invocation_id,
+            "scope_control_group": current.scope_control_group,
+        },
+    )
+    monkeypatch.setattr(
+        monitor_service,
+        "_run_trusted_runtime_command",
+        lambda argv, **_kwargs: calls.append(argv) or b"",
+    )
+    monkeypatch.setattr(
+        monitor_service, "_trusted_systemctl_executable", lambda: Path("/usr/bin/systemctl")
+    )
+    monkeypatch.setattr(
+        monitor_service,
+        "_trusted_systemd_command_environment",
+        lambda: {"XDG_RUNTIME_DIR": "/run/user/1000"},
+    )
+    monkeypatch.setattr(monitor_service, "_SCOPE_CANCEL_GRACE_SECONDS", 0.0)
+
+    with pytest.raises(monitor_service.SandboxMonitorServiceError):
+        monitor_service._cancel_scope(binding)
+
+    assert len(calls) == 1
+    assert calls[0][-3:] == ["stop", "--", binding.scope_unit]
 
 
 def test_cancel_refuses_activating_scope_without_acknowledging_stop(

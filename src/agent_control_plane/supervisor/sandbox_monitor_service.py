@@ -59,6 +59,9 @@ _BINDING_LIMIT = 4096
 _INVOCATION_ID = re.compile(r"[0-9a-f]{32}\Z")
 _SCOPE_UNIT = re.compile(r"[A-Za-z0-9_.:@\-]+\.scope\Z")
 _PROPERTY_SET = ("Id", "LoadState", "ActiveState", "InvocationID", "ControlGroup", "Slice")
+_SCOPE_CANCEL_GRACE_SECONDS = 2.0
+_SCOPE_CANCEL_FORCE_WAIT_SECONDS = 5.0
+_SCOPE_CANCEL_POLL_SECONDS = 0.05
 _MONITOR_PROPERTIES = (
     "Id",
     "LoadState",
@@ -691,33 +694,62 @@ def _scope_status(binding: SandboxMonitorScopeBinding) -> dict[str, Any]:
 
 def _cancel_scope(binding: SandboxMonitorScopeBinding) -> dict[str, Any]:
     initial = _scope_status(binding)
-    if initial["phase"] in {"stopping", "exited"}:
+    if initial["phase"] == "exited":
         return initial
-    if initial["phase"] != "running":
+    if initial["phase"] not in {"running", "stopping"}:
         raise SandboxMonitorServiceError("monitor refuses to cancel an unverified scope")
+    if initial["phase"] == "running":
+        _run_trusted_runtime_command(
+            [
+                str(_trusted_systemctl_executable()),
+                "--user",
+                "--no-block",
+                "stop",
+                "--",
+                binding.scope_unit,
+            ],
+            environment=_trusted_systemd_command_environment(),
+        )
+
+    def wait_for_exit(timeout_seconds: float) -> dict[str, Any]:
+        deadline = time.monotonic() + timeout_seconds
+        while True:
+            current = _scope_status(binding)
+            if current["phase"] in {"exited", "unknown"}:
+                return current
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return current
+            time.sleep(min(_SCOPE_CANCEL_POLL_SECONDS, remaining))
+
+    current = wait_for_exit(_SCOPE_CANCEL_GRACE_SECONDS)
+    if current["phase"] == "exited":
+        return current
+    if current["phase"] == "unknown":
+        raise SandboxMonitorServiceError("scope identity changed during cancellation")
+    if current["phase"] not in {"running", "stopping"}:
+        raise SandboxMonitorServiceError("scope cancellation reached an invalid state")
+
+    # systemd's inherited TimeoutStopSec may be 90 seconds, longer than the
+    # supervisor's bounded cancellation window. Escalate only after the exact
+    # bound scope remains verifiably live/stopping, and never target its parent
+    # attempt slice or a PID supplied by the controller.
     _run_trusted_runtime_command(
         [
             str(_trusted_systemctl_executable()),
             "--user",
-            "--no-block",
-            "stop",
+            "kill",
+            "--signal=SIGKILL",
+            "--kill-whom=all",
             "--",
             binding.scope_unit,
         ],
         environment=_trusted_systemd_command_environment(),
     )
-    deadline = time.monotonic() + 10.0
-    while time.monotonic() < deadline:
-        current = _scope_status(binding)
-        if current["phase"] in {"stopping", "exited"}:
-            return current
-        if current["phase"] == "unknown":
-            raise SandboxMonitorServiceError("scope identity changed during cancellation")
-        time.sleep(0.05)
-    current = _scope_status(binding)
-    if current["phase"] in {"stopping", "exited"}:
-        return current
-    raise SandboxMonitorServiceError("scope cancellation did not reach a verified state")
+    current = wait_for_exit(_SCOPE_CANCEL_FORCE_WAIT_SECONDS)
+    if current["phase"] not in {"stopping", "exited"}:
+        raise SandboxMonitorServiceError("scope did not stop after exact-scope force kill")
+    return current
 
 
 def _write_service_receipt(

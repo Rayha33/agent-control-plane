@@ -1478,6 +1478,88 @@ not establish provider authentication/egress, production credential delivery,
 crash/reboot recovery, general hostile-kernel isolation, or default-worker
 activation. Tasks #2370 and #3441 remain open; PR #42 remains draft/open/unmerged.
 
+### TLS redirect replay: host egress-gate correction (2026-10-24 UTC; pending rerun)
+
+The first composed TLS/canary replay used test-only
+`PrivateNetwork=yes` on the systemd user launch-driver unit. On the disposable
+Debian 12 ARM64 guest (Linux `6.12.95+deb12-cloud-arm64`, systemd `252.39`),
+the unit reported that property but retained the host network-namespace inode.
+The live request reached the local TLS mock, verified the synthetic canary,
+followed the 302, received denial for the redirected CONNECT, and opened the
+third approved UDS tunnel. The test then failed at the namespace-inode
+assertion; its 30-second sandbox timeout elapsed before the test's explicit
+SIGINT/cancellation path.
+
+That exact fixture is preserved, not cleaned by direct process signaling. A
+fresh authenticated read of its attempt monitor returned `phase=unknown` for
+the exact failed scope; the durable execution is `stopping` with
+`stop_reason=execution_timeout` and no runc kernel-wait/exit evidence or cleanup
+receipt. The production `reap_expired()` path moved the expired attempt to
+`terminating` / `quarantined` and its task to `cleanup_pending` / `blocked`; it
+reported no worker termination or runtime cleanup. The monitor service remains
+present, so this fixture and VM are not represented as cleanup-verified.
+
+Read-only loopback probes then showed that `IPAddressDeny=any` on another
+transient user service did not block a local control connection, while
+`RestrictAddressFamilies=AF_UNIX AF_NETLINK` did allow AF_UNIX and deny creation
+of AF_INET/AF_INET6 sockets with `EAFNOSUPPORT`. These probes created no socket
+connection to any network address. The test-only TLS replay now requests that
+address-family restriction and probes it from inside the exact launch-driver
+service before starting the production driver. It also gives that replay a
+150-second sandbox timeout so the cancellation assertion has headroom. This is
+a syscall-family gate, not a separate network namespace, and this correction
+remains pending a fresh disposable replay; independent static/source QC has
+since returned GO on the exact code diff.
+Tasks #2370 and #3441 remain open; PR #42 remains draft/open/unmerged.
+
+The fresh kernel-6.12 replay reached the worker's `provider-probe-result` and
+`provider-probe-open` markers, but did not reach durable cleanup verification.
+Attempt `056c420f-2086-49a6-affd-fce50aedb9a3` remained `stopping` with
+`stop_reason=terminate_worker`, no observed runc exit code, and empty cleanup
+receipts. Pytest preserved `/tmp/acp-live-launch-driver-zf3u4i15`; its finalizer
+reported the exact test units non-quiescent. Read-only inspection then found the
+attempt slice inactive, its scope `failed` with `Result=timeout`, and the
+attempt monitor still active. Authenticated monitor reconnection refused the
+attempt-slice mismatch, so no direct cancellation, unit stop, or fixture
+cleanup was attempted afterward. The exact production reaper then returned no
+worker terminations or runtime cleanup; it quarantined this attempt, kept its
+task `cleanup_pending` / `blocked`, and retained the provider artifact. The
+earlier attempt remains a separate quarantined fixture.
+
+This run exposed a test-finalizer hazard: it could request teardown of the
+attempt slice while the exact durable execution was still stopping, invalidating
+the monitor's durable slice binding before cleanup verification. The test now
+checks the attempt/claim/execution identity and exact `cleanup_verified` phase
+before any ACP unit stop; otherwise it preserves the fixture and units.
+That guard has local tests. Independent static/source QC has returned GO on
+the exact code diff; a fresh disposable replay remains pending. Tasks #2370
+and #3441 remain open; PR #42 remains draft/open/unmerged.
+
+### Bounded cancellation escalation (2026-10-24 UTC; pending replay)
+
+Read-only systemd journal inspection of the second failed fixture established
+the cancellation timing: the authenticated monitor's durable cancel response
+was `outcome=ok, phase=stopping`; the exact scope began stopping at
+23:13:27 UTC, then systemd logged `Stopping timed out. Killing.` at 23:14:57
+UTC and sent SIGKILL to the held `provider-tls-redirect-probe`. The scope had
+inherited `TimeoutStopUSec=1min 30s` and ended with `Result=timeout`. This is
+why the controller's 30-second cancellation cleanup deadline expired before
+the original graceful-stop job escalated. The test's earlier finalizer then
+requested attempt-slice teardown while the execution was still unverified;
+the new `cleanup_verified` identity guard prevents that secondary hazard.
+
+The monitor now allows a two-second graceful stop, then sends SIGKILL only to
+the exact scope unit after rereading and confirming its invocation, cgroup, and
+attempt-slice binding; it never targets a controller-supplied PID or the parent
+slice. It polls that same identity for up to five seconds after escalation and
+fails closed on unknown/replaced scope state or anything other than verified
+`stopping` or `exited`. Focused monitor-service tests and local Ruff/format
+checks pass. Independent static/source QC of the exact code diff is GO; a fresh
+disposable TLS/cancellation replay remains pending. The two prior failed
+fixtures remain preserved and quarantined. No claim of provider/TLS
+cancellation success is made. Tasks #2370 and #3441 remain open; PR #42 remains
+draft/open/unmerged.
+
 ### Live synthetic FD4 worker-canary replay (2026-10-24; no provider)
 
 The opt-in `test_live_production_launch_driver_runs_exact_pinned_runc_request`

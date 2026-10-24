@@ -20,7 +20,16 @@ verification, and digest-only result import in one no-provider run. A second
 exact opt-in combination reads and digests the fake canary before exercising
 the attempt-scoped provider UDS and supervised cancellation path; it proves
 credential-channel teardown with proxy cleanup, but makes no provider
-connection and imports no cancelled result.
+connection and imports no cancelled result. A third, narrower replay sends that
+synthetic canary only inside a locally verified TLS request through the
+attempt UDS, follows a mock 302 into a policy-denied second CONNECT, and holds a
+third approved UDS tunnel open until supervised cancellation. Its launch-driver
+unit applies a process-level address-family restriction that allows only the
+Unix-domain and netlink families; a preflight inside the actual service proves
+IPv4/IPv6 socket creation is denied before the production driver starts. The
+fake public DNS pin maps only to a separate local filesystem UDS, and test
+hooks have no network fallback. It does not prove real DNS, public-IP dialing,
+provider authentication, or external TLS.
 Combining the supervised mode with ``ACP_LIVE_CANCEL_AFTER_START=1`` instead
 injects SIGINT while ``run_worker`` waits on a running payload; the test proves
 that its interrupt handler requests exact monitor cancellation, verifies
@@ -67,6 +76,30 @@ To additionally prove that cancellation closes a connected/open partial UDS
 request, combine ``ACP_LIVE_PROVIDER_PROXY_CANCEL=1`` with
 ``ACP_LIVE_CANCEL_AFTER_START=1``. Neither mode uses provider credentials;
 service-level accepted-channel shutdown is separately covered by unit tests.
+
+For the composed synthetic bearer-canary/TLS/redirect/cancellation replay,
+combine all of:
+
+    ACP_LIVE_PROVIDER_PROXY_UDS=1
+    ACP_LIVE_PROVIDER_PROXY_CANCEL=1
+    ACP_LIVE_PROVIDER_TLS_REDIRECT=1
+    ACP_LIVE_WORKER_CANARY_FD4=1
+    ACP_TEST_ALLOW_WORKER_CANARY=1
+    ACP_LIVE_SUPERVISED_RUN_WORKER=1
+    ACP_LIVE_CANCEL_AFTER_START=1
+
+The test-only launch-driver service receives
+``RestrictAddressFamilies=AF_UNIX AF_NETLINK``. This is a seccomp-backed
+process restriction, not a separate network namespace: its in-service probe
+must create an AF_UNIX socket and fail to create AF_INET/AF_INET6 sockets before
+the driver runs. The approved fake DNS answer is pinned through the production
+classifier, then its test dial hook maps only that exact endpoint to a local
+filesystem UDS. The mock verifies the synthetic bearer in memory, retains only
+a match and digest, and returns a redirect whose second CONNECT must be denied
+before DNS or dial. The guest validates the mock certificate and exact
+hostname. No public socket, real DNS query, real credential, provider request,
+inference, or paid call is made; the worker still has no IPv4/IPv6 socket
+access.
 
 For the launch-driver post-wait/pre-report recovery boundary, combine:
 
@@ -160,6 +193,7 @@ same-repository cross-attempt workspace isolation or wire ``run_worker``.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import multiprocessing
 import os
@@ -169,10 +203,12 @@ import shlex
 import shutil
 import signal
 import socket
+import ssl
 import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import traceback
 from pathlib import Path, PurePosixPath
@@ -187,6 +223,7 @@ from test_oci_worker_runtime import (
     _CONTAINER_MEMORY_BYTES,
     _CONTAINER_PIDS_LIMIT,
     _copy_busybox_closure,
+    _require_root_owned_file,
 )
 
 import agent_control_plane.supervisor.oci_worker as oci_worker
@@ -557,6 +594,281 @@ int main(int argc, char **argv) {
         return 15;
     }
 #endif
+    return 0;
+}
+"""
+_PROVIDER_TLS_REDIRECT_PROBE_SOURCE = r"""#define _GNU_SOURCE
+#include <errno.h>
+#include <fcntl.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <unistd.h>
+
+typedef struct ssl_method_st SSL_METHOD;
+typedef struct ssl_ctx_st SSL_CTX;
+typedef struct ssl_st SSL;
+typedef int (*ssl_verify_callback)(int, void *);
+
+#define SSL_VERIFY_PEER 0x01
+
+const SSL_METHOD *TLS_client_method(void);
+SSL_CTX *SSL_CTX_new(const SSL_METHOD *method);
+void SSL_CTX_free(SSL_CTX *ctx);
+int SSL_CTX_load_verify_locations(SSL_CTX *ctx, const char *file, const char *path);
+void SSL_CTX_set_verify(SSL_CTX *ctx, int mode, ssl_verify_callback callback);
+SSL *SSL_new(SSL_CTX *ctx);
+void SSL_free(SSL *ssl);
+int SSL_set_fd(SSL *ssl, int fd);
+int SSL_set1_host(SSL *ssl, const char *hostname);
+int SSL_connect(SSL *ssl);
+int SSL_write(SSL *ssl, const void *buffer, int length);
+int SSL_read(SSL *ssl, void *buffer, int length);
+int SSL_shutdown(SSL *ssl);
+unsigned char *SHA256(const unsigned char *data, size_t length, unsigned char *digest);
+
+static bool denied_socket_family(int family) {
+    int fd = socket(family, SOCK_STREAM, 0);
+    if (fd >= 0) {
+        close(fd);
+        return false;
+    }
+    return errno == EPERM || errno == EACCES || errno == EAFNOSUPPORT || errno == ENOSYS;
+}
+
+static bool write_all(int fd, const void *data, size_t length) {
+    const unsigned char *bytes = data;
+    size_t sent = 0;
+    while (sent < length) {
+        ssize_t count = send(fd, bytes + sent, length - sent, 0);
+        if (count <= 0) return false;
+        sent += (size_t)count;
+    }
+    return true;
+}
+
+static bool ssl_write_all(SSL *ssl, const void *data, size_t length) {
+    const unsigned char *bytes = data;
+    size_t sent = 0;
+    while (sent < length) {
+        int remaining = (int)(length - sent);
+        int count = SSL_write(ssl, bytes + sent, remaining);
+        if (count <= 0) return false;
+        sent += (size_t)count;
+    }
+    return true;
+}
+
+static bool read_proxy_headers(int fd, char *response, size_t capacity) {
+    size_t received = 0;
+    if (capacity < 5) return false;
+    while (received + 1 < capacity) {
+        ssize_t count = recv(fd, response + received, capacity - received - 1, 0);
+        if (count <= 0) return false;
+        received += (size_t)count;
+        response[received] = '\0';
+        if (strstr(response, "\r\n\r\n") != NULL) return true;
+    }
+    return false;
+}
+
+static int connect_proxy(const char *authority, char *response, size_t capacity) {
+    const char *path = getenv("ACP_PROVIDER_PROXY_UNIX_SOCKET");
+    if (path == NULL || strcmp(path, "/run/acp/provider.sock") != 0) return -1;
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    struct sockaddr_un address = {0};
+    address.sun_family = AF_UNIX;
+    if (strlen(path) >= sizeof(address.sun_path)) {
+        close(fd);
+        return -1;
+    }
+    memcpy(address.sun_path, path, strlen(path) + 1);
+    if (connect(fd, (struct sockaddr *)&address, sizeof(address)) != 0) {
+        close(fd);
+        return -1;
+    }
+    char request[1024];
+    int request_length = snprintf(
+        request,
+        sizeof(request),
+        "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n",
+        authority,
+        authority
+    );
+    if (request_length <= 0 || (size_t)request_length >= sizeof(request)
+            || !write_all(fd, request, (size_t)request_length)
+            || !read_proxy_headers(fd, response, capacity)) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+static bool read_tls_headers(SSL *ssl, char *response, size_t capacity) {
+    size_t received = 0;
+    if (capacity < 5) return false;
+    while (received + 1 < capacity) {
+        int count = SSL_read(ssl, response + received, (int)(capacity - received - 1));
+        if (count <= 0) return false;
+        received += (size_t)count;
+        response[received] = '\0';
+        if (strstr(response, "\r\n\r\n") != NULL) return true;
+    }
+    return false;
+}
+
+static bool write_marker(const char *path, const char *value) {
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) return false;
+    size_t length = strlen(value);
+    size_t written = 0;
+    while (written < length) {
+        ssize_t count = write(fd, value + written, length - written);
+        if (count <= 0) {
+            close(fd);
+            return false;
+        }
+        written += (size_t)count;
+    }
+    return close(fd) == 0;
+}
+
+static bool read_canary(unsigned char *canary, size_t capacity, size_t *length) {
+    *length = 0;
+    while (*length < capacity) {
+        ssize_t count = read(4, canary + *length, capacity - *length);
+        if (count < 0 && errno == EINTR) continue;
+        if (count < 0) return false;
+        if (count == 0) return *length > 0;
+        *length += (size_t)count;
+    }
+    unsigned char extra;
+    ssize_t count = read(4, &extra, 1);
+    return count == 0;
+}
+
+static bool redirect_authority(const char *response, char *authority, size_t capacity) {
+    const char prefix[] = "Location: https://";
+    const char *start = strstr(response, prefix);
+    if (start == NULL) return false;
+    start += sizeof(prefix) - 1;
+    const char *end = strchr(start, '/');
+    if (end == NULL || end == start || (size_t)(end - start) >= capacity) return false;
+    memcpy(authority, start, (size_t)(end - start));
+    authority[end - start] = '\0';
+    return true;
+}
+
+int main(void) {
+    if (!denied_socket_family(AF_INET) || !denied_socket_family(AF_INET6)) return 2;
+    unsigned char canary[512] = {0};
+    size_t canary_length = 0;
+    if (!read_canary(canary, sizeof(canary) - 1, &canary_length)) return 3;
+    canary[canary_length] = '\0';
+    if (strchr((char *)canary, '\r') != NULL || strchr((char *)canary, '\n') != NULL) return 4;
+    unsigned char digest[32];
+    if (SHA256(canary, canary_length, digest) == NULL) return 5;
+    char digest_hex[65];
+    for (size_t index = 0; index < sizeof(digest); ++index) {
+        snprintf(digest_hex + index * 2, 3, "%02x", digest[index]);
+    }
+    digest_hex[64] = '\0';
+    char canary_marker[128];
+    snprintf(
+        canary_marker,
+        sizeof(canary_marker),
+        "worker-canary-fd4-sha256=%s\n",
+        digest_hex
+    );
+    if (!write_marker("/workspace/worker-canary-fd4-result", canary_marker)) return 6;
+
+    char proxy_response[4096];
+    int first = connect_proxy("allowed.example.invalid:443", proxy_response, sizeof(proxy_response));
+    if (first < 0 || strncmp(proxy_response, "HTTP/1.1 200 Connection Established\r\n", 37) != 0) {
+        if (first >= 0) close(first);
+        return 7;
+    }
+    SSL_CTX *context = SSL_CTX_new(TLS_client_method());
+    if (context == NULL) {
+        close(first);
+        return 8;
+    }
+    SSL_CTX_set_verify(context, SSL_VERIFY_PEER, NULL);
+    if (SSL_CTX_load_verify_locations(context, "/etc/acp/provider-test-ca.pem", NULL) != 1) {
+        SSL_CTX_free(context);
+        close(first);
+        return 9;
+    }
+    SSL *tls = SSL_new(context);
+    if (tls == NULL || SSL_set_fd(tls, first) != 1
+            || SSL_set1_host(tls, "allowed.example.invalid") != 1
+            || SSL_connect(tls) != 1) {
+        if (tls != NULL) SSL_free(tls);
+        SSL_CTX_free(context);
+        close(first);
+        return 10;
+    }
+    char request[2048];
+    int request_length = snprintf(
+        request,
+        sizeof(request),
+        "GET /redirect HTTP/1.1\r\nHost: allowed.example.invalid\r\n"
+        "Authorization: Bearer %s\r\nConnection: close\r\n\r\n",
+        (char *)canary
+    );
+    memset(canary, 0, sizeof(canary));
+    if (request_length <= 0 || (size_t)request_length >= sizeof(request)
+            || !ssl_write_all(tls, request, (size_t)request_length)) {
+        memset(request, 0, sizeof(request));
+        SSL_free(tls);
+        SSL_CTX_free(context);
+        close(first);
+        return 11;
+    }
+    memset(request, 0, sizeof(request));
+    char tls_response[4096];
+    if (!read_tls_headers(tls, tls_response, sizeof(tls_response))
+            || strncmp(tls_response, "HTTP/1.1 302 Found\r\n", 20) != 0) {
+        SSL_free(tls);
+        SSL_CTX_free(context);
+        close(first);
+        return 12;
+    }
+    char redirected_authority[256];
+    if (!redirect_authority(tls_response, redirected_authority, sizeof(redirected_authority))
+            || strcmp(redirected_authority, "blocked.example.invalid:443") != 0) {
+        SSL_free(tls);
+        SSL_CTX_free(context);
+        close(first);
+        return 13;
+    }
+    SSL_shutdown(tls);
+    SSL_free(tls);
+    SSL_CTX_free(context);
+    close(first);
+
+    int redirected = connect_proxy(redirected_authority, proxy_response, sizeof(proxy_response));
+    if (redirected < 0 || strncmp(proxy_response, "HTTP/1.1 403 Forbidden\r\n", 24) != 0) {
+        if (redirected >= 0) close(redirected);
+        return 14;
+    }
+    close(redirected);
+
+    int held = connect_proxy("allowed.example.invalid:443", proxy_response, sizeof(proxy_response));
+    if (held < 0 || strncmp(proxy_response, "HTTP/1.1 200 Connection Established\r\n", 37) != 0) {
+        if (held >= 0) close(held);
+        return 15;
+    }
+    if (!write_marker("/workspace/provider-probe-result", "tls-redirect-policy-pass\n")
+            || !write_marker("/workspace/provider-probe-open", "tls-third-connect-open\n")) {
+        close(held);
+        return 16;
+    }
+    for (;;) pause();
     return 0;
 }
 """
@@ -966,7 +1278,12 @@ def _start_launch_driver_then_crash_controller(
                 )
             argv = list(argv)
             insertion = argv.index("--working-directory")
-            argv[insertion:insertion] = [
+            systemd_test_properties = (
+                ["--property=RestrictAddressFamilies=AF_UNIX AF_NETLINK"]
+                if os.environ.get("ACP_LIVE_PROVIDER_TLS_REDIRECT") == "1"
+                else []
+            )
+            argv[insertion:insertion] = systemd_test_properties + [
                 f"--property=StandardOutput=append:{service_log_path}",
                 f"--property=StandardError=append:{service_log_path}",
             ]
@@ -1118,6 +1435,140 @@ raise SystemExit(sandbox_launch_driver_service.main(driver_args))
                     wrapper,
                     str(monitor_acceptance_crash_marker),
                     crash_phase,
+                    *driver_args,
+                ]
+            if os.environ.get("ACP_LIVE_PROVIDER_TLS_REDIRECT") == "1":
+                module_flag = argv.index("-m")
+                python = argv[module_flag - 1]
+                module_name = argv[module_flag + 1]
+                if module_name != "agent_control_plane.supervisor.sandbox_launch_driver_service":
+                    raise AssertionError("production launch-driver command changed unexpectedly")
+                mock_socket_path = os.environ.get("ACP_LIVE_PROVIDER_TLS_MOCK_SOCKET", "")
+                hook_marker_path = os.environ.get("ACP_LIVE_PROVIDER_TLS_HOOK_MARKER", "")
+                if not mock_socket_path.startswith("/tmp/") or not hook_marker_path.startswith(
+                    "/tmp/"
+                ):
+                    raise AssertionError("test-only TLS fixture paths are not private /tmp paths")
+                driver_args = argv[module_flag + 2 :]
+                wrapper = r"""
+import errno
+import json
+import os
+import socket
+import stat
+import sys
+from pathlib import Path
+
+from agent_control_plane.supervisor import provider_egress, sandbox_launch_driver_service
+
+mock_socket_path = Path(sys.argv[1])
+hook_marker_path = Path(sys.argv[2])
+driver_args = sys.argv[3:]
+mock_info = mock_socket_path.lstat()
+if not stat.S_ISSOCK(mock_info.st_mode) or mock_info.st_mode & 0o077:
+    raise RuntimeError("test upstream mock socket is not a private filesystem UDS")
+address_family_probe = {}
+unix_probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+unix_probe.close()
+address_family_probe["AF_UNIX"] = "allowed"
+for family_name in ("AF_INET", "AF_INET6"):
+    try:
+        probe = socket.socket(getattr(socket, family_name), socket.SOCK_STREAM)
+    except OSError as error:
+        if error.errno not in {errno.EAFNOSUPPORT, errno.EPERM}:
+            raise
+        address_family_probe[family_name] = (
+            "denied:" + errno.errorcode.get(error.errno, "UNKNOWN")
+        )
+    else:
+        probe.close()
+        raise RuntimeError(
+            "test launch-driver service can create a prohibited " + family_name + " socket"
+        )
+resolver_calls = []
+dial_calls = []
+guarded_non_unix_attempts = []
+original_getaddrinfo = socket.getaddrinfo
+original_connect = socket.socket.connect
+original_connect_ex = socket.socket.connect_ex
+original_send = socket.socket.send
+original_sendall = socket.socket.sendall
+original_sendto = socket.socket.sendto
+original_sendmsg = getattr(socket.socket, "sendmsg", None)
+
+def deny_non_unix_io(method_name, method):
+    def guarded(self, *args, **kwargs):
+        if self.family != socket.AF_UNIX:
+            guarded_non_unix_attempts.append(method_name)
+            raise PermissionError(errno.EPERM, "test proxy host egress is disabled")
+        return method(self, *args, **kwargs)
+    return guarded
+
+socket.socket.connect = deny_non_unix_io("connect", original_connect)
+socket.socket.connect_ex = deny_non_unix_io("connect_ex", original_connect_ex)
+socket.socket.send = deny_non_unix_io("send", original_send)
+socket.socket.sendall = deny_non_unix_io("sendall", original_sendall)
+socket.socket.sendto = deny_non_unix_io("sendto", original_sendto)
+if original_sendmsg is not None:
+    socket.socket.sendmsg = deny_non_unix_io("sendmsg", original_sendmsg)
+
+def synthetic_resolver(host, port, *args, **kwargs):
+    resolver_calls.append({"host": host, "port": port})
+    if host != "allowed.example.invalid." or port != 443:
+        raise AssertionError("unexpected DNS request in test-only provider flow")
+    return [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("8.8.8.8", 443))]
+
+def synthetic_dial(endpoint, *, timeout):
+    value = {
+        "host": endpoint.host,
+        "port": endpoint.port,
+        "family": endpoint.family,
+        "sockaddr": list(endpoint.sockaddr),
+    }
+    dial_calls.append(value)
+    if (
+        endpoint.host != "allowed.example.invalid"
+        or endpoint.port != 443
+        or endpoint.family != socket.AF_INET
+        or tuple(endpoint.sockaddr) != ("8.8.8.8", 443)
+    ):
+        raise AssertionError("test dialer rejected an unexpected pinned endpoint")
+    upstream = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    upstream.settimeout(timeout)
+    upstream.connect(str(mock_socket_path))
+    return upstream
+
+socket.getaddrinfo = synthetic_resolver
+provider_egress._connect_pinned = synthetic_dial
+
+def write_evidence(result, error_type=None):
+    evidence = {
+        "result": result,
+        "error_type": error_type,
+        "resolver_calls": resolver_calls,
+        "dial_calls": dial_calls,
+        "guarded_non_unix_attempts": guarded_non_unix_attempts,
+        "host_service_restrict_address_families_requested": True,
+        "host_service_address_family_probe": address_family_probe,
+        "public_pin_was_mapped_only_to_test_uds": True,
+    }
+    hook_marker_path.write_text(json.dumps(evidence, sort_keys=True), encoding="ascii")
+
+try:
+    result = sandbox_launch_driver_service.main(driver_args)
+except BaseException as error:
+    write_evidence("raised", type(error).__name__)
+    raise
+else:
+    write_evidence("returned")
+    raise SystemExit(result)
+"""
+                argv[module_flag - 1 :] = [
+                    python,
+                    "-c",
+                    wrapper,
+                    mock_socket_path,
+                    hook_marker_path,
                     *driver_args,
                 ]
         result = original_runner(argv, environment=environment)
@@ -2768,6 +3219,49 @@ def _wait_for_quiescence(service_unit: str | None, slice_unit: str | None) -> bo
     return safe
 
 
+def _live_execution_allows_test_unit_teardown(
+    execution: dict[str, Any] | None,
+    *,
+    expected_identity: tuple[str, int, str],
+    expected_phase: str,
+) -> bool:
+    """Only tear down test-owned ACP units after the exact execution is terminal."""
+
+    return (
+        execution is not None
+        and (
+            execution.get("attempt_id"),
+            execution.get("claim_token"),
+            execution.get("execution_id"),
+        )
+        == expected_identity
+        and execution.get("phase") == expected_phase
+    )
+
+
+def test_live_execution_teardown_requires_exact_terminal_cleanup() -> None:
+    identity = ("attempt", 3, "execution")
+    verified = {
+        "attempt_id": identity[0],
+        "claim_token": identity[1],
+        "execution_id": identity[2],
+        "phase": "cleanup_verified",
+    }
+
+    assert _live_execution_allows_test_unit_teardown(
+        verified, expected_identity=identity, expected_phase="cleanup_verified"
+    )
+    for unsafe in (
+        None,
+        {**verified, "phase": "stopping"},
+        {**verified, "phase": "cleanup_reported"},
+        {**verified, "attempt_id": "different-attempt"},
+    ):
+        assert not _live_execution_allows_test_unit_teardown(
+            unsafe, expected_identity=identity, expected_phase="cleanup_verified"
+        )
+
+
 def _best_effort_stop_unit(systemctl: str, unit: str, *, timeout: float = 12.0) -> None:
     """Request stop even when a start client timed out after systemd accepted it."""
 
@@ -3372,6 +3866,7 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
     supervised_run_worker = os.environ.get("ACP_LIVE_SUPERVISED_RUN_WORKER") == "1"
     provider_proxy_uds = os.environ.get("ACP_LIVE_PROVIDER_PROXY_UDS") == "1"
     provider_proxy_cancel = os.environ.get("ACP_LIVE_PROVIDER_PROXY_CANCEL") == "1"
+    provider_tls_redirect = os.environ.get("ACP_LIVE_PROVIDER_TLS_REDIRECT") == "1"
     worker_canary_fd4 = os.environ.get("ACP_LIVE_WORKER_CANARY_FD4") == "1"
     test_worker_canary = (
         b"ACP-test-worker-canary-" + os.urandom(24).hex().encode("ascii")
@@ -3391,6 +3886,11 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
         and os.environ.get("ACP_LIVE_CANCEL_AFTER_START") == "1"
         and not import_result_after_cleanup
     )
+    if provider_tls_redirect and not worker_canary_provider_cancel:
+        pytest.fail(
+            "provider TLS redirect proof requires the exact supervised FD4-canary, "
+            "provider-UDS cancellation combination"
+        )
     if worker_canary_fd4 and (
         os.environ.get("ACP_TEST_ALLOW_WORKER_CANARY") != "1"
         or (
@@ -3630,10 +4130,171 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
     provider_probe_result: Path | None = None
     provider_probe_open: Path | None = None
     provider_probe_release_error: OSError | None = None
+    provider_tls_listener: socket.socket | None = None
+    provider_tls_thread: threading.Thread | None = None
+    provider_tls_stop = threading.Event()
+    provider_tls_client_sockets: list[socket.socket] = []
+    provider_tls_socket_lock = threading.Lock()
+    provider_tls_target_state: dict[str, Any] = {}
+    provider_tls_target_errors: list[str] = []
+    provider_tls_certificate_path: Path | None = None
+    provider_tls_mock_socket_path: Path | None = None
+    provider_tls_hook_marker_path: Path | None = None
     child_processes: list[multiprocessing.Process] = []
     host_process_sentinel: subprocess.Popen[bytes] | None = None
+    supervisor: GitSupervisor | None = None
+    attempt: dict[str, Any] | None = None
+    identity: tuple[str, int, str] | None = None
     try:
         run_root.chmod(0o700)
+        if provider_tls_redirect:
+            assert test_worker_canary is not None
+            openssl = shutil.which("openssl")
+            if openssl is None:
+                pytest.fail("provider TLS redirect proof requires the local OpenSSL executable")
+            provider_tls_certificate_path = run_root / "provider-test-ca.pem"
+            provider_tls_key_path = run_root / "provider-test-key.pem"
+            provider_tls_mock_socket_path = run_root / "provider-test-upstream.sock"
+            provider_tls_hook_marker_path = run_root / "provider-tls-hook-evidence.json"
+            certificate_result = subprocess.run(
+                [
+                    openssl,
+                    "req",
+                    "-x509",
+                    "-newkey",
+                    "rsa:2048",
+                    "-nodes",
+                    "-sha256",
+                    "-days",
+                    "1",
+                    "-subj",
+                    "/CN=allowed.example.invalid",
+                    "-addext",
+                    "subjectAltName=DNS:allowed.example.invalid",
+                    "-addext",
+                    "basicConstraints=critical,CA:TRUE",
+                    "-keyout",
+                    str(provider_tls_key_path),
+                    "-out",
+                    str(provider_tls_certificate_path),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+            if certificate_result.returncode != 0:
+                pytest.fail(
+                    "local provider TLS certificate generation failed: "
+                    f"{certificate_result.stderr[-2000:]}"
+                )
+            provider_tls_key_path.chmod(0o600)
+            provider_tls_certificate_path.chmod(0o600)
+            tls_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            tls_context.load_cert_chain(
+                certfile=str(provider_tls_certificate_path), keyfile=str(provider_tls_key_path)
+            )
+            provider_tls_listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            provider_tls_listener.bind(str(provider_tls_mock_socket_path))
+            provider_tls_mock_socket_path.chmod(0o600)
+            provider_tls_listener.listen(2)
+            provider_tls_listener.settimeout(0.2)
+
+            def accept_provider_tls_target() -> socket.socket | None:
+                assert provider_tls_listener is not None
+                while not provider_tls_stop.is_set():
+                    try:
+                        target_socket, _ = provider_tls_listener.accept()
+                    except TimeoutError:
+                        continue
+                    with provider_tls_socket_lock:
+                        provider_tls_client_sockets.append(target_socket)
+                    return target_socket
+                return None
+
+            def serve_provider_tls_target() -> None:
+                try:
+                    first_target = accept_provider_tls_target()
+                    if first_target is None:
+                        return
+                    with tls_context.wrap_socket(first_target, server_side=True) as tls_target:
+                        tls_target.settimeout(10)
+                        request = bytearray()
+                        while b"\r\n\r\n" not in request and len(request) <= 8192:
+                            chunk = tls_target.recv(2048)
+                            if not chunk:
+                                raise ConnectionError("TLS request ended before headers")
+                            request.extend(chunk)
+                        if len(request) > 8192:
+                            raise ValueError("TLS request headers exceeded the fixture limit")
+                        authorization_values = [
+                            bytearray(line.partition(b":")[2].strip())
+                            for line in bytes(request).split(b"\r\n")
+                            if line.lower().startswith(b"authorization:")
+                        ]
+                        bearer_prefix = b"Bearer "
+                        token_value = (
+                            bytearray(authorization_values[0][len(bearer_prefix) :])
+                            if len(authorization_values) == 1
+                            and authorization_values[0].startswith(bearer_prefix)
+                            else bytearray()
+                        )
+                        provider_tls_target_state["canary_match"] = bool(
+                            len(authorization_values) == 1
+                            and hmac.compare_digest(bytes(token_value), test_worker_canary)
+                        )
+                        provider_tls_target_state["canary_sha256"] = (
+                            hashlib.sha256(token_value).hexdigest()
+                            if provider_tls_target_state["canary_match"]
+                            else None
+                        )
+                        token_value[:] = b"\0" * len(token_value)
+                        for authorization_value in authorization_values:
+                            authorization_value[:] = b"\0" * len(authorization_value)
+                        request[:] = b"\0" * len(request)
+                        del authorization_values, token_value
+                        if not provider_tls_target_state["canary_match"]:
+                            provider_tls_target_errors.append("synthetic_canary_mismatch")
+                            tls_target.sendall(
+                                b"HTTP/1.1 500 Fixture Rejected\r\n"
+                                b"Content-Length: 0\r\nConnection: close\r\n\r\n"
+                            )
+                            return
+                        tls_target.sendall(
+                            b"HTTP/1.1 302 Found\r\n"
+                            b"Location: https://blocked.example.invalid:443/redirected\r\n"
+                            b"Content-Length: 0\r\nConnection: close\r\n\r\n"
+                        )
+                    second_target = accept_provider_tls_target()
+                    if second_target is None:
+                        return
+                    second_target.settimeout(0.2)
+                    provider_tls_target_state["third_tunnel_accepted"] = True
+                    while not provider_tls_stop.is_set():
+                        try:
+                            unexpected_data = second_target.recv(1)
+                        except TimeoutError:
+                            continue
+                        if not unexpected_data:
+                            provider_tls_target_state["third_tunnel_closed"] = True
+                            return
+                        provider_tls_target_errors.append("unexpected_third_tunnel_payload")
+                        return
+                except (OSError, ssl.SSLError, ValueError, ConnectionError) as error:
+                    if not provider_tls_stop.is_set():
+                        provider_tls_target_errors.append(f"mock_{type(error).__name__}")
+
+            provider_tls_thread = threading.Thread(
+                target=serve_provider_tls_target,
+                name="acp-provider-tls-test-mock",
+                daemon=True,
+            )
+            provider_tls_thread.start()
+            monkeypatch.setenv(
+                "ACP_LIVE_PROVIDER_TLS_MOCK_SOCKET", str(provider_tls_mock_socket_path)
+            )
+            monkeypatch.setenv(
+                "ACP_LIVE_PROVIDER_TLS_HOOK_MARKER", str(provider_tls_hook_marker_path)
+            )
         if isolation_probes:
             host_process_sentinel = subprocess.Popen(
                 [sys.executable, "-c", "import time; time.sleep(180)"],
@@ -3746,6 +4407,71 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
                         f"{compile_result.stderr[-4000:]}"
                     )
                 canary_client_path.chmod(0o755)
+            if provider_tls_redirect:
+                assert provider_tls_certificate_path is not None
+                compiler = shutil.which("cc")
+                ldd = shutil.which("ldd")
+                if compiler is None or ldd is None:
+                    pytest.fail("provider TLS redirect proof requires cc and ldd")
+                provider_ca_path = rootfs_source / "etc" / "acp" / "provider-test-ca.pem"
+                provider_ca_path.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
+                shutil.copyfile(provider_tls_certificate_path, provider_ca_path)
+                provider_ca_path.chmod(0o644)
+                tls_source_path = run_root / "provider-tls-redirect-probe.c"
+                tls_client_path = rootfs_source / "bin" / "provider-tls-redirect-probe"
+                tls_source_path.write_text(_PROVIDER_TLS_REDIRECT_PROBE_SOURCE, encoding="ascii")
+                compile_result = subprocess.run(
+                    [
+                        compiler,
+                        "-O2",
+                        "-Wall",
+                        "-Wextra",
+                        "-Werror",
+                        str(tls_source_path),
+                        "-o",
+                        str(tls_client_path),
+                        "-l:libssl.so.3",
+                        "-l:libcrypto.so.3",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+                if compile_result.returncode != 0:
+                    pytest.fail(
+                        "provider TLS redirect guest probe failed to compile: "
+                        f"{compile_result.stderr[-4000:]}"
+                    )
+                tls_client_path.chmod(0o755)
+                closure_result = subprocess.run(
+                    [ldd, str(tls_client_path)],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                    env={"LC_ALL": "C", "LANG": "C", "PATH": "/usr/sbin:/usr/bin:/sbin:/bin"},
+                )
+                closure_output = f"{closure_result.stdout}\n{closure_result.stderr}"
+                if closure_result.returncode != 0 or "not found" in closure_output:
+                    pytest.fail("provider TLS guest probe dependency closure is unresolved")
+                tls_dependencies = {
+                    token
+                    for line in closure_result.stdout.splitlines()
+                    for token in line.replace("=>", " ").split()
+                    if token.startswith("/") and Path(token).is_file()
+                }
+                if not tls_dependencies:
+                    pytest.fail("provider TLS guest probe has no inspectable dynamic dependencies")
+                for dependency in sorted(tls_dependencies):
+                    source_dependency = _require_root_owned_file(
+                        Path(dependency), "provider TLS guest runtime dependency"
+                    )
+                    dependency_destination = rootfs_source / dependency.lstrip("/")
+                    dependency_destination.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
+                    shutil.copyfile(source_dependency, dependency_destination)
+                    dependency_destination.chmod(
+                        stat.S_IMODE(source_dependency.stat().st_mode) & 0o755
+                    )
             if isolation_probes and "rm" not in busybox_applets:
                 pytest.fail("trusted BusyBox lacks rm for the temporary workspace symlink probe")
             repo_root = run_root / "repo"
@@ -4187,7 +4913,13 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
             if cancel_after_start or timeout_after_start or lease_expiry_after_stop
             else 1
         )
-        sandbox_timeout_seconds = 150 if concurrent_live_child else 1 if timeout_after_start else 30
+        sandbox_timeout_seconds = (
+            150
+            if concurrent_live_child or provider_tls_redirect
+            else 1
+            if timeout_after_start
+            else 30
+        )
         if isolation_probes:
             payload_command = ("/bin/busybox", "sh", f"/workspace/{isolation_script_name}")
         elif cross_attempt_probes:
@@ -4207,6 +4939,15 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
                 "/bin/busybox sleep 0.1; done; "
                 "printf 'production-driver-ran\\n' > /workspace/launch-driver-marker; "
                 + ("exit 17" if supervised_post_wait_recovery else "true"),
+            )
+        elif provider_tls_redirect:
+            payload_command = (
+                "/bin/busybox",
+                "sh",
+                "-c",
+                "set -eu; "
+                "printf 'production-driver-started\\n' > /workspace/launch-driver-started; "
+                "exec /bin/provider-tls-redirect-probe",
             )
         elif provider_proxy_uds and worker_canary_fd4:
             assert test_worker_canary is not None
@@ -4435,6 +5176,12 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
                         else "<launch-driver service log was not created>"
                     )
                     service_log = service_log.replace(runner["credential"], "[redacted]")
+                    tls_hook_evidence = (
+                        provider_tls_hook_marker_path.read_text(encoding="ascii")
+                        if provider_tls_hook_marker_path is not None
+                        and provider_tls_hook_marker_path.is_file()
+                        else "<test-only hook marker not written>"
+                    )
                     pytest.fail(
                         "provider UDS in-cgroup probe did not pass; "
                         f"phase={current['phase'] if current is not None else None!r}; "
@@ -4443,6 +5190,9 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
                         f"started={_entry_is_present(provider_started_path)}; "
                         f"result={_entry_is_present(provider_probe_result)}; "
                         f"producer_result_ready={producer_result_receiver.poll()}; "
+                        f"tls_target_state={provider_tls_target_state!r}; "
+                        f"tls_target_errors={provider_tls_target_errors!r}; "
+                        f"tls_hook_evidence={tls_hook_evidence!r}; "
                         f"service_log_tail={service_log[-4000:]!r}"
                     )
                 if provider_probe_open is not None:
@@ -4461,6 +5211,28 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
                     "worker left its running cgroup before the outside-peer probe: "
                     f"{current['phase']!r}"
                 )
+                if provider_tls_redirect:
+                    target_deadline = time.monotonic() + 5
+                    while (
+                        not provider_tls_target_state.get("third_tunnel_accepted")
+                        and time.monotonic() < target_deadline
+                    ):
+                        time.sleep(0.02)
+                    assert provider_tls_target_state.get("canary_match") is True, (
+                        "TLS mock did not verify the synthetic bearer canary"
+                    )
+                    assert expected_worker_canary_result is not None
+                    assert provider_tls_target_state.get("canary_sha256") == (
+                        expected_worker_canary_result.removeprefix(
+                            "worker-canary-fd4-sha256="
+                        ).strip()
+                    )
+                    assert provider_tls_target_state.get("third_tunnel_accepted") is True, (
+                        "approved third CONNECT did not reach the held local mock tunnel"
+                    )
+                    assert provider_tls_target_errors == []
+                    launch_driver_pid = current.get("launch_driver_pid")
+                    assert type(launch_driver_pid) is int and launch_driver_pid > 0
                 workspace_path_text = current.get("workspace_root_path")
                 assert isinstance(workspace_path_text, str) and workspace_path_text, (
                     "running execution row has no bound worker workspace"
@@ -5877,11 +6649,18 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
         if provider_proxy_uds:
             assert provider_probe_result is not None
             assert provider_probe_result.read_text(encoding="ascii") == (
-                "attempt-uds-policy-pass\n"
+                "tls-redirect-policy-pass\n"
+                if provider_tls_redirect
+                else "attempt-uds-policy-pass\n"
             )
             if provider_proxy_cancel:
                 assert provider_probe_open is not None
-                assert provider_probe_open.read_text(encoding="ascii") == ("partial-connect-open\n")
+                expected_open_marker = (
+                    "tls-third-connect-open\n"
+                    if provider_tls_redirect
+                    else "partial-connect-open\n"
+                )
+                assert provider_probe_open.read_text(encoding="ascii") == expected_open_marker
             else:
                 assert provider_probe_release is not None
                 assert provider_probe_release.read_text(encoding="ascii") == (
@@ -5892,6 +6671,53 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
             assert not os.path.lexists(provider_proxy_socket_path), (
                 "attempt provider proxy socket remained after production cleanup"
             )
+            if provider_tls_redirect:
+                assert provider_tls_thread is not None
+                assert provider_tls_hook_marker_path is not None
+                target_close_deadline = time.monotonic() + 5
+                while (
+                    not provider_tls_target_state.get("third_tunnel_closed")
+                    and time.monotonic() < target_close_deadline
+                ):
+                    time.sleep(0.02)
+                provider_tls_thread.join(timeout=2)
+                assert not provider_tls_thread.is_alive(), (
+                    "local TLS mock retained a proxy-side tunnel after cancellation cleanup"
+                )
+                assert provider_tls_target_state.get("third_tunnel_closed") is True
+                assert provider_tls_target_errors == []
+                assert provider_tls_hook_marker_path.is_file(), (
+                    "test-only launch-driver egress evidence marker is absent"
+                )
+                provider_tls_hook_evidence = json.loads(
+                    provider_tls_hook_marker_path.read_text(encoding="ascii")
+                )
+                assert provider_tls_hook_evidence["result"] == "returned"
+                assert provider_tls_hook_evidence["resolver_calls"] == [
+                    {"host": "allowed.example.invalid.", "port": 443},
+                    {"host": "allowed.example.invalid.", "port": 443},
+                ]
+                expected_dial = {
+                    "host": "allowed.example.invalid",
+                    "port": 443,
+                    "family": socket.AF_INET,
+                    "sockaddr": ["8.8.8.8", 443],
+                }
+                assert provider_tls_hook_evidence["dial_calls"] == [
+                    expected_dial,
+                    expected_dial,
+                ]
+                assert provider_tls_hook_evidence["guarded_non_unix_attempts"] == []
+                assert (
+                    provider_tls_hook_evidence["host_service_restrict_address_families_requested"]
+                    is True
+                )
+                family_probe = provider_tls_hook_evidence["host_service_address_family_probe"]
+                assert set(family_probe) == {"AF_UNIX", "AF_INET", "AF_INET6"}
+                assert family_probe["AF_UNIX"] == "allowed"
+                assert family_probe["AF_INET"].startswith("denied:")
+                assert family_probe["AF_INET6"].startswith("denied:")
+                assert provider_tls_hook_evidence["public_pin_was_mapped_only_to_test_uds"] is True
             if expected_cleanup_phase == "cleanup_reported":
                 provider_artifact = durable["provider_proxy_artifact"]
                 assert provider_artifact["directory"]["path"] == str(provider_proxy_directory)
@@ -6557,6 +7383,37 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
                 f"disposable VM and exact fixture at {run_root}; manually inspect user@UID.service "
                 "and the exact ACP fixture units before recovery."
             )
+        if service_start_attempted or monitor_start_attempted or slice_start_attempted:
+            if supervisor is None or attempt is None or identity is None:
+                pytest.fail(
+                    "exact ACP test units were attempted without a durable execution identity; "
+                    f"leaving units and fixture untouched at {run_root}"
+                )
+            try:
+                teardown_execution = supervisor._sandbox_execution_get(attempt["id"])
+            except Exception as error:
+                pytest.fail(
+                    "could not read the exact durable execution before teardown; leaving ACP "
+                    "units and fixture untouched at "
+                    f"{run_root}; read_error={type(error).__name__}"
+                )
+            expected_teardown_phase = "cleanup_verified"
+            if not _live_execution_allows_test_unit_teardown(
+                teardown_execution,
+                expected_identity=identity,
+                expected_phase=expected_teardown_phase,
+            ):
+                observed_phase = (
+                    teardown_execution.get("phase")
+                    if isinstance(teardown_execution, dict)
+                    else None
+                )
+                pytest.fail(
+                    "durable execution has not reached its exact expected cleanup phase; "
+                    "leaving ACP units and fixture untouched at "
+                    f"{run_root}; phase={observed_phase!r}; "
+                    f"expected={expected_teardown_phase!r}; execution_id={identity[2]}"
+                )
         driver_safe = _stop_attempted_units_and_check_quiescence(
             systemctl, service_unit, service_start_attempted, slice_unit, slice_start_attempted
         )
@@ -6589,6 +7446,31 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
                             f"pid={host_process_sentinel.pid}"
                         )
             isolation_cleanup_errors: list[str] = []
+            if provider_tls_redirect:
+                provider_tls_stop.set()
+                if provider_tls_listener is not None:
+                    try:
+                        provider_tls_listener.close()
+                    except OSError as error:
+                        isolation_cleanup_errors.append(
+                            f"provider TLS mock listener close: {type(error).__name__}"
+                        )
+                    provider_tls_listener = None
+                with provider_tls_socket_lock:
+                    target_sockets = list(provider_tls_client_sockets)
+                for target_socket in target_sockets:
+                    try:
+                        target_socket.close()
+                    except OSError as error:
+                        isolation_cleanup_errors.append(
+                            f"provider TLS mock client close: {type(error).__name__}"
+                        )
+                if provider_tls_thread is not None:
+                    provider_tls_thread.join(timeout=2)
+                    if provider_tls_thread.is_alive():
+                        isolation_cleanup_errors.append(
+                            "provider TLS mock server thread did not stop"
+                        )
             if isolation_socket is not None:
                 isolation_socket.close()
                 isolation_socket = None
