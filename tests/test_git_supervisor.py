@@ -3649,9 +3649,21 @@ def test_reaper_stops_supervised_worker_before_releasing_runtime(repo: Path) -> 
 
     with ThreadPoolExecutor(max_workers=1) as pool:
         worker = pool.submit(supervisor.run_worker, attempt["id"], attempt["claim_token"], command)
-        deadline = time.time() + 5
-        while supervisor._port_available(port) and time.time() < deadline:
+        deadline = time.monotonic() + 15
+        while supervisor._port_available(port) and time.monotonic() < deadline:
+            if worker.done():
+                # Surface a launch failure directly instead of reporting a
+                # misleading listener-readiness timeout.
+                worker.result()
             time.sleep(0.02)
+        if supervisor._port_available(port):
+            if worker.done():
+                worker.result()
+            state = supervisor.attempt(attempt["id"])
+            pytest.fail(
+                f"worker did not bind assigned port {port} within 15 seconds "
+                f"(future_done={worker.done()}, attempt_status={state['status']})"
+            )
         assert not supervisor._port_available(port)
         result = supervisor.reap_expired(now=supervisor.attempt(attempt["id"])["lease_expires_at"])
         with pytest.raises(SupervisorError):
