@@ -1231,3 +1231,66 @@ formatting, and package build. This is evidence for the explicit opt-in
 supervised cancellation path only; it does not prove provider execution or
 egress, general hostile-kernel isolation, supervisor restart recovery, or
 default OCI-worker activation. Task #2370 remains open.
+
+### Supervised provider-UDS cancellation through `run_worker()` (2026-10-24; no provider)
+
+At code-bearing commit `4e103857a489ea739b8aa7cc7a5e6fa63d8c0f07`,
+`test_live_production_launch_driver_runs_exact_pinned_runc_request` passed
+1/1 in 14.28s on disposable Debian 12 ARM64, Linux
+`6.12.95+deb12-cloud-arm64`, Python 3.11.2, unified cgroup v2, and an active
+private systemd user manager. Root-owned `/usr/local/bin/runc` was version
+1.5.2 with SHA-256
+`d10ecae898361832a059be2089bab92d158aec54661b18ed7346ed79628b46b0`; the
+test used `/usr/bin/busybox`. The exact test-module SHA-256 matched between
+the source checkout and guest:
+`244731600bcd044dde569c5a7962e0bfd6ae14017faea47c58ff58856b3f4643`.
+
+The test ran from the disposable checkout beneath `/tmp` with this cleared
+invocation environment (task-specific tool/cache paths are shown verbatim):
+
+```sh
+cd /tmp/acp-2370-provider-uds-run-worker-cancel-20261024/repo && \
+env -i \
+  HOME=/home/rayha.guest \
+  PATH=/tmp/acp-2370-provider-uds-run-worker-cancel-20261024/tooling/bin:/usr/local/bin:/usr/bin:/bin \
+  XDG_RUNTIME_DIR=/run/user/501 \
+  DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/501/bus \
+  UV_CACHE_DIR=/tmp/acp-2370-provider-uds-run-worker-cancel-20261024/uv-cache \
+  ACP_RUN_SANDBOX_WORKER_LIFECYCLE=1 \
+  ACP_OCI_TEST_RUNC=/usr/local/bin/runc \
+  ACP_OCI_TEST_RUNC_VERSION=1.5.2 \
+  ACP_OCI_TEST_BUSYBOX=/usr/bin/busybox \
+  ACP_LIVE_SUPERVISED_RUN_WORKER=1 \
+  ACP_LIVE_CANCEL_AFTER_START=1 \
+  ACP_LIVE_PROVIDER_PROXY_UDS=1 \
+  ACP_LIVE_PROVIDER_PROXY_CANCEL=1 \
+  /tmp/acp-2370-provider-uds-run-worker-cancel-20261024/tooling/bin/uv \
+  run --frozen --extra dev pytest -vv \
+  tests/test_sandbox_worker_lifecycle_integration.py::test_live_production_launch_driver_runs_exact_pinned_runc_request
+```
+
+The opt-in test seam injected the named `live-uds-only` policy
+(`allowed.example.invalid:443`) into the registered launch call; it did not
+add a public provider-egress API or change the default worker path. The worker
+verified the read-only attempt socket mount, received 400 for a malformed
+request and 403 for the blocked `.invalid` authority, then held a partial UDS
+request open. A same-UID peer outside the exact worker cgroup was rejected.
+The controller interrupted the process blocked in `run_worker()` with SIGINT;
+the attempt reached `cleanup_verified`, the proxy socket and directory were
+removed, the wrong runner credential was rejected before monitor reconnection,
+and no result-import row was created. The test proves the client held a
+connected partial request, not that the server accepted that specific partial
+request before cancellation.
+
+This run configured no provider credential or endpoint and made no approved
+CONNECT, DNS lookup, external request, TLS handshake, model call, or paid call.
+`env -i` cleared the test runner's inherited environment; it supplied only the
+shown test flags plus task-scoped tool/cache paths and the active user-manager
+socket coordinates. This does not claim that the systemd manager's own
+environment was cleared. Postflight found no ACP test unit, runc process,
+attempt cgroup, or live fixture root; the task-specific guest files were
+removed and the VM was stopped. This composes opt-in provider-socket lifecycle with supervised
+cancellation only; it does not prove fake-credential delivery, provider
+authentication/egress, TLS redirect behavior, crash recovery through
+`run_worker()`, general hostile-kernel isolation, or default OCI-worker
+activation. Tasks #2370 and #3441 remain open.
