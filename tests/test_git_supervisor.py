@@ -513,8 +513,11 @@ def test_oci_configured_worker_fails_closed_before_host_fallback(
     assert not worker_log.exists()
 
 
-def test_experimental_sandbox_worker_verifies_cleanup_before_import(
-    repo: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("interrupt_during_wait", [False, True])
+def test_experimental_sandbox_worker_retries_busy_cleanup_gate_before_import(
+    repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    interrupt_during_wait: bool,
 ) -> None:
     from agent_control_plane.supervisor import sandbox_launch_driver_service
 
@@ -537,12 +540,7 @@ def test_experimental_sandbox_worker_verifies_cleanup_before_import(
         "execution_id": "execution-test-1",
         "phase": "running",
     }
-    states = iter(
-        [
-            {**expected_execution, "phase": "running"},
-            {**expected_execution, "phase": "cleanup_reported"},
-        ]
-    )
+    observations = 0
 
     def fake_start(_supervisor, **kwargs):
         events.append("start")
@@ -566,18 +564,37 @@ def test_experimental_sandbox_worker_verifies_cleanup_before_import(
         )
 
     def fake_get(_attempt_id):
+        nonlocal observations
+        observations += 1
         events.append("observe")
-        return next(states)
+        phase = "running" if observations == 1 else "cleanup_reported"
+        return {**expected_execution, "phase": phase}
+
+    busy_verification_remaining = True
 
     def fake_verify(_attempt_id, _claim_token, *, credential=None):
+        nonlocal busy_verification_remaining
         events.append("verify_cleanup")
         assert credential is None
+        if busy_verification_remaining:
+            busy_verification_remaining = False
+            raise SupervisorError("sandbox_execution_gate_busy", "test lifecycle fence is busy")
         return {**expected_execution, "phase": "cleanup_verified", "runc_exit_code": 0}
 
     def fake_import(_attempt_id, _claim_token, *, credential=None):
+        if interrupt_during_wait:
+            pytest.fail("interrupted worker must never import a result")
         events.append("import")
         assert credential is None
         return {"status": "pending_qc", "commit_sha": "a" * 40}
+
+    interrupted = False
+
+    def fake_sleep(_seconds):
+        nonlocal interrupted
+        if interrupt_during_wait and not interrupted:
+            interrupted = True
+            raise KeyboardInterrupt
 
     monkeypatch.setattr(
         sandbox_launch_driver_service,
@@ -587,23 +604,48 @@ def test_experimental_sandbox_worker_verifies_cleanup_before_import(
     monkeypatch.setattr(supervisor, "_sandbox_execution_get", fake_get)
     monkeypatch.setattr(supervisor, "_sandbox_execution_verify_cleanup", fake_verify)
     monkeypatch.setattr(supervisor, "import_sandbox_execution_result", fake_import)
-    monkeypatch.setattr(workers_module.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(workers_module.time, "sleep", fake_sleep)
 
-    result = supervisor.run_worker(
-        attempt["id"],
-        attempt["claim_token"],
-        ["/bin/busybox", "sh", "-c", "exit 0"],
-        sandbox_experimental_opt_in=True,
-        sandbox_memory_max_bytes=64 * 1024 * 1024,
-        sandbox_cpu_quota=50_000,
-        sandbox_cpu_period=100_000,
-        sandbox_pids_max=32,
-        sandbox_timeout_seconds=10,
-        sandbox_provider_uds_policy_name="test-provider",
-        sandbox_provider_uds_destinations={"api.example.com": [443]},
-    )
+    def run_worker():
+        return supervisor.run_worker(
+            attempt["id"],
+            attempt["claim_token"],
+            ["/bin/busybox", "sh", "-c", "exit 0"],
+            sandbox_experimental_opt_in=True,
+            sandbox_memory_max_bytes=64 * 1024 * 1024,
+            sandbox_cpu_quota=50_000,
+            sandbox_cpu_period=100_000,
+            sandbox_pids_max=32,
+            sandbox_timeout_seconds=10,
+            sandbox_provider_uds_policy_name="test-provider",
+            sandbox_provider_uds_destinations={"api.example.com": [443]},
+        )
 
-    assert events == ["start", "observe", "observe", "verify_cleanup", "import"]
+    if interrupt_during_wait:
+        with pytest.raises(KeyboardInterrupt):
+            run_worker()
+        assert events == [
+            "start",
+            "observe",
+            "observe",
+            "observe",
+            "verify_cleanup",
+            "observe",
+            "verify_cleanup",
+        ]
+        return
+
+    result = run_worker()
+
+    assert events == [
+        "start",
+        "observe",
+        "observe",
+        "verify_cleanup",
+        "observe",
+        "verify_cleanup",
+        "import",
+    ]
     assert result == {
         "status": "pending_qc",
         "commit_sha": "a" * 40,

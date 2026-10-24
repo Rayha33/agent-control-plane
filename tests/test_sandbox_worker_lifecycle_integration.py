@@ -74,6 +74,11 @@ provider-proxy request. A test-only service wrapper exits after the kernel wait
 is durably recorded and the proxy is closed, before pinned-runc deletion or the
 cleanup report; a fresh production reaper must finish exact cleanup and resource
 release. It makes no DNS lookup or provider/model call and uses no credentials.
+To compose this post-wait recovery with the public experimental ``run_worker``
+path, also set ``ACP_LIVE_SUPERVISED_RUN_WORKER=1``. That variant gives the
+synthetic payload exit code 17, waits for a fresh reaper to recover the exact
+execution, and verifies ``run_worker`` rejects the failed result without
+importing it.
 
 For the fresh-supervisor cancellation branch, add:
 
@@ -3389,6 +3394,9 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
     crash_after_exit_before_cleanup_report = (
         os.environ.get("ACP_LIVE_CRASH_AFTER_EXIT_BEFORE_CLEANUP_REPORT") == "1"
     )
+    supervised_post_wait_recovery = (
+        supervised_run_worker and provider_proxy_uds and crash_after_exit_before_cleanup_report
+    )
     user_manager_restart_after_driver_crash = (
         os.environ.get("ACP_LIVE_USER_MANAGER_RESTART_AFTER_DRIVER_CRASH") == "1"
     )
@@ -4025,6 +4033,10 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
         identity: tuple[str, int, str] | None = None
         provider_proxy_directory: Path | None = None
         provider_proxy_socket_path: Path | None = None
+        post_wait_crash_record: dict[str, Any] | None = None
+        post_wait_execution_before_recovery: dict[str, Any] | None = None
+        post_wait_pre_recovery_evidence: dict[str, Any] | None = None
+        post_wait_recovery_result: tuple[Any, ...] | None = None
 
         cancel_after_start = os.environ.get("ACP_LIVE_CANCEL_AFTER_START") == "1"
         timeout_after_start = os.environ.get("ACP_LIVE_TIMEOUT_AFTER_START") == "1"
@@ -4104,7 +4116,7 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
                 "post-wait cleanup-report crash proof requires ACP_LIVE_PROVIDER_PROXY_UDS=1"
             )
         if supervised_run_worker and (
-            not (import_result_after_cleanup or cancel_after_start)
+            not (import_result_after_cleanup or cancel_after_start or supervised_post_wait_recovery)
             or timeout_after_start
             or lease_expiry_after_stop
             or crash_driver_service_before_receipt
@@ -4124,7 +4136,10 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
                 cross_attempt_probes,
                 isolation_probes,
                 import_result_after_cleanup,
-                supervised_run_worker and not (cancel_after_start and provider_proxy_cancel),
+                supervised_run_worker
+                and not (
+                    (cancel_after_start and provider_proxy_cancel) or supervised_post_wait_recovery
+                ),
                 cancel_after_start and not provider_proxy_cancel,
                 timeout_after_start,
                 lease_expiry_after_stop,
@@ -4168,7 +4183,8 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
                 "printf 'production-driver-started\\n' > /workspace/launch-driver-started; "
                 "while [ ! -e /workspace/provider-probe-release ]; do "
                 "/bin/busybox sleep 0.1; done; "
-                "printf 'production-driver-ran\\n' > /workspace/launch-driver-marker",
+                "printf 'production-driver-ran\\n' > /workspace/launch-driver-marker; "
+                + ("exit 17" if supervised_post_wait_recovery else "true"),
             )
         elif provider_proxy_uds:
             payload_command = (
@@ -4455,6 +4471,82 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
                 assert provider_probe_release is not None
                 if not crash_after_exit_before_cleanup_report:
                     provider_probe_release.write_text("release-provider-probe\n", encoding="ascii")
+        if supervised_post_wait_recovery:
+            assert identity is not None
+            assert provider_proxy_directory is not None
+            assert provider_proxy_socket_path is not None
+            _wait_for_receipt(run_root, monitor_acceptance_marker.name, timeout=40.0)
+            post_wait_crash_record = json.loads(
+                monitor_acceptance_marker.read_text(encoding="ascii")
+            )
+            assert post_wait_crash_record["crash_phase"] == "after_exit_before_cleanup_report"
+            assert post_wait_crash_record["identity"] == list(identity)
+            recovery_deadline = time.monotonic() + 10
+            post_wait_execution_before_recovery = supervisor._sandbox_execution_get(attempt["id"])
+            while (
+                post_wait_execution_before_recovery is not None
+                and post_wait_execution_before_recovery["phase"] != "exited"
+                and time.monotonic() < recovery_deadline
+            ):
+                time.sleep(0.05)
+                post_wait_execution_before_recovery = supervisor._sandbox_execution_get(
+                    attempt["id"]
+                )
+            assert (
+                post_wait_execution_before_recovery is not None
+                and post_wait_execution_before_recovery["execution_id"] == identity[2]
+                and post_wait_execution_before_recovery["phase"] == "exited"
+                and post_wait_execution_before_recovery["runc_exit_code"] == 17
+            ), "run_worker post-wait crash fixture did not reach the expected failed exit"
+            provider_artifact = post_wait_execution_before_recovery["provider_proxy_artifact"]
+            assert provider_artifact["directory"]["path"] == str(provider_proxy_directory)
+            assert provider_artifact["socket"]["path"] == str(provider_proxy_socket_path)
+            directory_info = provider_proxy_directory.lstat()
+            assert (directory_info.st_dev, directory_info.st_ino) == (
+                provider_artifact["directory"]["device"],
+                provider_artifact["directory"]["inode"],
+            )
+            assert not os.path.lexists(provider_proxy_socket_path)
+            assert list(provider_proxy_directory.iterdir()) == []
+            container_state_entry = (
+                Path(post_wait_execution_before_recovery["state_path"])
+                / post_wait_execution_before_recovery["container_id"]
+            )
+            assert container_state_entry.is_dir(), (
+                "the exact stopped runc state entry must exist before supervised recovery"
+            )
+            assert not _entry_is_present(workspace_root / "provider-probe-result"), (
+                "supervised post-wait recovery must not issue a provider-proxy request"
+            )
+            post_wait_pre_recovery_evidence = {
+                "container_state_present": True,
+                "provider_directory_identity_matches": True,
+                "provider_directory_empty": True,
+                "provider_socket_absent": True,
+                "provider_request_absent": True,
+            }
+            assert not producer_result_receiver.poll(), (
+                "run_worker returned before the exited execution was recovered"
+            )
+            recovery_attempt = supervisor.attempt(attempt["id"])
+            reaper_epoch = max(int(time.time()), int(recovery_attempt["lease_expires_at"])) + 60
+            recovery_receiver, recovery_sender = context.Pipe(duplex=False)
+            recovery = context.Process(
+                target=_reap_expired_from_fresh_process,
+                args=(repo, reaper_epoch, recovery_sender),
+            )
+            recovery.start()
+            child_processes.append(recovery)
+            recovery_sender.close()
+            assert recovery_receiver.poll(45), (
+                "fresh reaper did not recover the supervised post-wait crash"
+            )
+            post_wait_recovery_result = recovery_receiver.recv()
+            recovery.join(timeout=10)
+            assert not recovery.is_alive()
+            assert recovery.exitcode == 0
+            recovery_receiver.close()
+            assert post_wait_recovery_result[0] == "ok", post_wait_recovery_result
         supervised_cancel = supervised_run_worker and cancel_after_start
         if supervised_cancel:
             running_deadline = time.monotonic() + 30
@@ -4513,6 +4605,15 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
             producer_receipt = None
             producer_summary = None
             producer_exit = 1
+        elif supervised_post_wait_recovery:
+            assert producer_result[0:2] == ("error", "SupervisorError"), producer_result
+            assert "sandbox worker exited 17" in producer_result[2], producer_result
+            assert runner["credential"] not in repr(producer_result)
+            assert producer_controller.pid is not None
+            controller_pid = producer_controller.pid
+            producer_receipt = None
+            producer_summary = None
+            producer_exit = 1
         else:
             if producer_result[0] not in {"ok", "manager_accepted"}:
                 service_log = (
@@ -4536,7 +4637,7 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
                 producer_exit = 73
         assert producer_controller.exitcode == producer_exit
         producer_result_receiver.close()
-        if supervised_cancel:
+        if supervised_cancel or supervised_post_wait_recovery:
             pass
         elif producer_result[0] == "manager_accepted":
             controller_pid = producer_result[1]
@@ -4547,7 +4648,7 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
             assert producer_receipt["attempt_id"] == identity[0]
             assert producer_receipt["claim_token"] == identity[1]
             assert producer_receipt["execution_id"] == identity[2]
-        if supervised_run_worker and not cancel_after_start:
+        if supervised_run_worker and not cancel_after_start and not supervised_post_wait_recovery:
             assert producer_summary == {
                 "status": "pending_qc",
                 "sandbox_execution_id": identity[2],
@@ -5256,8 +5357,12 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
             assert monitor_acceptance_marker.is_file()
             return
         if crash_after_exit_before_cleanup_report:
-            _wait_for_receipt(run_root, monitor_acceptance_marker.name, timeout=40.0)
-            crashed = json.loads(monitor_acceptance_marker.read_text(encoding="ascii"))
+            if supervised_post_wait_recovery:
+                assert post_wait_crash_record is not None
+                crashed = post_wait_crash_record
+            else:
+                _wait_for_receipt(run_root, monitor_acceptance_marker.name, timeout=40.0)
+                crashed = json.loads(monitor_acceptance_marker.read_text(encoding="ascii"))
             assert crashed["crash_phase"] == "after_exit_before_cleanup_report"
             assert crashed["identity"] == list(identity)
             driver = crashed["driver"]
@@ -5269,10 +5374,15 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
             assert driver["slice"] == slice_unit
             assert PurePosixPath(driver["control_group"]).name == service_unit
 
-            durable_before_recovery = supervisor._sandbox_execution_get(attempt["id"])
+            durable_before_recovery = (
+                post_wait_execution_before_recovery
+                if supervised_post_wait_recovery
+                else supervisor._sandbox_execution_get(attempt["id"])
+            )
             assert durable_before_recovery is not None
             assert durable_before_recovery["phase"] == "exited"
-            assert durable_before_recovery["runc_exit_code"] == 0
+            expected_recovered_exit_code = 17 if supervised_post_wait_recovery else 0
+            assert durable_before_recovery["runc_exit_code"] == expected_recovered_exit_code
             assert (
                 durable_before_recovery["runc_exit_evidence_source"] == "runc_client_kernel_waitpid"
             )
@@ -5289,7 +5399,7 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
             assert durable_before_recovery["launch_driver_identity"] == driver["identity"]
             assert durable_before_recovery["launch_driver_invocation_id"] == driver["invocation_id"]
             assert crashed["execution_phase"] == "exited"
-            assert crashed["runc_exit_code"] == 0
+            assert crashed["runc_exit_code"] == expected_recovered_exit_code
             assert crashed["cleanup_receipt"] == {}
 
             driver_after_crash = _unit_properties(
@@ -5325,36 +5435,55 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
             provider_artifact = durable_before_recovery["provider_proxy_artifact"]
             assert provider_artifact["directory"]["path"] == str(provider_proxy_directory)
             assert provider_artifact["socket"]["path"] == str(provider_proxy_socket_path)
-            directory_info = provider_proxy_directory.lstat()
-            assert (directory_info.st_dev, directory_info.st_ino) == (
-                provider_artifact["directory"]["device"],
-                provider_artifact["directory"]["inode"],
-            )
-            assert not os.path.lexists(provider_proxy_socket_path)
-            assert list(provider_proxy_directory.iterdir()) == []
+            if supervised_post_wait_recovery:
+                assert post_wait_pre_recovery_evidence == {
+                    "container_state_present": True,
+                    "provider_directory_identity_matches": True,
+                    "provider_directory_empty": True,
+                    "provider_socket_absent": True,
+                    "provider_request_absent": True,
+                }
+            else:
+                directory_info = provider_proxy_directory.lstat()
+                assert (directory_info.st_dev, directory_info.st_ino) == (
+                    provider_artifact["directory"]["device"],
+                    provider_artifact["directory"]["inode"],
+                )
+                assert not os.path.lexists(provider_proxy_socket_path)
+                assert list(provider_proxy_directory.iterdir()) == []
             container_state_entry = state_root / durable_before_recovery["container_id"]
-            assert container_state_entry.is_dir(), (
-                "the exact stopped runc state entry must still exist at the injected crash"
-            )
+            if not supervised_post_wait_recovery:
+                assert container_state_entry.is_dir(), (
+                    "the exact stopped runc state entry must still exist at the injected crash"
+                )
 
-            reaper_epoch = (
-                max(int(time.time()), int(supervisor.attempt(attempt["id"])["lease_expires_at"]))
-                + 1
-            )
-            recovery_receiver, recovery_sender = context.Pipe(duplex=False)
-            recovery = context.Process(
-                target=_reap_expired_from_fresh_process,
-                args=(repo, reaper_epoch, recovery_sender),
-            )
-            recovery.start()
-            child_processes.append(recovery)
-            recovery_sender.close()
-            assert recovery_receiver.poll(45), "fresh reaper did not recover the post-wait crash"
-            recovery_result = recovery_receiver.recv()
-            recovery.join(timeout=10)
-            assert not recovery.is_alive()
-            assert recovery.exitcode == 0
-            recovery_receiver.close()
+            if supervised_post_wait_recovery:
+                assert post_wait_recovery_result is not None
+                recovery_result = post_wait_recovery_result
+            else:
+                reaper_epoch = (
+                    max(
+                        int(time.time()),
+                        int(supervisor.attempt(attempt["id"])["lease_expires_at"]),
+                    )
+                    + 1
+                )
+                recovery_receiver, recovery_sender = context.Pipe(duplex=False)
+                recovery = context.Process(
+                    target=_reap_expired_from_fresh_process,
+                    args=(repo, reaper_epoch, recovery_sender),
+                )
+                recovery.start()
+                child_processes.append(recovery)
+                recovery_sender.close()
+                assert recovery_receiver.poll(45), (
+                    "fresh reaper did not recover the post-wait crash"
+                )
+                recovery_result = recovery_receiver.recv()
+                recovery.join(timeout=10)
+                assert not recovery.is_alive()
+                assert recovery.exitcode == 0
+                recovery_receiver.close()
             assert recovery_result[0] == "ok", recovery_result
             assert recovery_result[1] not in {controller_pid, driver["pid"]}
             recovered = supervisor._sandbox_execution_get(attempt["id"])
@@ -5414,6 +5543,14 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
                 ).fetchone()
             assert not remaining_leases
             assert remaining_allocation is None
+            with supervisor.connect() as connection:
+                assert (
+                    connection.execute(
+                        "SELECT 1 FROM result_imports WHERE attempt_id = ?",
+                        (attempt["id"],),
+                    ).fetchone()
+                    is None
+                )
             service_log = service_log_path.read_text(encoding="utf-8", errors="replace")
             assert runner["credential"] not in service_log
             return

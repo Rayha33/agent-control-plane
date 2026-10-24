@@ -786,18 +786,36 @@ class WorkersMixin:
                     verified = current
                     break
                 if phase == "cleanup_reported":
-                    verified = self._sandbox_execution_verify_cleanup(
-                        attempt_id,
-                        claim_token,
-                        credential=credential,
-                    )
-                    break
+                    try:
+                        verified = self._sandbox_execution_verify_cleanup(
+                            attempt_id,
+                            claim_token,
+                            credential=credential,
+                        )
+                    except SupervisorError as error:
+                        if error.code != "sandbox_execution_gate_busy":
+                            raise
+                        # A fresh reaper may be finalizing this exact
+                        # cleanup_reported row under the process-shared
+                        # execution fence. The fence is fail-closed, but busy
+                        # is explicitly retryable; keep polling the durable
+                        # identity instead of returning a transient race as a
+                        # terminal worker failure.
+                    else:
+                        break
                 if phase == "ambiguous":
                     raise SupervisorError(
                         "sandbox_execution_ambiguous",
                         "sandbox worker cleanup is ambiguous; execution and resource fences remain held",
                     )
-                if phase not in {"reserved", "launched", "running", "stopping", "exited"}:
+                if phase not in {
+                    "reserved",
+                    "launched",
+                    "running",
+                    "stopping",
+                    "exited",
+                    "cleanup_reported",
+                }:
                     raise SupervisorError(
                         "sandbox_execution_transition_invalid",
                         "sandbox worker reached an unknown phase; execution and resource fences remain held",
@@ -814,7 +832,7 @@ class WorkersMixin:
                 elif cancellation_deadline is not None and now >= cancellation_deadline:
                     raise SupervisorError(
                         "sandbox_execution_cleanup_unverified",
-                        "sandbox worker did not produce a cleanup report after exact cancellation; execution and resource fences remain held",
+                        "sandbox worker cleanup did not reach independently verified state before the deadline; execution and resource fences remain held",
                     )
                 time.sleep(0.05)
         except KeyboardInterrupt as error:
@@ -848,11 +866,17 @@ class WorkersMixin:
                             "sandbox worker identity changed during cancellation; execution remains fenced",
                         )
                     if current.get("phase") == "cleanup_reported":
-                        verified = self._sandbox_execution_verify_cleanup(
-                            attempt_id,
-                            claim_token,
-                            credential=credential,
-                        )
+                        try:
+                            verified = self._sandbox_execution_verify_cleanup(
+                                attempt_id,
+                                claim_token,
+                                credential=credential,
+                            )
+                        except SupervisorError as cleanup_error:
+                            if cleanup_error.code != "sandbox_execution_gate_busy":
+                                raise
+                            time.sleep(0.05)
+                            continue
                         if (
                             verified.get("attempt_id"),
                             verified.get("claim_token"),
@@ -875,7 +899,7 @@ class WorkersMixin:
                 else:
                     raise SupervisorError(
                         "sandbox_execution_cleanup_unverified",
-                        "sandbox cancellation did not produce a cleanup report; execution and resource fences remain held",
+                        "sandbox cancellation cleanup did not reach independently verified state before the deadline; execution and resource fences remain held",
                     )
             except BaseException as cleanup_error:
                 error.add_note(
