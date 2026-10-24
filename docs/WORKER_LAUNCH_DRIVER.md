@@ -1511,6 +1511,61 @@ does not establish registered `run_worker()` composition, real credential
 delivery, provider proxy policy/egress, or absence of canary bytes from every
 possible host path. Task #3441 remains open; PR #42 remains draft/open/unmerged.
 
+### Supervised `run_worker()` FD4 canary and result-import replay (2026-10-24 UTC; no provider)
+
+The follow-up used a `git archive` of PR head
+`9c25c8983d2346e1950bbc262361d6e880ab04f4` in the same disposable Debian 12
+ARM64 / Linux `6.12.95+deb12-cloud-arm64` VM, with systemd `252.39`, CPython
+`3.12.15`, uv `0.5.9`, and rootless runc `1.5.2` (binary SHA-256
+`d10ecae898361832a059be2089bab92d158aec54661b18ed7346ed79628b46b0`). The
+Linux ARM64 uv release asset matched its official SHA-256
+`376d5d52a4b3a9875d66898261e2ce2d31d36c095a1d81cb88d953f5bf7273eb`.
+
+Host and guest source SHA-256 values matched:
+
+| File | SHA-256 |
+| --- | --- |
+| `pyproject.toml` | `cfb987509711316640f448b0b87eeee3cd9ffe396bd30bac25cdd62b6299acca` |
+| `uv.lock` | `f3314012c2d1fcf5f05949a5c15c07e20be43283d8c927d5d676a24ea29f78b8` |
+| `src/agent_control_plane/supervisor/oci_worker.py` | `9731bedf92ffc0d6e0f368e23db722bc66d358f9cc025926154eb8c2f2f4f134` |
+| `src/agent_control_plane/supervisor/sandbox_launch_driver_service.py` | `d68c16bbdf0ad86fbbdc6fb6df6bca07db399fa9c61214f159d5e3e867820865` |
+| `src/agent_control_plane/supervisor/sandbox_execution_journal.py` | `0000645f92f783fc45cd86b3d5da9d28e56da261f44e84f17391eafea474f70a` |
+| `tests/test_sandbox_worker_lifecycle_integration.py` | `a9e125022abf2ebd4be99821f7b4016d4f5d1384b5716ea0bfcf8143ac6fb1fe` |
+
+With `ACP_RUN_SANDBOX_WORKER_LIFECYCLE=1`,
+`ACP_LIVE_WORKER_CANARY_FD4=1`, `ACP_TEST_ALLOW_WORKER_CANARY=1`,
+`ACP_LIVE_SUPERVISED_RUN_WORKER=1`, and
+`ACP_LIVE_IMPORT_RESULT_AFTER_CLEANUP=1` (plus the pinned runc and BusyBox
+paths), `test_live_production_launch_driver_runs_exact_pinned_runc_request`
+passed 1/1 in 2.36s (exit 0). Unlike the preceding isolated launch-driver
+replay, this mode exercised registered `run_worker()`, verified
+`cleanup_verified`, then imported the synthetic result into its temporary
+fixture repository; the submission reached `pending_qc` and the fixture task
+reached `qc_review`. Assertions checked the expected imported paths and that
+`worker-canary-fd4-result` contained only the expected SHA-256 digest.
+
+The synthetic worker-delivered canary remained absent from launch-driver
+systemd argv/environment, supervisor event payloads, SQLite database bytes,
+and the launch-driver service log. The enrolled test-runner credential stayed
+on the harness authorization path, separate from the worker canary. The guest
+command piped combined pytest stdout/stderr through a regex replacement for the
+random canary pattern before returning it to the host; no raw log was saved.
+No provider endpoint,
+provider credential, provider-proxy request, model inference, or paid call was
+configured or used. The canary is test data, not a real secret: worker-controlled
+stdout/stderr or result files could contain it if worker code printed it; this
+replay's result contained only the digest.
+
+Postflight found zero `acp-*` user units, no runc process, no `acp-live-*`
+fixture root, and an empty `user-acp.slice` cgroup. The exact mode-0700
+owner-private source/uv staging tree was removed, and the VM was stopped. This
+proves the test-only FD4 path through supervised `run_worker()` and
+cleanup-verified fixture result import on this Linux tuple. It does not prove
+real provider credentials/authentication or egress, broad absence of canary
+bytes from every host path, reboot recovery, hostile-kernel isolation, or
+default-worker activation. Tasks #2370 and #3441 remain open; PR #42 remains
+draft/open/unmerged.
+
 ### Live concurrent-workspace and post-wait recovery replay (2026-10-24; no provider)
 
 The source archive was taken from docs-only PR head
