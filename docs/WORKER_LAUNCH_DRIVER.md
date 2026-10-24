@@ -1419,3 +1419,61 @@ The full exact-head GitHub Actions matrix for test-only commit
 
 This matrix checks the repository test suite; it is not additional
 sandbox-isolation, provider-egress, activation, or crash-recovery evidence.
+
+### Exact-head provider UDS cancellation replay (2026-10-24; no provider)
+
+After PR #42 advanced to code commit
+`6fe68c36d9521c52c3abacd92bbc906ea7c0e81e`, the opt-in
+`test_live_production_launch_driver_runs_exact_pinned_runc_request` passed
+1/1 with exit code 0 on the disposable Debian 12 ARM64 Lima VM
+`acp-2370-live-sandbox-kernel612-20261021` (Linux
+`6.12.95+deb12-cloud-arm64`, systemd `252.39`, rootless runc `1.5.2`, SHA-256
+`d10ecae898361832a059be2089bab92d158aec54661b18ed7346ed79628b46b0`). The
+fixture ran under CPython 3.12.15 selected by `uv 0.5.9`; its Linux ARM64 uv
+binary matched the official [release asset checksum](https://github.com/astral-sh/uv/releases/download/0.5.9/uv-aarch64-unknown-linux-gnu.tar.gz.sha256)
+`376d5d52a4b3a9875d66898261e2ce2d31d36c095a1d81cb88d953f5bf7273eb`.
+
+The exact opt-in combination was
+`ACP_RUN_SANDBOX_WORKER_LIFECYCLE=1`,
+`ACP_LIVE_SUPERVISED_RUN_WORKER=1`, `ACP_LIVE_CANCEL_AFTER_START=1`,
+`ACP_LIVE_PROVIDER_PROXY_UDS=1`, and
+`ACP_LIVE_PROVIDER_PROXY_CANCEL=1`, with the pinned runc 1.5.2 path/version.
+The test injected the synthetic policy authority
+`allowed.example.invalid:443`, but the worker never requested that authority.
+It reached the attempt-scoped provider UDS and produced the expected
+connected/open-partial-request marker. The provider proxy rejected a same-UID
+peer outside the exact worker cgroup, which the test asserted as HTTP 403.
+Interrupting `run_worker()` reached
+`cleanup_verified`; assertions confirmed the provider socket and directory were
+removed, all observed worker processes were absent, the required cgroups were
+empty, runtime state was `released`, allocations were empty, and the cancelled
+result was ineligible for import.
+
+Host and guest SHA-256 values matched for every staged source/test file used by
+this proof:
+
+| File | SHA-256 |
+| --- | --- |
+| `src/agent_control_plane/supervisor/provider_egress.py` | `e6a8bced5a3f284751e69f0da54afc2d2f408e471af5ea3a595aa9313a5139b1` |
+| `src/agent_control_plane/supervisor/provider_proxy.py` | `fa8119eb1e4fb1c81f856178a6227569c554049f9ac8e032984d796db0535fca` |
+| `src/agent_control_plane/supervisor/sandbox_launch_driver_service.py` | `d68c16bbdf0ad86fbbdc6fb6df6bca07db399fa9c61214f159d5e3e867820865` |
+| `src/agent_control_plane/supervisor/sandbox_execution_journal.py` | `0000645f92f783fc45cd86b3d5da9d28e56da261f44e84f17391eafea474f70a` |
+| `src/agent_control_plane/supervisor/oci_worker.py` | `9731bedf92ffc0d6e0f368e23db722bc66d358f9cc025926154eb8c2f2f4f134` |
+| `src/agent_control_plane/supervisor/workers.py` | `641fbb91d4447e95328e5096065e22ec0055260e3136772ff142caff09747cbb` |
+| `tests/test_sandbox_worker_lifecycle_integration.py` | `a9e125022abf2ebd4be99821f7b4016d4f5d1384b5716ea0bfcf8143ac6fb1fe` |
+
+Postflight found no pytest, runc, or launch-driver process; the loaded
+`user-acp.slice` had an empty `cgroup.procs`, and no test-specific unit or
+fixture root remained. This session removed its temporary guest staging tree
+and stopped the VM. `limactl shell` printed two pre-existing guest `.profile`
+warnings for helper files under `/tmp` that had already been cleaned; the
+test command used `env -i`, and no profile change was made. No provider
+credential or real provider endpoint was configured/contacted, and the
+synthetic authority above was not requested; the worker communicated only with
+the local test UDS. No DNS lookup, TLS handshake, model call, or paid call was
+made by the live worker. (The temporary test setup used the official uv asset
+and the repository's frozen development dependencies.)
+This is fresh evidence for the no-provider UDS cancellation path only; it does
+not establish provider authentication/egress, production credential delivery,
+crash/reboot recovery, general hostile-kernel isolation, or default-worker
+activation. Tasks #2370 and #3441 remain open; PR #42 remains draft/open/unmerged.
