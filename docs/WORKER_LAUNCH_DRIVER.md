@@ -1508,8 +1508,8 @@ address-family restriction and probes it from inside the exact launch-driver
 service before starting the production driver. It also gives that replay a
 150-second sandbox timeout so the cancellation assertion has headroom. This is
 a syscall-family gate, not a separate network namespace, and this correction
-remains pending a fresh disposable replay; independent static/source QC has
-since returned GO on the exact code diff.
+was included in the passing fresh disposable replay recorded below.
+Independent static/source QC returned GO on the exact code diff.
 Tasks #2370 and #3441 remain open; PR #42 remains draft/open/unmerged.
 
 The fresh kernel-6.12 replay reached the worker's `provider-probe-result` and
@@ -1531,11 +1531,12 @@ attempt slice while the exact durable execution was still stopping, invalidating
 the monitor's durable slice binding before cleanup verification. The test now
 checks the attempt/claim/execution identity and exact `cleanup_verified` phase
 before any ACP unit stop; otherwise it preserves the fixture and units.
-That guard has local tests. Independent static/source QC has returned GO on
-the exact code diff; a fresh disposable replay remains pending. Tasks #2370
-and #3441 remain open; PR #42 remains draft/open/unmerged.
+That guard has local tests and was exercised by the passing fresh disposable
+replay recorded below. Independent static/source QC returned GO on the exact
+code diff. Tasks #2370 and #3441 remain open; PR #42 remains
+draft/open/unmerged.
 
-### Bounded cancellation escalation (2026-10-24 UTC; pending replay)
+### Bounded cancellation escalation (2026-10-24 UTC; replay pass)
 
 Read-only systemd journal inspection of the second failed fixture established
 the cancellation timing: the authenticated monitor's durable cancel response
@@ -1554,11 +1555,21 @@ attempt-slice binding; it never targets a controller-supplied PID or the parent
 slice. It polls that same identity for up to five seconds after escalation and
 fails closed on unknown/replaced scope state or anything other than verified
 `stopping` or `exited`. Focused monitor-service tests and local Ruff/format
-checks pass. Independent static/source QC of the exact code diff is GO; a fresh
-disposable TLS/cancellation replay remains pending. The two prior failed
-fixtures remain preserved and quarantined. No claim of provider/TLS
-cancellation success is made. Tasks #2370 and #3441 remain open; PR #42 remains
-draft/open/unmerged.
+checks pass. Independent static/source QC of the exact code diff is GO. The
+fresh exact-source replay passed the composed supervised FD4-canary, provider
+UDS, TLS-redirect-denial, and cancellation test 1/1 (exit 0) on the disposable
+Debian 12 ARM64 guest (Linux 6.12.95, systemd 252.39, runc 1.5.2). Its exact
+cleanup-identity assertion passed. Post-run read-only inspection found no new
+attempt runroot, provider-proxy directory, active test service, or scope; the
+two earlier quarantined fixtures remain untouched. The replay used only the
+synthetic provider canary and local mock; it made no provider request and used
+no real provider credentials. The harness used its enrolled test-runner
+credential for control-plane authorization. The live test proves cancellation
+and verified cleanup; it does not emit a separate receipt identifying whether
+graceful stop or forced SIGKILL completed the scope. The focused
+monitor-service unit tests separately assert exact-scope SIGKILL escalation
+and fail-closed identity checks. Tasks #2370 and #3441 remain open; PR #42
+remains draft/open/unmerged.
 
 ### Live synthetic FD4 worker-canary replay (2026-10-24; no provider)
 
