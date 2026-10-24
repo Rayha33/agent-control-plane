@@ -1478,6 +1478,39 @@ not establish provider authentication/egress, production credential delivery,
 crash/reboot recovery, general hostile-kernel isolation, or default-worker
 activation. Tasks #2370 and #3441 remain open; PR #42 remains draft/open/unmerged.
 
+### Live synthetic FD4 worker-canary replay (2026-10-24; no provider)
+
+The opt-in `test_live_production_launch_driver_runs_exact_pinned_runc_request`
+passed 1/1 (exit 0) from an archive of PR head
+`631d55819beab784bff4896eb9f434eaff0767a1` on the same disposable Debian 12
+ARM64 / Linux 6.12.95 / systemd 252.39 VM, using CPython 3.11.2, checksum-
+verified uv 0.5.9, and rootless runc 1.5.2. Host and guest SHA-256 matched for
+`oci_worker.py`, `sandbox_launch_driver_service.py`,
+`sandbox_execution_journal.py`, the integration test, `pyproject.toml`, and
+`uv.lock` (the source and lock hashes match the preceding tables).
+
+The worker-delivered credential payload was a random test canary, with
+`ACP_LIVE_WORKER_CANARY_FD4=1` and the explicit test-only
+`ACP_TEST_ALLOW_WORKER_CANARY=1`; no provider endpoint, provider credential,
+provider proxy, model inference, or paid call was configured. The worker's
+static probe read the canary through the test FD4 path and returned its
+expected SHA-256 digest. Assertions kept the raw canary out of launch-driver
+systemd argv/environment, supervisor event payloads, SQLite database bytes,
+and the launch-driver service log. The isolated execution workspace's named
+`worker-canary-fd4-result` artifact contained the expected digest, not the raw
+canary. This invocation omitted both supervised-worker and import-after-cleanup
+flags, so it did not exercise registered `run_worker()` composition or create
+an imported result commit. The synthetic enrolled test-runner credential used
+for control-plane authorization remained on the harness path, distinct from
+the worker-delivered canary.
+
+Postflight found no `acp-` scope or `acp-live-*` fixture root; the exact
+owner-private source/uv staging tree was removed and the VM stopped. This is
+test-only FD4 transport evidence for the production launch-driver path. It
+does not establish registered `run_worker()` composition, real credential
+delivery, provider proxy policy/egress, or absence of canary bytes from every
+possible host path. Task #3441 remains open; PR #42 remains draft/open/unmerged.
+
 ### Live concurrent-workspace and post-wait recovery replay (2026-10-24; no provider)
 
 The source archive was taken from docs-only PR head
