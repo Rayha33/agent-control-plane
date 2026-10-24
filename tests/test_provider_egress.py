@@ -130,6 +130,24 @@ def test_private_local_reserved_and_mapped_addresses_are_denied(
     assert result.value.code == "destination_address_denied"
 
 
+@pytest.mark.parametrize("network", provider_egress._IANA_SPECIAL_PURPOSE_NETWORKS, ids=str)
+def test_every_pinned_iana_special_purpose_prefix_is_denied(
+    monkeypatch: pytest.MonkeyPatch,
+    network: ipaddress.IPv4Network | ipaddress.IPv6Network,
+) -> None:
+    address = str(network.network_address)
+    monkeypatch.setattr(
+        provider_egress.socket,
+        "getaddrinfo",
+        lambda *_args, **_kwargs: [record(address)],
+    )
+
+    with pytest.raises(EgressPolicyError) as result:
+        policy().resolve_connect_authority("api.example.com:443")
+
+    assert result.value.code == "destination_address_denied"
+
+
 def test_empty_dns_answers_fail_closed(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(provider_egress.socket, "getaddrinfo", lambda *_a, **_kw: [])
 

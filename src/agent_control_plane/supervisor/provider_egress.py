@@ -49,9 +49,12 @@ class PinnedConnection:
 _LABEL = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 
 # Snapshot of the IANA IPv4/IPv6 Special-Purpose Address Registries (both last
-# updated 2025-10-09). Reject the entire registered blocks, including entries
-# marked globally reachable: they are special-use destinations, not arbitrary
-# provider endpoints. Refresh this list when updating the registry snapshot.
+# updated 2025-10-09, verified unchanged on 2026-10-24):
+# https://www.iana.org/assignments/iana-ipv4-special-registry
+# https://www.iana.org/assignments/iana-ipv6-special-registry
+# Reject the entire registered blocks, including entries marked globally
+# reachable: they are special-use destinations, not arbitrary provider
+# endpoints. Refresh this list when updating the registry snapshot.
 _IANA_SPECIAL_PURPOSE_NETWORKS = tuple(
     ipaddress.ip_network(network)
     for network in (
