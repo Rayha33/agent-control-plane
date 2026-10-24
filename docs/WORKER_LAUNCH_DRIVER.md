@@ -1566,6 +1566,70 @@ bytes from every host path, reboot recovery, hostile-kernel isolation, or
 default-worker activation. Tasks #2370 and #3441 remain open; PR #42 remains
 draft/open/unmerged.
 
+### Supervised FD4 canary with provider-UDS cancellation (2026-10-24 UTC; no provider)
+
+At code head `9ce0abd812d01cdd3da8a3031e5b68a884ad43b6`, the integration test
+module was updated only in the disposable test checkout and matched host to
+guest at SHA-256
+`c299873fe5f186d8273a219094f5b57f7938b9a322b771b761e55912991650b9`. Runtime
+source remained at the PR head. The replay used Debian 12 ARM64, Linux
+`6.12.95+deb12-cloud-arm64`, systemd `252.39`, CPython `3.12.15`, checksum-
+verified uv `0.5.9` (Linux ARM64 release asset SHA-256
+`376d5d52a4b3a9875d66898261e2ce2d31d36c095a1d81cb88d953f5bf7273eb`), BusyBox
+`1.35.0`, and rootless runc `1.5.2` (binary SHA-256
+`d10ecae898361832a059be2089bab92d158aec54661b18ed7346ed79628b46b0`). The
+other staged source hashes matched the preceding supervised canary replay.
+
+The exact live-test flags were:
+
+```sh
+ACP_RUN_SANDBOX_WORKER_LIFECYCLE=1 \
+ACP_OCI_TEST_RUNC=/usr/local/bin/runc \
+ACP_OCI_TEST_RUNC_VERSION=1.5.2 \
+ACP_OCI_TEST_BUSYBOX=/usr/bin/busybox \
+ACP_LIVE_SUPERVISED_RUN_WORKER=1 \
+ACP_LIVE_CANCEL_AFTER_START=1 \
+ACP_LIVE_PROVIDER_PROXY_UDS=1 \
+ACP_LIVE_PROVIDER_PROXY_CANCEL=1 \
+ACP_LIVE_WORKER_CANARY_FD4=1 \
+ACP_TEST_ALLOW_WORKER_CANARY=1 \
+uv run --frozen --extra dev pytest -vv \
+  tests/test_sandbox_worker_lifecycle_integration.py::test_live_production_launch_driver_runs_exact_pinned_runc_request
+```
+
+The actual guest invocation used `env -i` with only task-scoped `HOME`, `PATH`,
+user-manager socket coordinates, `UV_CACHE_DIR`, and the flags above; the
+verified uv 0.5.9 binary was first on `PATH`.
+
+`test_live_production_launch_driver_runs_exact_pinned_runc_request` passed
+1/1 in 14.19 seconds. It exercised the registered `run_worker()` path: the
+worker read the synthetic FD4 canary and wrote only its SHA-256 digest, then
+used its attempt-scoped provider UDS for the malformed-request and blocked
+`.invalid` policy probes. It opened a partial local UDS request; a same-UID
+peer outside the exact worker cgroup received HTTP 403. SIGINT cancellation
+reached `cleanup_verified`; the test asserted the canary digest result existed
+in the temporary workspace, but the cancelled result was not imported. No
+approved CONNECT, DNS lookup, external network request, TLS session, provider
+authentication, model inference, or paid call occurred.
+
+The first composite run exposed a fixture-only conflict: the ordinary canary
+probe wrote the success marker before the cancellation assertion expected it
+absent. The test harness now compiles that probe without the success marker in
+this exact cancellation combination; the rerun passed. Canary assertions still
+check the covered launcher argv/environment, supervisor events/database bytes,
+and service log. This synthetic value is not a real secret, and worker-owned
+stdout/stderr or result files remain capable of containing it if worker code
+prints it; this replay did not establish absence from every possible host path.
+
+Postflight found no ACP test unit, no runc process, no `acp-live-*` fixture
+root, and an empty `user-acp.slice` cgroup. The exact mode-0700 source/uv
+staging tree was removed and the VM was stopped. This is evidence for composing
+the test-only FD4 canary with supervised proxy-UDS cancellation and cleanup on
+this Linux tuple. It does not prove a successful approved tunnel, TLS redirect
+handling, real provider credentials/authentication/egress, reboot recovery,
+hostile-kernel isolation, or default-worker activation. Tasks #2370 and #3441
+remain open; PR #42 remains draft/open/unmerged.
+
 ### Live concurrent-workspace and post-wait recovery replay (2026-10-24; no provider)
 
 The source archive was taken from docs-only PR head

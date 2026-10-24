@@ -14,9 +14,13 @@ test inside the private workspace, then imports the host-captured result into
 the normal pending-QC submission path. An explicit opt-in mode drives that
 fixture through ``WorkersMixin.run_worker`` and its verified-import boundary;
 it can be combined with the host-path probes to test those denials through the
-public supervisor path. A separate synthetic FD4 canary may be combined only
-with that supervised/import mode, proving the test-only descriptor handoff,
-cleanup verification, and digest-only result import in one no-provider run.
+public supervisor path. The separate synthetic FD4 canary can be combined with
+that supervised/import mode, proving the test-only descriptor handoff, cleanup
+verification, and digest-only result import in one no-provider run. A second
+exact opt-in combination reads and digests the fake canary before exercising
+the attempt-scoped provider UDS and supervised cancellation path; it proves
+credential-channel teardown with proxy cleanup, but makes no provider
+connection and imports no cancelled result.
 Combining the supervised mode with ``ACP_LIVE_CANCEL_AFTER_START=1`` instead
 injects SIGINT while ``run_worker`` waits on a running payload; the test proves
 that its interrupt handler requests exact monitor cancellation, verifies
@@ -548,9 +552,11 @@ int main(int argc, char **argv) {
     if (write_marker("/workspace/worker-canary-fd4-result", result_marker) != 0) {
         return 14;
     }
+#ifndef ACP_WORKER_CANARY_NO_LAUNCH_MARKER
     if (write_marker("/workspace/launch-driver-marker", "production-driver-ran\n") != 0) {
         return 15;
     }
+#endif
     return 0;
 }
 """
@@ -3377,19 +3383,30 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
         if test_worker_canary is not None
         else None
     )
+    worker_canary_provider_cancel = (
+        worker_canary_fd4
+        and provider_proxy_uds
+        and provider_proxy_cancel
+        and supervised_run_worker
+        and os.environ.get("ACP_LIVE_CANCEL_AFTER_START") == "1"
+        and not import_result_after_cleanup
+    )
     if worker_canary_fd4 and (
         os.environ.get("ACP_TEST_ALLOW_WORKER_CANARY") != "1"
-        or supervised_run_worker != import_result_after_cleanup
-        or provider_proxy_uds
-        or provider_proxy_cancel
+        or (
+            supervised_run_worker != import_result_after_cleanup
+            and not worker_canary_provider_cancel
+        )
+        or (provider_proxy_uds and not worker_canary_provider_cancel)
+        or (provider_proxy_cancel and not worker_canary_provider_cancel)
         or cross_attempt_probes
         or isolation_probes
         or os.environ.get("ACP_LIVE_CRASH_AFTER_EXIT_BEFORE_CLEANUP_REPORT") == "1"
     ):
         pytest.fail(
             "FD4 canary proof requires ACP_TEST_ALLOW_WORKER_CANARY=1 and either the isolated "
-            "production no-model launch-driver mode or the supervised run_worker plus "
-            "cleanup-verified import mode"
+            "production no-model launch-driver mode, the supervised run_worker plus "
+            "cleanup-verified import mode, or supervised provider-UDS cancellation"
         )
     crash_after_exit_before_cleanup_report = (
         os.environ.get("ACP_LIVE_CRASH_AFTER_EXIT_BEFORE_CLEANUP_REPORT") == "1"
@@ -3710,6 +3727,11 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
                         "-Wall",
                         "-Wextra",
                         "-Werror",
+                        *(
+                            ["-DACP_WORKER_CANARY_NO_LAUNCH_MARKER=1"]
+                            if worker_canary_provider_cancel
+                            else []
+                        ),
                         str(canary_source_path),
                         "-o",
                         str(canary_client_path),
@@ -4185,6 +4207,17 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
                 "/bin/busybox sleep 0.1; done; "
                 "printf 'production-driver-ran\\n' > /workspace/launch-driver-marker; "
                 + ("exit 17" if supervised_post_wait_recovery else "true"),
+            )
+        elif provider_proxy_uds and worker_canary_fd4:
+            assert test_worker_canary is not None
+            payload_command = (
+                "/bin/busybox",
+                "sh",
+                "-c",
+                "set -eu; "
+                f"/bin/worker-canary-fd4-probe {len(test_worker_canary)}; "
+                "/bin/provider-proxy-probe; "
+                "printf 'production-driver-ran\\n' > /workspace/launch-driver-marker",
             )
         elif provider_proxy_uds:
             payload_command = (
