@@ -1121,6 +1121,7 @@ raise SystemExit(sandbox_launch_driver_service.main(driver_args))
 
     exit_code = 73
     try:
+        provider_proxy_uds = os.environ.get("ACP_LIVE_PROVIDER_PROXY_UDS") == "1"
         supervisor = GitSupervisor(repo)
         with patch.object(
             sandbox_launch_driver_service,
@@ -1136,7 +1137,7 @@ raise SystemExit(sandbox_launch_driver_service.main(driver_args))
                     "sandbox_pids_max": pids_max,
                     "sandbox_timeout_seconds": timeout_seconds,
                 }
-                if test_worker_canary is None:
+                if test_worker_canary is None and not provider_proxy_uds:
                     result = supervisor.run_worker(
                         attempt_id,
                         claim_token,
@@ -1149,14 +1150,22 @@ raise SystemExit(sandbox_launch_driver_service.main(driver_args))
                         sandbox_launch_driver_service.start_registered_no_model_sandbox_worker
                     )
 
-                    def start_registered_with_test_canary(*args: Any, **kwargs: Any) -> Any:
-                        kwargs["_test_worker_canary"] = test_worker_canary
+                    def start_registered_with_test_options(*args: Any, **kwargs: Any) -> Any:
+                        if test_worker_canary is not None:
+                            kwargs["_test_worker_canary"] = test_worker_canary
+                        if provider_proxy_uds:
+                            # Test-only injection exercises provider-socket lifecycle through
+                            # run_worker without adding a public provider-egress API.
+                            kwargs["provider_egress_policy_name"] = "live-uds-only"
+                            kwargs["provider_egress_destinations"] = {
+                                "allowed.example.invalid": [443]
+                            }
                         return original_start_registered(*args, **kwargs)
 
                     with patch.object(
                         sandbox_launch_driver_service,
                         "start_registered_no_model_sandbox_worker",
-                        start_registered_with_test_canary,
+                        start_registered_with_test_options,
                     ):
                         result = supervisor.run_worker(
                             attempt_id,
@@ -4115,7 +4124,7 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
                 cross_attempt_probes,
                 isolation_probes,
                 import_result_after_cleanup,
-                supervised_run_worker,
+                supervised_run_worker and not (cancel_after_start and provider_proxy_cancel),
                 cancel_after_start and not provider_proxy_cancel,
                 timeout_after_start,
                 lease_expiry_after_stop,
