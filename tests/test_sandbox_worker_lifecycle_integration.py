@@ -17,6 +17,10 @@ it can be combined with the host-path probes to test those denials through the
 public supervisor path. A separate synthetic FD4 canary may be combined only
 with that supervised/import mode, proving the test-only descriptor handoff,
 cleanup verification, and digest-only result import in one no-provider run.
+Combining the supervised mode with ``ACP_LIVE_CANCEL_AFTER_START=1`` instead
+injects SIGINT while ``run_worker`` waits on a running payload; the test proves
+that its interrupt handler requests exact monitor cancellation, verifies
+cleanup, and does not import a failed result.
 These are no-model executor proofs; they do not start a provider/model worker
 or enable the default ``run_worker`` path.
 
@@ -24,8 +28,11 @@ The legacy direct-monitor lifecycle fixture is intentionally skipped: it starts
 runc from a monitor-owned service and cannot satisfy the current launch-driver
 redemption contract. The production launch-driver test remains opt-in. Its
 default branch verifies natural completion; setting
-`ACP_LIVE_CANCEL_AFTER_START=1` runs the same fixture with a long payload and
-verifies cancellation from a fresh supervisor. Setting
+`ACP_LIVE_CANCEL_AFTER_START=1` without the supervised `run_worker` mode runs
+the same fixture with a long payload and verifies cancellation from a fresh
+supervisor. When combined with the supervised `run_worker` mode described
+above, it instead sends SIGINT to the producer and verifies that
+`run_worker()` requests cancellation and checks cleanup. Setting
 `ACP_LIVE_TIMEOUT_AFTER_START=1` uses a one-second driver timeout with a long
 payload and verifies automatic stop-intent recording, monitor cancellation,
 and cleanup verification. Setting
@@ -4088,14 +4095,13 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
                 "post-wait cleanup-report crash proof requires ACP_LIVE_PROVIDER_PROXY_UDS=1"
             )
         if supervised_run_worker and (
-            not import_result_after_cleanup
-            or cancel_after_start
+            not (import_result_after_cleanup or cancel_after_start)
             or timeout_after_start
             or lease_expiry_after_stop
             or crash_driver_service_before_receipt
         ):
             pytest.fail(
-                "supervisor run_worker proof requires successful coding-task completion and result import"
+                "supervisor run_worker proof requires natural completion/import or the explicit cancellation mode"
             )
         if isolation_probes and (
             cancel_after_start
@@ -4440,6 +4446,49 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
                 assert provider_probe_release is not None
                 if not crash_after_exit_before_cleanup_report:
                     provider_probe_release.write_text("release-provider-probe\n", encoding="ascii")
+        supervised_cancel = supervised_run_worker and cancel_after_start
+        if supervised_cancel:
+            running_deadline = time.monotonic() + 30
+            running_execution = supervisor._sandbox_execution_get(attempt["id"])
+            while (
+                running_execution is not None
+                and running_execution["phase"] != "running"
+                and time.monotonic() < running_deadline
+            ):
+                time.sleep(0.05)
+                running_execution = supervisor._sandbox_execution_get(attempt["id"])
+            assert running_execution is not None and running_execution["phase"] == "running"
+            started_marker = (
+                Path(running_execution["workspace_root_path"]) / "launch-driver-started"
+            )
+            started_deadline = time.monotonic() + 5
+            while not _entry_is_present(started_marker) and time.monotonic() < started_deadline:
+                time.sleep(0.05)
+            assert _entry_is_present(started_marker), "supervised payload did not start"
+
+            # Keep the payload alive across the deliberately short claim lease
+            # before interrupting the process blocked in run_worker.
+            time.sleep(12)
+            renewed_attempt = supervisor.attempt(attempt["id"])
+            assert renewed_attempt["status"] == "working"
+            assert renewed_attempt["lease_expires_at"] > initial_lease_expires_at
+            assert renewed_attempt["lease_expires_at"] > int(time.time())
+
+            wrong_credential_supervisor = GitSupervisor(repo)
+            with patch.object(
+                sandbox_monitor_lifecycle,
+                "reconnect_sandbox_monitor",
+                side_effect=AssertionError("invalid runner credential reached the monitor"),
+            ) as reconnect:
+                with pytest.raises(SupervisorError) as rejected:
+                    wrong_credential_supervisor.terminate_worker(
+                        attempt["id"], credential="not-the-enrolled-runner-credential"
+                    )
+                assert rejected.value.code == "runner_authentication_failed"
+                reconnect.assert_not_called()
+
+            assert producer_controller.pid is not None
+            os.kill(producer_controller.pid, signal.SIGINT)
         assert producer_result_receiver.poll(35), "launch producer did not report its handoff"
         producer_result = producer_result_receiver.recv()
         assert identity is not None and execution is not None
@@ -4447,27 +4496,40 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
         assert not producer_controller.is_alive(), (
             "launch producer survived simulated controller loss"
         )
-        if producer_result[0] not in {"ok", "manager_accepted"}:
-            service_log = (
-                service_log_path.read_text(encoding="utf-8", errors="replace")
-                if service_log_path.exists()
-                else ""
-            )
-            assert runner["credential"] not in service_log
-            service_detail = service_log[-12_000:] or "<launch-driver service log was not created>"
-            raise AssertionError(
-                f"production launch-driver startup failed: {producer_result}; "
-                f"service log tail:\n{service_detail}"
-            )
-        if crash_driver_service_before_receipt:
-            assert producer_result[0] == "manager_accepted", producer_result
-            producer_exit = 74
+        if supervised_cancel:
+            assert producer_result[0:2] == ("error", "KeyboardInterrupt"), producer_result
+            assert producer_controller.pid is not None
+            assert runner["credential"] not in repr(producer_result)
+            controller_pid = producer_controller.pid
+            producer_receipt = None
+            producer_summary = None
+            producer_exit = 1
         else:
-            assert producer_result[0] == "ok", producer_result
-            producer_exit = 73
+            if producer_result[0] not in {"ok", "manager_accepted"}:
+                service_log = (
+                    service_log_path.read_text(encoding="utf-8", errors="replace")
+                    if service_log_path.exists()
+                    else ""
+                )
+                assert runner["credential"] not in service_log
+                service_detail = (
+                    service_log[-12_000:] or "<launch-driver service log was not created>"
+                )
+                raise AssertionError(
+                    f"production launch-driver startup failed: {producer_result}; "
+                    f"service log tail:\n{service_detail}"
+                )
+            if crash_driver_service_before_receipt:
+                assert producer_result[0] == "manager_accepted", producer_result
+                producer_exit = 74
+            else:
+                assert producer_result[0] == "ok", producer_result
+                producer_exit = 73
         assert producer_controller.exitcode == producer_exit
         producer_result_receiver.close()
-        if producer_result[0] == "manager_accepted":
+        if supervised_cancel:
+            pass
+        elif producer_result[0] == "manager_accepted":
             controller_pid = producer_result[1]
             producer_receipt = None
             producer_summary = None
@@ -4476,7 +4538,7 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
             assert producer_receipt["attempt_id"] == identity[0]
             assert producer_receipt["claim_token"] == identity[1]
             assert producer_receipt["execution_id"] == identity[2]
-        if supervised_run_worker:
+        if supervised_run_worker and not cancel_after_start:
             assert producer_summary == {
                 "status": "pending_qc",
                 "sandbox_execution_id": identity[2],
@@ -5433,7 +5495,26 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
             )
             == start_identity_before_retry
         )
-        if cancel_after_start or lease_expiry_after_stop:
+        if supervised_cancel:
+            cancelled_execution = supervisor._sandbox_execution_get(attempt["id"])
+            assert (
+                cancelled_execution is not None
+                and cancelled_execution["phase"] == "cleanup_verified"
+            )
+            assert cancelled_execution["stop_reason"] == "terminate_worker"
+            assert cancelled_execution["runc_exit_code"] != 0
+            cancelled_workspace = Path(cancelled_execution["workspace_root_path"])
+            assert _entry_is_present(cancelled_workspace / "launch-driver-started")
+            assert not _entry_is_present(cancelled_workspace / "launch-driver-marker")
+            with supervisor.connect() as connection:
+                assert (
+                    connection.execute(
+                        "SELECT 1 FROM result_imports WHERE attempt_id = ?",
+                        (attempt["id"],),
+                    ).fetchone()
+                    is None
+                )
+        elif cancel_after_start or lease_expiry_after_stop:
             running_deadline = time.monotonic() + 30
             durable = supervisor._sandbox_execution_get(attempt["id"])
             while (
