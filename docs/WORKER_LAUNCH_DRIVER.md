@@ -1294,3 +1294,128 @@ cancellation only; it does not prove fake-credential delivery, provider
 authentication/egress, TLS redirect behavior, crash recovery through
 `run_worker()`, general hostile-kernel isolation, or default OCI-worker
 activation. Tasks #2370 and #3441 remain open.
+
+### Supervised `run_worker()` post-wait reaper-race recovery (2026-10-24; no provider)
+
+Code-bearing commit `3da9257bb47486e1d5d3e70796bd7b5cc9906499` adds a bounded
+retry when the independent cleanup verifier reports only
+`sandbox_execution_gate_busy` for an exact `cleanup_reported` execution. The
+worker loop re-reads the durable attempt identity and continues polling; other
+verification errors still fail closed. The ordinary wait and interrupt-cleanup
+deadlines are unchanged, and result import still requires exact-identity
+`cleanup_verified`.
+
+The source and test files reviewed and staged into the guest had these exact
+SHA-256 values (host and guest matched):
+
+| File | SHA-256 |
+| --- | --- |
+| `src/agent_control_plane/supervisor/workers.py` | `641fbb91d4447e95328e5096065e22ec0055260e3136772ff142caff09747cbb` |
+| `tests/test_git_supervisor.py` | `d867b4d2a812eccaca0e056ac2401c9f6474fd1523cf58fb5f73dead5adecf14` |
+| `tests/test_sandbox_worker_lifecycle_integration.py` | `a9e125022abf2ebd4be99821f7b4016d4f5d1384b5716ea0bfcf8143ac6fb1fe` |
+
+Independent exact-hash review returned GO with no blockers; the reviewer
+confirmed the retry remains restricted to the explicit busy-gate error and that
+both timeout messages describe incomplete independent verification rather than
+claiming no cleanup report exists. The focused unit test passed both normal-wait
+and interrupt-cleanup cases. The full local suite exited 0 with 92 expected
+platform/opt-in skips; Ruff check/format and `git diff --check` passed.
+
+The exact opt-in
+`test_live_production_launch_driver_runs_exact_pinned_runc_request` passed 1/1
+on disposable VM `acp-2370-live-sandbox-kernel612-20261021`: Debian 12 ARM64,
+Linux `6.12.95+deb12-cloud-arm64`, Python 3.11.2, unified cgroup v2, active
+private systemd user manager (`systemd 252.39-1~deb12u2`), root-owned
+`/usr/local/bin/runc` 1.5.2 with SHA-256
+`d10ecae898361832a059be2089bab92d158aec54661b18ed7346ed79628b46b0`, and
+`/usr/bin/busybox`. Its source root was staged from parent commit `6cdf497` plus
+the three hash-matched files above. The run used this cleared test-runner
+environment (the host invoked the command through `limactl shell`):
+
+```sh
+limactl shell acp-2370-live-sandbox-kernel612-20261021 -- env -i \
+  HOME=/home/rayha.guest \
+  LANG=C.UTF-8 \
+  PATH=/tmp/acp-2370-supervised-postwait-recovery-20261024/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+  XDG_RUNTIME_DIR=/run/user/501 \
+  DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/501/bus \
+  ACP_RUN_SANDBOX_WORKER_LIFECYCLE=1 \
+  ACP_OCI_TEST_RUNC_VERSION=1.5.2 \
+  ACP_OCI_TEST_RUNC=/usr/local/bin/runc \
+  ACP_OCI_TEST_BUSYBOX=/usr/bin/busybox \
+  ACP_LIVE_SUPERVISED_RUN_WORKER=1 \
+  ACP_LIVE_PROVIDER_PROXY_UDS=1 \
+  ACP_LIVE_CRASH_AFTER_EXIT_BEFORE_CLEANUP_REPORT=1 \
+  /tmp/acp-2370-supervised-postwait-recovery-20261024/tooling/bin/uv run \
+  --frozen --extra dev \
+  --project /tmp/acp-2370-supervised-postwait-recovery-20261024 \
+  --cache-dir /tmp/acp-2370-supervised-postwait-recovery-20261024/uv-cache \
+  pytest -q \
+  /tmp/acp-2370-supervised-postwait-recovery-20261024/tests/test_sandbox_worker_lifecycle_integration.py::test_live_production_launch_driver_runs_exact_pinned_runc_request
+```
+
+The test injected a crash after the kernel wait durably recorded synthetic
+worker exit code 17 and the proxy listener was closed/socket removed, but before
+pinned-runc deletion or a cleanup report. The OCI config records the read-only
+`/run/acp` bind mount, and the stopped runc state entry remained before reaper
+recovery; the test does not inspect the mount namespace after worker exit. A
+fresh production reaper recovered the exact execution, verified cleanup, and
+released its runtime resources. `run_worker()` remained blocked until recovery,
+then raised `SupervisorError` reporting `sandbox worker exited 17`; no result
+was imported. The live test does not assert that its independent verifier
+actually received `sandbox_execution_gate_busy`; the focused unit test
+deterministically injects one such transient response in both normal-wait and
+interrupt-cleanup paths. Assertions confirmed the provider request was absent
+and no result-import row was written. No real provider credential or real
+provider endpoint was configured. The test-only policy includes the synthetic
+authority `allowed.example.invalid:443`, but no proxy request or DNS lookup was
+made; there was no TLS handshake, model call, or paid API call.
+
+Postflight found no `acp-live-launch-driver-*` fixture root, ACP launch/monitor
+unit, `runc` or `python3` process, ACP-named cgroup, or open descriptor under
+the task staging tree; the test also asserted the exact runc state root was
+removed. The guest staging tree was removed and the VM stopped. The host-side
+staging archive was moved to Trash after the test, so it remains recoverable.
+This proves only the explicit
+opt-in no-provider post-wait recovery path and its no-import behavior. It does
+not prove provider authentication/egress, supervisor-daemon restart, reboot or
+logout recovery, hostile-kernel isolation, or default OCI-worker activation.
+Tasks #2370 and #3441 remain open; PR #42 remains draft/open/unmerged.
+
+### CI readiness-test follow-up (2026-10-24; test-only)
+
+The first hosted run of code commit `3da9257bb47486e1d5d3e70796bd7b5cc9906499`
+was mixed: one Ubuntu/Python 3.12 attempt failed in the unrelated
+`test_reaper_stops_supervised_worker_before_releasing_runtime` test while its
+five-second readiness poll checked only that the port was still available. It
+did not check whether the worker future had already completed with an error.
+Rerunning only that failed job, without changing the commit, passed: 1,742
+passed, 22 skipped, one warning, in 316.61 seconds. The evidence supports a
+test-observability/readiness race; the first failure did not establish a
+production regression.
+
+Test-only commit `00b971d8eb50d15a56554b38fe386e0e7a7cc264` makes that poll
+monotonic and bounded at 15 seconds, checks `worker.done()` during and after
+polling, and retrieves `worker.result()` so startup exceptions are surfaced.
+It does not change product or sandbox runtime behavior. The exact modified
+test file SHA-256 is
+`d4512f4300e154f74b1aeba85153ccd0dcd99feeecfa14c458b38fc949ec1222`;
+independent exact-hash QC returned GO. The focused regression test
+`tests/test_git_supervisor.py::test_reaper_stops_supervised_worker_before_releasing_runtime`
+passed in 10/10 repeated invocations on disposable Debian 12 ARM64 with Python
+3.11.2, and again in 10/10 repeated invocations with Python 3.12.15. These are
+ten repetitions of that single test per interpreter, not ten distinct tests.
+
+The full exact-head GitHub Actions matrix for test-only commit
+`00b971d8eb50d15a56554b38fe386e0e7a7cc264` passed in [run
+40129800793](https://github.com/Rayha33/agent-control-plane/actions/runs/40129800793):
+
+| Runner | Tests | Result |
+| --- | --- | --- |
+| Ubuntu / Python 3.11 | 1,742 passed, 22 skipped | Success; lint, format, and package build passed |
+| Ubuntu / Python 3.12 | 1,742 passed, 22 skipped, 1 warning | Success; lint, format, and package build passed |
+| macOS / Python 3.11 | 1,672 passed, 92 skipped | Success; lint, format, and package build passed |
+| macOS / Python 3.12 | 1,672 passed, 92 skipped | Success; lint, format, and package build passed |
+
+This matrix checks the repository test suite; it is not additional
+sandbox-isolation, provider-egress, activation, or crash-recovery evidence.
