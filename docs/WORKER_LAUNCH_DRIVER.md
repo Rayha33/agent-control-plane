@@ -1185,3 +1185,49 @@ repository paths were not visible through the tested lookups on one guest. It
 does not establish general kernel isolation, broader host-filesystem coverage,
 network-egress policy, provider/model execution, another kernel or
 architecture, or default `run_worker()` activation. Task #2370 remains open.
+
+### Supervised `run_worker()` interrupt cancellation (2026-10-24; no provider)
+
+On code-bearing commit `0dbf9622a615732275daf365ba9abb311265da60`,
+`test_live_production_launch_driver_runs_exact_pinned_runc_request` passed
+1/1 in 13.76s on disposable Debian 12 ARM64, Linux
+`6.1.0-53-cloud-arm64`, Python 3.11.2, unified cgroup v2, and an active private
+systemd user manager. Root-owned `/usr/local/bin/runc` was version 1.5.2 with
+SHA-256 `d10ecae898361832a059be2089bab92d158aec54661b18ed7346ed79628b46b0`;
+`/usr/bin/busybox` supplied the test payload. The exact test-module SHA-256
+matched between the source checkout and guest:
+`7a5ba0f6562edd474a19ac87b660c884c317322e834e9fafeb32377349d3feb7`.
+
+The command ran from the disposable checkout beneath `/tmp`:
+
+```sh
+ACP_RUN_SANDBOX_WORKER_LIFECYCLE=1 \
+ACP_OCI_TEST_RUNC=/usr/local/bin/runc \
+ACP_OCI_TEST_RUNC_VERSION=1.5.2 \
+ACP_OCI_TEST_BUSYBOX=/usr/bin/busybox \
+ACP_LIVE_SUPERVISED_RUN_WORKER=1 \
+ACP_LIVE_CANCEL_AFTER_START=1 \
+uv run --frozen --extra dev pytest -vv \
+  tests/test_sandbox_worker_lifecycle_integration.py::test_live_production_launch_driver_runs_exact_pinned_runc_request
+```
+
+The run enabled `ACP_LIVE_SUPERVISED_RUN_WORKER=1` and
+`ACP_LIVE_CANCEL_AFTER_START=1`; it did not enable result import. The test
+waited for the supervised payload to reach `running`, delivered SIGINT to the
+producer blocked in `run_worker()`, and verified exact monitor cancellation,
+`cleanup_verified`, a nonzero runc exit, and absence of a `result_imports` row.
+It also checked that wrong-credential cancellation was rejected before monitor
+reconnection. The interrupted attempt did not produce or import a successful
+coding-task result: this cancellation mode uses the sleep payload, not the
+coding-task fixture, and imported no result. No provider credentials or
+endpoint were configured or used, and no model/provider call was made.
+
+Postflight found no ACP test unit, runc process, test cgroup, or live-attempt
+root. The task-specific VM was stopped and the temporary source checkout,
+virtual environment, and package cache were removed. Exact-head GitHub Actions
+run [40122434656](https://github.com/Rayha33/agent-control-plane/actions/runs/40122434656)
+passed all four Ubuntu/macOS x Python 3.11/3.12 jobs, including tests, lint,
+formatting, and package build. This is evidence for the explicit opt-in
+supervised cancellation path only; it does not prove provider execution or
+egress, general hostile-kernel isolation, supervisor restart recovery, or
+default OCI-worker activation. Task #2370 remains open.
