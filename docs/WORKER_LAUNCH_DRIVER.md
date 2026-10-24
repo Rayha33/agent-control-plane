@@ -1477,3 +1477,91 @@ This is fresh evidence for the no-provider UDS cancellation path only; it does
 not establish provider authentication/egress, production credential delivery,
 crash/reboot recovery, general hostile-kernel isolation, or default-worker
 activation. Tasks #2370 and #3441 remain open; PR #42 remains draft/open/unmerged.
+
+### Live concurrent-workspace and post-wait recovery replay (2026-10-24; no provider)
+
+The source archive was taken from docs-only PR head
+`4ccef712f16943f39c48e3de155e9836cc02578f`; its runtime and integration-test
+files matched the seven host/guest hashes in the preceding replay table.
+`pyproject.toml` (`cfb987509711316640f448b0b87eeee3cd9ffe396bd30bac25cdd62b6299acca`)
+and `uv.lock` (`f3314012c2d1fcf5f05949a5c15c07e20be43283d8c927d5d676a24ea29f78b8`)
+also matched. Both runs used the same disposable Debian 12 ARM64 VM, Linux
+`6.12.95+deb12-cloud-arm64`, systemd `252.39`, rootless runc `1.5.2`, and
+CPython `3.11.2`.
+
+`test_live_concurrent_attempts_use_distinct_scopes_and_clean_up` passed 1/1
+(exit 0) with `ACP_RUN_SANDBOX_WORKER_LIFECYCLE=1` and
+`ACP_LIVE_CONCURRENT_ATTEMPTS=1`. It held two no-model supervised cancellation
+runs active against the same synthetic repository. The test required distinct
+attempt, container, execution, process, run-root, systemd-scope, source-worktree,
+and workspace identities, plus different simultaneously held runtime-port
+allocations. Both active scope identities remained stable across two samples.
+Each private mode-0700 workspace was under the repository's sandbox-execution
+root, had no `.git`, and was the exact `/workspace` mount source. Live probes
+could not read or write the other attempt's sentinel or a sentinel under the
+shared repository `.git`; sibling symlink and canonical `../../` probes were
+also not visible. Both host sentinels retained their original inode and bytes.
+Worker mountinfo showed one `/proc`, `/dev`, `/workspace`, `/tmp`, and
+`/home/agent` mount; the only visible test-fixture host mount was that attempt's
+own workspace, with no broad `/etc`, `/usr`, `/home`, or `/root` mount. The
+fixture's cancellation and post-cleanup assertions passed for both children.
+
+`test_live_production_launch_driver_runs_exact_pinned_runc_request` also passed
+1/1 (exit 0) with `ACP_LIVE_PROVIDER_PROXY_UDS=1`,
+`ACP_LIVE_CRASH_AFTER_EXIT_BEFORE_CLEANUP_REPORT=1`, and
+`ACP_LIVE_SUPERVISED_RUN_WORKER=1`. Its test-only wrapper exited after the
+kernel wait was durably recorded and the provider proxy closed, but before
+pinned-runc deletion and the cleanup report. A fresh production reaper finished
+the exact cleanup and resource release; `run_worker()` rejected the synthetic
+exit-code-17 result without importing it. This mode created the provider UDS
+but made no proxy request. Neither live worker used a provider credential,
+real provider endpoint, DNS/TLS provider connection, model inference, or paid
+call. The setup fetched the checksum-verified official uv asset and used the
+repository's frozen development dependencies.
+
+Postflight found no pytest, runc, or launch-driver process, no active `acp-`
+systemd scope, and no concurrent-test or launch-driver fixture roots; the two
+test suites also verified their exact units and fixture cleanup before exit.
+This session removed its staged source and uv directories and stopped the VM;
+both task VMs are stopped. `limactl shell` printed the same pre-existing guest
+`.profile` warnings for helper paths already removed under `/tmp`; the test
+processes used `env -i`, and no profile was changed. These are bounded proofs
+of two concurrent attempt workspaces and one post-wait recovery boundary on
+this Linux tuple, not proof of provider egress/authentication, real credential
+delivery, reboot recovery, general hostile-kernel isolation, Codex CLI
+read-isolation, or default-worker activation. Tasks #2370 and #3441 remain
+open; PR #42 remains draft/open/unmerged.
+
+### Live readable-host-sentinel isolation replay (2026-10-24; no provider)
+
+From the same source archive and matching runtime/test hashes, the opt-in
+`test_live_production_launch_driver_runs_exact_pinned_runc_request` passed 1/1
+(exit 0) on the disposable Debian 12 ARM64 VM above, under CPython 3.11.2 and
+rootless runc 1.5.2. The run set
+`ACP_RUN_SANDBOX_WORKER_LIFECYCLE=1`, `ACP_LIVE_ISOLATION_PROBES=1`, and
+`ACP_LIVE_ISOLATION_DISPOSABLE_HOST` to the exact VM hostname; no provider,
+endpoint or provider credential was configured, and neither supervised
+`run_worker()` nor FD4 worker-credential delivery was enabled. The test
+harness still used its enrolled test-runner credential for control-plane
+authorization.
+
+The worker probe rejected the unique synthetic sentinels at host `/etc`,
+`/usr/local/share`, the VM host user's home/config/SSH paths, host temporary
+storage, the harness checkout, task base checkout, sibling worktree, and an
+unrelated project. It also asserted the rootfs was read-only, `/usr` absent,
+`/tmp` and `/home/agent` were private tmpfs mounts, the harness PID and a
+synthetic host-process sentinel PID plus the host-only and systemd sockets were
+invisible, symlink and canonical-path escapes failed, and direct TCP to a
+reserved external-test IP was denied while workspace scratch remained
+writable. Teardown removed privileged sentinels only after identity-and-content
+verification and completed without preserving an uncertain fixture.
+
+Postflight found no remaining test sentinels, `acp-live-*` fixture roots, or
+ACP scope in the guest; the test-owned source/uv staging tree was removed and
+the VM stopped. The guest printed the same pre-existing `.profile` warnings
+for deleted `/tmp` helper paths; commands used a cleared environment after
+shell startup and did not modify the profile. This proves the tested host-path
+denials on this exact disposable Linux tuple; it does not prove confinement
+against a hostile kernel, other hosts/runtimes, Codex CLI profile-path reads,
+provider egress/authentication, real credential delivery, or default-worker
+activation. Tasks #2370 and #3441 remain open; PR #42 remains draft/open/unmerged.
