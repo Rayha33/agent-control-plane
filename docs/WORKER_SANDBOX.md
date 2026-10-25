@@ -1,36 +1,44 @@
 # Per-attempt worker sandbox decision
 
-**Current status (2026-10-25):** Provider-backed end-to-end acceptance remains
-incomplete. At exact PR #42 head `747c32988be7dbf72ffba4f042986848bed43533`,
-the composed supervised `run_worker()` TLS-mock/redirect/cancellation proof
-passed on Linux 6.12 with the runtime `SO_PEERPIDFD` gate enabled. The same gate
-refuses provider mode before attempt reservation on Linux 6.1, where the kernel
-does not implement option 77. The supported-kernel replay exercised the
-attempt-scoped UDS policy, rejected an encrypted redirect's new CONNECT to a
-blocked authority, verified the synthetic bearer canary in the local mock, and
-reached `cleanup_verified` after cancellation. This is local-mock evidence only:
-no real provider credential, endpoint, model inference, or paid call was used;
-the synthetic resolver was invoked locally, but no external DNS query was made.
-The fake canary exercised the named `read-only-fd4-v1` credential channel
-through the public `run_worker()` API; synthetic credential delivery is now
-tested, but real-provider credentials and authentication remain unverified.
-This experimental, no-model route exposes the channel only with explicit named
-credential and UDS-egress policies; it does not add generic TCP HTTP-proxy/SDK
-compatibility, and the default OCI worker path remains disabled/fail-closed. A
-separate live two-worker
-test from 2026-10-22 on one shared repository recorded `/proc/self/mountinfo` from
-each worker and verified its `/workspace` mount root matched that attempt's
-exact workspace path, `/tmp`, `/dev`, and `/home/agent` were tmpfs, `/proc` was
-procfs, and no mount root from the shared fixture appeared outside `/workspace`.
-Direct lookups of host-absolute peer-workspace and shared-Git sentinel paths
-were not visible; the peer-workspace sentinel was also tested through symlink
-and `..` paths. Cleanup was verified for both attempts. This is specific-path
-and live-mount evidence on one disposable Linux guest, not a general
-kernel-isolation proof. Real-provider authentication/egress with genuine
-credentials, full supervisor-daemon restart, logout/linger, and reboot
-recovery remain unproven.
-The dated entries below describe evidence and status as of their stated dates;
-the current summary above supersedes older integration-status statements.
+**Current status (2026-10-25):** Exact PR #42 head
+`749710807dcac615d41b10a994f1bd463304e628` passed hosted Actions run
+`40159366849` across Ubuntu/macOS × Python 3.11/3.12 (4/4 jobs). That follow-up
+changes only the portable test and evidence wording; runtime behavior is
+unchanged from the synthetic sealed-FD replay snapshot documented below.
+
+The latest credential-bearing supervised `run_worker()` live replay used a
+synthetic sealed memfd, the named UDS policy, a local TLS mock, a blocked TLS
+redirect, and cancellation; it reached `cleanup_verified` once on Debian 12
+ARM64/Linux 6.12.95, systemd 252.39, CPython 3.12.15, and runc 1.5.2. This is
+local-mock evidence only: no real provider credential or endpoint, external
+DNS/network request, model inference, or paid call was used. The runtime-source
+hashes and test-snapshot hash are recorded in the dated replay section; after
+that replay, only `oci_worker.py` docstrings changed before the portability fix
+changed the launch-driver test code.
+
+The evidence does not establish credential-bearing post-wait/supervisor
+recovery, directly observed deletion of systemd's `CREDENTIALS_DIRECTORY`, or
+absence from every possible unrelated host path and receipt. Current leak
+checks cover named surfaces including argv, environment, durable request and
+database data, service logs, and the tested proxy/workspace artifacts. Keep
+claims within those tested surfaces. The Linux 6.1 `SO_PEERPIDFD` gate refuses
+provider mode before attempt reservation. The experimental route requires
+explicit named credential and UDS-egress policies; it adds no generic TCP
+HTTP-proxy/SDK compatibility, and the default OCI worker path remains
+disabled/fail-closed.
+
+A separate live two-worker test from 2026-10-22 on one shared repository
+recorded `/proc/self/mountinfo` from each worker and verified its `/workspace`
+mount root matched that attempt's exact workspace path, `/tmp`, `/dev`, and
+`/home/agent` were tmpfs, `/proc` was procfs, and no mount root from the shared
+fixture appeared outside `/workspace`. Direct lookups of host-absolute
+peer-workspace and shared-Git sentinel paths were not visible; the
+peer-workspace sentinel was also tested through symlink and `..` paths. Cleanup
+was verified for both attempts. This is specific-path and live-mount evidence on
+one disposable Linux guest, not a general kernel-isolation proof. Real-provider
+authentication/egress with genuine credentials, full supervisor-daemon
+restart, logout/linger, and reboot recovery remain unproven. Dated entries below
+retain their historical scope and provenance.
 
 Standalone bounded snapshot and change-set primitives, exact host-side manifest
 replay validation, secure snapshot readback, an isolated-index candidate-tree
@@ -4573,13 +4581,13 @@ paid call was used. The pytest log contained no raw canary.
 Postflight retained the two previously quarantined monitor units and the
 previous failed launch-driver unit unchanged; no new ACP unit, test worker,
 runc process, or test-specific launch-driver root remained. No old fixture was
-cleaned or signaled. Exact-head hosted CI run
-`40154200500` also passed all four Ubuntu/macOS × Python 3.11/3.12 jobs, and
-independent exact-diff QC returned GO. This proves the test-only local-mock
-provider path on this Linux tuple; it still does not prove production
-credential-channel delivery, external provider authentication/egress, reboot
-recovery, or default OCI activation. Tasks #2370 and #3441 remain open; PR #42
-remains draft/open/unmerged.
+cleaned or signaled. At that historical head, CI run `40154200500` passed all
+four Ubuntu/macOS × Python 3.11/3.12 jobs and independent exact-diff QC returned
+GO. The later exact-head run `40159366849` also passed 4/4 at head `7497108`;
+that follow-up changed only test portability and evidence wording, not runtime
+code. Neither CI run establishes credential-bearing recovery, production
+authentication/egress, reboot recovery, or default OCI activation. Tasks #2370
+and #3441 remain open; PR #42 remains draft/open/unmerged.
 
 ### Experimental sealed-FD provider credential replay (2026-10-25)
 

@@ -2185,6 +2185,8 @@ def test_live_systemd_loadcredential_is_read_only_and_not_environment() -> None:
     observed_unit: dict[str, str] = {}
     captured_main_pid = 0
     captured_main_identity: str | None = None
+    credential_directory: Path | None = None
+    credential_path: Path | None = None
     cleanup_errors: list[str] = []
     try:
         if (
@@ -2217,6 +2219,8 @@ def test_live_systemd_loadcredential_is_read_only_and_not_environment() -> None:
             "credential_path=Path(os.environ['CREDENTIALS_DIRECTORY'])/'launch'; "
             "credential=credential_path.read_bytes(); "
             "report={'sha256':hashlib.sha256(credential).hexdigest(), "
+            "'credentials_directory':str(credential_path.parent), "
+            "'credential_path':str(credential_path), "
             "'secret_in_environment':any(credential.decode('ascii') in value "
             "for value in os.environ.values()), "
             "'credential_read_only':(stat.S_IMODE(credential_path.stat().st_mode)&0o222)==0, "
@@ -2272,8 +2276,20 @@ def test_live_systemd_loadcredential_is_read_only_and_not_environment() -> None:
             "credential_read_only": True,
             "credential_owner_uid": os.geteuid(),
         }
-        if observed != expected:
+        if set(observed) != set(expected) | {"credentials_directory", "credential_path"}:
+            raise AssertionError("systemd credential handoff report had unexpected fields")
+        if {key: observed[key] for key in expected} != expected:
             raise AssertionError(f"systemd credential handoff differed: {observed!r}")
+        credential_directory = Path(observed["credentials_directory"])
+        credential_path = Path(observed["credential_path"])
+        if (
+            not credential_directory.is_absolute()
+            or not credential_path.is_absolute()
+            or credential_path.parent != credential_directory
+            or credential_path.name != "launch"
+            or not credential_path.is_file()
+        ):
+            raise AssertionError("systemd did not expose its exact credential directory and file")
     finally:
         # Preserve the private fixture unless the exact transient unit is terminal,
         # its captured cgroups are empty, and its main process is gone.
@@ -2403,6 +2419,10 @@ def test_live_systemd_loadcredential_is_read_only_and_not_environment() -> None:
             ProcessMixin._process_identity(pid) == identity for pid, identity in process_identities
         ):
             cleanup_errors.append("systemd credential probe process identity remained alive")
+        if credential_directory is not None and os.path.lexists(credential_directory):
+            cleanup_errors.append("systemd credential directory remained after exact unit teardown")
+        if credential_path is not None and os.path.lexists(credential_path):
+            cleanup_errors.append("systemd credential file remained after exact unit teardown")
         try:
             after = private_directory.lstat()
             if (

@@ -34,8 +34,9 @@ Combining the supervised mode with ``ACP_LIVE_CANCEL_AFTER_START=1`` instead
 injects SIGINT while ``run_worker`` waits on a running payload; the test proves
 that its interrupt handler requests exact monitor cancellation, verifies
 cleanup, and does not import a failed result.
-These are no-model executor proofs; they do not start a provider/model worker
-or enable the default ``run_worker`` path.
+These are no-model executor proofs. The explicit fake-credential/UDS/TLS probe
+is separately opt-in and performs no real model inference, provider
+authentication, or paid call; none enables the default ``run_worker`` path.
 
 The legacy direct-monitor lifecycle fixture is intentionally skipped: it starts
 runc from a monitor-owned service and cannot satisfy the current launch-driver
@@ -124,6 +125,13 @@ path, also set ``ACP_LIVE_SUPERVISED_RUN_WORKER=1``. That variant gives the
 synthetic payload exit code 17, waits for a fresh reaper to recover the exact
 execution, and verifies ``run_worker`` rejects the failed result without
 importing it.
+To exercise the named fake credential in this recovery branch, also set
+``ACP_LIVE_PROVIDER_CREDENTIAL_FD4=1`` and leave the TLS-redirect and
+cancellation flags unset. A successful replay should have the worker read FD 4
+through the production credential path, write only its digest to the attempt
+workspace, exit 17, and be recovered by the fresh reaper without a proxy
+request. This mode has not yet been replayed; the test path alone does not prove
+credential-bearing recovery, provider access, or authentication.
 
 For the fresh-supervisor cancellation branch, add:
 
@@ -3867,6 +3875,8 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
 ) -> None:
     """Use the production launcher and reaper across completion and failure paths."""
 
+    import stat
+
     source_root = Path(__file__).resolve().parents[1]
     concurrent_control = _live_concurrent_control()
     cross_attempt_probes = os.environ.get("ACP_LIVE_CROSS_ATTEMPT_PROBES") == "1"
@@ -3934,6 +3944,12 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
     provider_tls_redirect = os.environ.get("ACP_LIVE_PROVIDER_TLS_REDIRECT") == "1"
     test_only_worker_canary_fd4 = os.environ.get("ACP_LIVE_WORKER_CANARY_FD4") == "1"
     provider_credential_fd4 = os.environ.get("ACP_LIVE_PROVIDER_CREDENTIAL_FD4") == "1"
+    crash_after_exit_before_cleanup_report = (
+        os.environ.get("ACP_LIVE_CRASH_AFTER_EXIT_BEFORE_CLEANUP_REPORT") == "1"
+    )
+    supervised_post_wait_recovery = (
+        supervised_run_worker and provider_proxy_uds and crash_after_exit_before_cleanup_report
+    )
     if test_only_worker_canary_fd4 and provider_credential_fd4:
         pytest.fail("legacy test canary and production provider credential modes are exclusive")
     worker_canary_fd4 = test_only_worker_canary_fd4 or provider_credential_fd4
@@ -3954,6 +3970,13 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
         and supervised_run_worker
         and os.environ.get("ACP_LIVE_CANCEL_AFTER_START") == "1"
         and not import_result_after_cleanup
+    )
+    provider_credential_post_wait_recovery = (
+        provider_credential_fd4
+        and supervised_post_wait_recovery
+        and not provider_tls_redirect
+        and not provider_proxy_cancel
+        and os.environ.get("ACP_LIVE_CANCEL_AFTER_START") != "1"
     )
     if provider_tls_redirect and not worker_canary_provider_cancel:
         pytest.fail(
@@ -3978,22 +4001,18 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
             "cleanup-verified import mode, or supervised provider-UDS cancellation"
         )
     if provider_credential_fd4 and (
-        not worker_canary_provider_cancel
-        or not provider_tls_redirect
+        not (
+            (worker_canary_provider_cancel and provider_tls_redirect)
+            or provider_credential_post_wait_recovery
+        )
         or not supervised_run_worker
         or import_result_after_cleanup
         or os.environ.get("ACP_TEST_ALLOW_WORKER_CANARY") == "1"
     ):
         pytest.fail(
-            "production provider credential FD4 proof requires the supervised TLS/redirect, "
-            "provider-UDS cancellation combination and must not enable the test-only canary hook"
+            "provider credential FD4 proof requires either supervised TLS/redirect cancellation "
+            "or no-request post-wait recovery; the test-only canary hook must remain disabled"
         )
-    crash_after_exit_before_cleanup_report = (
-        os.environ.get("ACP_LIVE_CRASH_AFTER_EXIT_BEFORE_CLEANUP_REPORT") == "1"
-    )
-    supervised_post_wait_recovery = (
-        supervised_run_worker and provider_proxy_uds and crash_after_exit_before_cleanup_report
-    )
     user_manager_restart_after_driver_crash = (
         os.environ.get("ACP_LIVE_USER_MANAGER_RESTART_AFTER_DRIVER_CRASH") == "1"
     )
@@ -4471,6 +4490,7 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
                         *(
                             ["-DACP_WORKER_CANARY_NO_LAUNCH_MARKER=1"]
                             if worker_canary_provider_cancel
+                            or provider_credential_post_wait_recovery
                             else []
                         ),
                         str(canary_source_path),
@@ -5043,15 +5063,27 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
                 "exec /bin/busybox sleep 180",
             )
         elif provider_proxy_uds and crash_after_exit_before_cleanup_report:
+            provider_credential_probe = ""
+            provider_credential_start_marker = ""
+            if provider_credential_post_wait_recovery:
+                assert test_worker_canary is not None
+                provider_credential_probe = (
+                    f"/bin/worker-canary-fd4-probe {len(test_worker_canary)}; "
+                )
+            else:
+                provider_credential_start_marker = (
+                    "printf 'production-driver-started\\n' > /workspace/launch-driver-started; "
+                )
             payload_command = (
                 "/bin/busybox",
                 "sh",
                 "-c",
                 "set -eu; "
-                "printf 'production-driver-started\\n' > /workspace/launch-driver-started; "
-                "while [ ! -e /workspace/provider-probe-release ]; do "
-                "/bin/busybox sleep 0.1; done; "
-                "printf 'production-driver-ran\\n' > /workspace/launch-driver-marker; "
+                + provider_credential_start_marker
+                + provider_credential_probe
+                + "while [ ! -e /workspace/provider-probe-release ]; do "
+                + "/bin/busybox sleep 0.1; done; "
+                + "printf 'production-driver-ran\\n' > /workspace/launch-driver-marker; "
                 + ("exit 17" if supervised_post_wait_recovery else "true"),
             )
         elif provider_tls_redirect:
@@ -7029,6 +7061,17 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
             assert test_worker_canary not in database_bytes
             if service_log_path.exists():
                 assert test_worker_canary not in service_log_path.read_bytes()
+            for artifact_root in (run_root, workspace_root):
+                for artifact_path in artifact_root.rglob("*"):
+                    try:
+                        artifact_info = artifact_path.lstat()
+                    except FileNotFoundError:
+                        continue
+                    if stat.S_ISREG(artifact_info.st_mode):
+                        assert test_worker_canary not in artifact_path.read_bytes(), (
+                            "raw fake credential persisted in a host-side test artifact: "
+                            f"{artifact_path.relative_to(artifact_root)}"
+                        )
         assert not (Path(execution["state_path"]) / "launch-driver-request.json").exists()
         assert durable["phase"] == "cleanup_verified"
         assert durable["cleanup_receipt"]["version"] == 3

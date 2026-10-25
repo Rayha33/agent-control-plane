@@ -2,8 +2,11 @@
 
 This module does not create a proxy or grant a worker network access. The
 explicit ``start_registered_no_model_sandbox_worker`` helper can bind a named
-policy into an attempt-scoped UDS proxy; generic ``run_worker`` exposes no
-provider options. This module provides the part that must be independently
+policy into an attempt-scoped UDS proxy. The public ``run_worker`` API also
+accepts provider options only behind its explicit experimental opt-in and
+named UDS policy; credential bytes require the separate named read-only-FD4
+policy. Missing or unsupported setup fails closed, and the default path has no
+provider access. This module provides the part that must be independently
 correct before the proxy can safely dial a provider: exact CONNECT-authority
 matching, whole-answer IP classification, and a numeric endpoint that can be
 connected without another DNS lookup. TLS and certificate validation remain
