@@ -477,8 +477,10 @@ def _sandbox_launch_submission_digest(row: Any, target: _RuncLaunchTarget) -> st
         or _DIGEST.fullmatch(target.config_sha256) is None
         or not isinstance(target.argv, tuple)
         or any(not isinstance(value, str) or not value for value in target.argv)
-        or type(target.test_worker_canary_fd4) is not bool
-        or target.test_worker_canary_fd4 != (target.argv[9:11] == ("--preserve-fds", "2"))
+        or type(target.worker_credential_transport) is not str
+        or target.worker_credential_transport not in {"none", "test_canary_fd4", "read-only-fd4-v1"}
+        or (target.worker_credential_transport != "none")
+        != (target.argv[9:11] == ("--preserve-fds", "2"))
         or any(
             type(value) is not int or value <= 0
             for value in (
@@ -791,9 +793,7 @@ def _sandbox_launch_plan_material(execution: Any, target: Any) -> dict[str, Any]
         },
         "launch": {
             "mode": target.launch_mode,
-            "worker_credential_transport": (
-                "test_canary_fd4" if target.test_worker_canary_fd4 else "none"
-            ),
+            "worker_credential_transport": target.worker_credential_transport,
             "runc_executable_path": target.runc_executable_path,
             "runc_executable_sha256": target.runc_executable_sha256,
             "config_sha256": target.config_sha256,
@@ -1004,11 +1004,17 @@ def _sandbox_launch_plan_binding_is_self_consistent(row: Any) -> bool:
             return False
         worker_credential_transport = launch.get("worker_credential_transport")
         if plan_version >= 7:
-            if worker_credential_transport not in {"none", "test_canary_fd4"}:
+            if type(worker_credential_transport) is not str or worker_credential_transport not in {
+                "none",
+                "test_canary_fd4",
+                "read-only-fd4-v1",
+            }:
                 return False
         elif "worker_credential_transport" in launch:
             return False
-        expected_preserved_fds = "2" if worker_credential_transport == "test_canary_fd4" else "1"
+        expected_preserved_fds = (
+            "2" if worker_credential_transport in {"test_canary_fd4", "read-only-fd4-v1"} else "1"
+        )
         resource_limits = launch.get("resource_limits")
         if plan_version >= 4 and (
             not isinstance(resource_limits, dict)
@@ -3754,9 +3760,7 @@ class SandboxExecutionJournalMixin:
                             "launch_target": {
                                 "mode": launch_target.launch_mode,
                                 "worker_credential_transport": (
-                                    "test_canary_fd4"
-                                    if launch_target.test_worker_canary_fd4
-                                    else "none"
+                                    launch_target.worker_credential_transport
                                 ),
                                 "runc_executable_path": launch_target.runc_executable_path,
                                 "runc_executable_sha256": launch_target.runc_executable_sha256,

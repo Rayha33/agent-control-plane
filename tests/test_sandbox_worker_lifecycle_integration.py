@@ -88,6 +88,14 @@ combine all of:
     ACP_LIVE_SUPERVISED_RUN_WORKER=1
     ACP_LIVE_CANCEL_AFTER_START=1
 
+To exercise the public named credential policy rather than the legacy
+test-only canary hook, replace ``ACP_LIVE_WORKER_CANARY_FD4=1`` and
+``ACP_TEST_ALLOW_WORKER_CANARY=1`` with ``ACP_LIVE_PROVIDER_CREDENTIAL_FD4=1``.
+The producer creates a sealed fake-token memfd, and ``run_worker`` passes its
+named ``read-only-fd4-v1`` policy directly to the registered launch path. The
+same TLS mock, redirect denial, cancellation, leak checks, and cleanup proof
+apply; no real provider credentials or network requests are used.
+
 The test-only launch-driver service receives
 ``RestrictAddressFamilies=AF_UNIX AF_NETLINK``. This is a seccomp-backed
 process restriction, not a separate network namespace: its in-service probe
@@ -206,6 +214,7 @@ same-repository cross-attempt workspace isolation or wire ``run_worker``.
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import hmac
 import json
@@ -1223,6 +1232,34 @@ def _terminate_worker_from_fresh_process(
         result_sender.close()
 
 
+def _sealed_fake_provider_memfd(payload: bytes) -> int:
+    """Build a fully sealed anonymous descriptor for the production FD4 path."""
+
+    if not hasattr(os, "memfd_create"):
+        raise RuntimeError("production fake-credential proof requires memfd_create")
+    descriptor = os.memfd_create(
+        "acp-live-provider-fake",
+        os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING,
+    )
+    try:
+        view = memoryview(payload)
+        while view:
+            written = os.write(descriptor, view)
+            view = view[written:]
+        seals = (
+            getattr(fcntl, "F_SEAL_WRITE", 0x0008)
+            | getattr(fcntl, "F_SEAL_GROW", 0x0004)
+            | getattr(fcntl, "F_SEAL_SHRINK", 0x0002)
+            | getattr(fcntl, "F_SEAL_SEAL", 0x0001)
+        )
+        fcntl.fcntl(descriptor, getattr(fcntl, "F_ADD_SEALS", 1033), seals)
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
 def _start_launch_driver_then_crash_controller(
     repo: Path,
     attempt_id: str,
@@ -1605,6 +1642,8 @@ else:
             capture_driver_service_output,
         ):
             if os.environ.get("ACP_LIVE_SUPERVISED_RUN_WORKER") == "1":
+                provider_credential_fd4 = os.environ.get("ACP_LIVE_PROVIDER_CREDENTIAL_FD4") == "1"
+                test_only_worker_canary_fd4 = os.environ.get("ACP_LIVE_WORKER_CANARY_FD4") == "1"
                 run_worker_kwargs = {
                     "sandbox_experimental_opt_in": True,
                     "sandbox_memory_max_bytes": memory_max_bytes,
@@ -1613,36 +1652,44 @@ else:
                     "sandbox_pids_max": pids_max,
                     "sandbox_timeout_seconds": timeout_seconds,
                 }
-                if test_worker_canary is None and not provider_proxy_uds:
-                    result = supervisor.run_worker(
-                        attempt_id,
-                        claim_token,
-                        command,
-                        credential,
-                        **run_worker_kwargs,
+                if provider_proxy_uds:
+                    run_worker_kwargs["sandbox_provider_uds_policy_name"] = "live-uds-only"
+                    run_worker_kwargs["sandbox_provider_uds_destinations"] = {
+                        "allowed.example.invalid": [443]
+                    }
+                provider_credential_fd: int | None = None
+                if provider_credential_fd4:
+                    if test_worker_canary is None:
+                        raise RuntimeError("provider credential proof has no fake test value")
+                    provider_credential_fd = _sealed_fake_provider_memfd(test_worker_canary)
+                    run_worker_kwargs["sandbox_provider_credential_policy_name"] = (
+                        "read-only-fd4-v1"
                     )
-                else:
-                    original_start_registered = (
-                        sandbox_launch_driver_service.start_registered_no_model_sandbox_worker
-                    )
+                    run_worker_kwargs["sandbox_provider_credential_fd"] = provider_credential_fd
+                try:
+                    if test_only_worker_canary_fd4:
+                        original_start_registered = (
+                            sandbox_launch_driver_service.start_registered_no_model_sandbox_worker
+                        )
 
-                    def start_registered_with_test_options(*args: Any, **kwargs: Any) -> Any:
-                        if test_worker_canary is not None:
-                            kwargs["_test_worker_canary"] = test_worker_canary
-                        if provider_proxy_uds:
-                            # Test-only injection exercises provider-socket lifecycle through
-                            # run_worker without adding a public provider-egress API.
-                            kwargs["provider_egress_policy_name"] = "live-uds-only"
-                            kwargs["provider_egress_destinations"] = {
-                                "allowed.example.invalid": [443]
-                            }
-                        return original_start_registered(*args, **kwargs)
+                        def start_registered_with_test_canary(*args: Any, **kwargs: Any) -> Any:
+                            if test_worker_canary is not None:
+                                kwargs["_test_worker_canary"] = test_worker_canary
+                            return original_start_registered(*args, **kwargs)
 
-                    with patch.object(
-                        sandbox_launch_driver_service,
-                        "start_registered_no_model_sandbox_worker",
-                        start_registered_with_test_options,
-                    ):
+                        with patch.object(
+                            sandbox_launch_driver_service,
+                            "start_registered_no_model_sandbox_worker",
+                            start_registered_with_test_canary,
+                        ):
+                            result = supervisor.run_worker(
+                                attempt_id,
+                                claim_token,
+                                command,
+                                credential,
+                                **run_worker_kwargs,
+                            )
+                    else:
                         result = supervisor.run_worker(
                             attempt_id,
                             claim_token,
@@ -1650,6 +1697,9 @@ else:
                             credential,
                             **run_worker_kwargs,
                         )
+                finally:
+                    if provider_credential_fd is not None:
+                        os.close(provider_credential_fd)
                 receipt_payload = result["sandbox_launch_receipt"]
                 result_summary = {
                     "status": result["status"],
@@ -3882,7 +3932,11 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
     provider_proxy_uds = os.environ.get("ACP_LIVE_PROVIDER_PROXY_UDS") == "1"
     provider_proxy_cancel = os.environ.get("ACP_LIVE_PROVIDER_PROXY_CANCEL") == "1"
     provider_tls_redirect = os.environ.get("ACP_LIVE_PROVIDER_TLS_REDIRECT") == "1"
-    worker_canary_fd4 = os.environ.get("ACP_LIVE_WORKER_CANARY_FD4") == "1"
+    test_only_worker_canary_fd4 = os.environ.get("ACP_LIVE_WORKER_CANARY_FD4") == "1"
+    provider_credential_fd4 = os.environ.get("ACP_LIVE_PROVIDER_CREDENTIAL_FD4") == "1"
+    if test_only_worker_canary_fd4 and provider_credential_fd4:
+        pytest.fail("legacy test canary and production provider credential modes are exclusive")
+    worker_canary_fd4 = test_only_worker_canary_fd4 or provider_credential_fd4
     test_worker_canary = (
         b"ACP-test-worker-canary-" + os.urandom(24).hex().encode("ascii")
         if worker_canary_fd4
@@ -3906,7 +3960,7 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
             "provider TLS redirect proof requires the exact supervised FD4-canary, "
             "provider-UDS cancellation combination"
         )
-    if worker_canary_fd4 and (
+    if test_only_worker_canary_fd4 and (
         os.environ.get("ACP_TEST_ALLOW_WORKER_CANARY") != "1"
         or (
             supervised_run_worker != import_result_after_cleanup
@@ -3919,9 +3973,20 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
         or os.environ.get("ACP_LIVE_CRASH_AFTER_EXIT_BEFORE_CLEANUP_REPORT") == "1"
     ):
         pytest.fail(
-            "FD4 canary proof requires ACP_TEST_ALLOW_WORKER_CANARY=1 and either the isolated "
+            "test-only FD4 canary proof requires ACP_TEST_ALLOW_WORKER_CANARY=1 and either the isolated "
             "production no-model launch-driver mode, the supervised run_worker plus "
             "cleanup-verified import mode, or supervised provider-UDS cancellation"
+        )
+    if provider_credential_fd4 and (
+        not worker_canary_provider_cancel
+        or not provider_tls_redirect
+        or not supervised_run_worker
+        or import_result_after_cleanup
+        or os.environ.get("ACP_TEST_ALLOW_WORKER_CANARY") == "1"
+    ):
+        pytest.fail(
+            "production provider credential FD4 proof requires the supervised TLS/redirect, "
+            "provider-UDS cancellation combination and must not enable the test-only canary hook"
         )
     crash_after_exit_before_cleanup_report = (
         os.environ.get("ACP_LIVE_CRASH_AFTER_EXIT_BEFORE_CLEANUP_REPORT") == "1"
@@ -6704,6 +6769,10 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
             durable = supervisor._sandbox_execution_get(attempt["id"])
         service_log = service_log_path.read_text(encoding="utf-8", errors="replace")
         assert runner["credential"] not in service_log
+        if test_worker_canary is not None:
+            fake_value = test_worker_canary.decode("ascii")
+            assert fake_value not in service_log
+            assert fake_value not in repr(durable)
         expected_cleanup_phase = "cleanup_verified" if supervised_run_worker else "cleanup_reported"
         assert durable is not None and durable["phase"] == expected_cleanup_phase, service_log
         if provider_proxy_uds and durable["phase"] == "cleanup_reported":
@@ -6718,7 +6787,13 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
             assert list(provider_proxy_directory.iterdir()) == [], (
                 "provider directory must be empty, but remain fenced until independent cleanup verification"
             )
-        expected_worker_credential_transport = "test_canary_fd4" if worker_canary_fd4 else "none"
+        expected_worker_credential_transport = (
+            "read-only-fd4-v1"
+            if provider_credential_fd4
+            else "test_canary_fd4"
+            if test_only_worker_canary_fd4
+            else "none"
+        )
         assert (
             durable["launch_plan"]["launch"]["worker_credential_transport"]
             == expected_worker_credential_transport

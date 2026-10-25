@@ -11,10 +11,13 @@ blocked authority, verified the synthetic bearer canary in the local mock, and
 reached `cleanup_verified` after cancellation. This is local-mock evidence only:
 no real provider credential, endpoint, model inference, or paid call was used;
 the synthetic resolver was invoked locally, but no external DNS query was made.
-The canary crossed a test-only FD4 seam, not a production credential API. The
-experimental, no-model `run_worker()` route still has no built-in
-provider-credential channel or generic TCP HTTP-proxy/SDK compatibility, and the
-default OCI worker path remains disabled/fail-closed. A separate live two-worker
+The fake canary exercised the named `read-only-fd4-v1` credential channel
+through the public `run_worker()` API; synthetic credential delivery is now
+tested, but real-provider credentials and authentication remain unverified.
+This experimental, no-model route exposes the channel only with explicit named
+credential and UDS-egress policies; it does not add generic TCP HTTP-proxy/SDK
+compatibility, and the default OCI worker path remains disabled/fail-closed. A
+separate live two-worker
 test from 2026-10-22 on one shared repository recorded `/proc/self/mountinfo` from
 each worker and verified its `/workspace` mount root matched that attempt's
 exact workspace path, `/tmp`, `/dev`, and `/home/agent` were tmpfs, `/proc` was
@@ -23,8 +26,8 @@ Direct lookups of host-absolute peer-workspace and shared-Git sentinel paths
 were not visible; the peer-workspace sentinel was also tested through symlink
 and `..` paths. Cleanup was verified for both attempts. This is specific-path
 and live-mount evidence on one disposable Linux guest, not a general
-kernel-isolation proof. Real-provider authentication/egress, production
-credential delivery, full supervisor-daemon restart, logout/linger, and reboot
+kernel-isolation proof. Real-provider authentication/egress with genuine
+credentials, full supervisor-daemon restart, logout/linger, and reboot
 recovery remain unproven.
 The dated entries below describe evidence and status as of their stated dates;
 the current summary above supersedes older integration-status statements.
@@ -4576,4 +4579,78 @@ independent exact-diff QC returned GO. This proves the test-only local-mock
 provider path on this Linux tuple; it still does not prove production
 credential-channel delivery, external provider authentication/egress, reboot
 recovery, or default OCI activation. Tasks #2370 and #3441 remain open; PR #42
+remains draft/open/unmerged.
+
+### Experimental sealed-FD provider credential replay (2026-10-25)
+
+The opt-in replay exercised the public `run_worker()` path with
+`sandbox_provider_credential_policy_name="read-only-fd4-v1"`, a sealed memfd
+containing only a synthetic bearer, and the named UDS egress policy. The
+systemd producer used `LoadCredential=`; the launch driver delivered the
+credential through bounded FD 4. The journal recorded the transport kind.
+Only the fake canary was used; no real credential or provider endpoint was
+configured.
+
+On the existing Debian 12 ARM64 guest (`6.12.95+deb12-cloud-arm64`, systemd
+`252.39`, CPython `3.12.15`, root-owned runc `1.5.2`), this exact opt-in test
+passed once:
+
+```sh
+env -i HOME=/home/rayha.guest USER=rayha LOGNAME=rayha \
+PATH=/usr/local/bin:/usr/bin:/bin XDG_RUNTIME_DIR=/run/user/501 \
+DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/501/bus \
+ACP_RUN_SANDBOX_WORKER_LIFECYCLE=1 \
+ACP_OCI_TEST_RUNC=/usr/local/bin/runc \
+ACP_OCI_TEST_RUNC_VERSION=1.5.2 \
+ACP_LIVE_PROVIDER_PROXY_UDS=1 \
+ACP_LIVE_PROVIDER_PROXY_CANCEL=1 \
+ACP_LIVE_PROVIDER_TLS_REDIRECT=1 \
+ACP_LIVE_PROVIDER_CREDENTIAL_FD4=1 \
+ACP_LIVE_SUPERVISED_RUN_WORKER=1 \
+ACP_LIVE_CANCEL_AFTER_START=1 \
+.venv/bin/pytest -q -s \
+  tests/test_sandbox_worker_lifecycle_integration.py::test_live_production_launch_driver_runs_exact_pinned_runc_request
+```
+
+The command ran in a cleared environment and required no canary override. The
+local TLS mock matched the synthetic bearer. A redirect to a blocked authority
+was rejected before resolver/dial; the in-cgroup worker peer was authorized
+while a same-UID outside peer was denied. Cancellation reached
+`cleanup_verified`, removed the test proxy artifacts, and left the cancelled
+result unimported. Producer tests checked the raw canary was absent from argv,
+environment, and the durable request; the live replay checked service logs and
+durable metadata. No external DNS or external provider/network request, real
+credential, model inference, or paid call was used. Focused Linux
+launch-driver service tests passed 63 cases with no skips; selected
+worker/journal checks passed four cases.
+
+The replay used the host/guest-matched source-and-test archive SHA-256
+`c7f3eb204a678262d9ef49d2ef8becdd40d97ca5d2b188bd6fcdc9681b7f380b`. Key
+files in that tested snapshot were:
+
+| File | SHA-256 |
+| --- | --- |
+| `credential_providers.py` | `ec86920132fc9cb43a28ad3e1f5547b6b9bce7451a0baaf3898d9bb38e93b24c` |
+| `oci_worker.py` | `8254f324e07fe8fba7ee3446ede1d6e381515a735c452df707262e4e640e79c9` |
+| `sandbox_execution_journal.py` | `0269b53cca1aa17f9c73b3b3d286444f083bae87f43750cfee72bcabc0a142a5` |
+| `sandbox_launch_driver_service.py` | `6548d722e250ed0ee4fd3190ed39119504920e4bb89d5ff6808da9a5467ceea1` |
+| `workers.py` | `66c290cc683730722519cef18a6a345c62e268229f0a08cbf86365bc15875066` |
+| `test_git_supervisor.py` | `0ce968c2aee08c19da9c160abd5559524a896ef916b8823fd08859be7a4a46db` |
+| `test_sandbox_execution_journal.py` | `df53b042532073116eb50ca369d87643aa2eb1032b32043343a3f21c60bea105` |
+| `test_sandbox_launch_driver_service.py` | `50c812de82fa13dc62d04e1069baa02d95f5478ac43fdbfb561cdabd6cbfcb5a` |
+| `test_sandbox_worker_lifecycle_integration.py` | `9c6fd18bb372544aca193a8ebb38e895dc78ea3fe4bc67132dd47d2ccca9a5be` |
+
+After that replay, only docstrings in `oci_worker.py` were clarified to
+distinguish the default offline path from the named opt-in; executable code
+and tests are unchanged from the hashes above.
+
+The first replay attempt stopped before attempt reservation because this
+guest's CPython omitted symbolic `F_SEAL_*` constants. Linux UAPI fallback
+values were added, while retaining the full required seal-mask check, and the
+replay above then passed. This is narrow test evidence, not production provider
+acceptance: the default remains off; the path is limited to named UDS/CONNECT,
+with no generic TCP or SDK bridge. The worker, root, or another same-UID
+process can read FD 4, and worker output/result data can disclose it. No reboot
+recovery, supervisor-crash recovery, real authentication/egress, or default
+worker activation is established. Tasks #2370 and #3441 remain open; PR #42
 remains draft/open/unmerged.

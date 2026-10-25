@@ -272,6 +272,8 @@ class WorkersMixin:
         sandbox_timeout_seconds: float | None = None,
         sandbox_provider_uds_policy_name: str | None = None,
         sandbox_provider_uds_destinations: dict[str, Any] | None = None,
+        sandbox_provider_credential_policy_name: str | None = None,
+        sandbox_provider_credential_fd: int | None = None,
     ) -> dict[str, Any]:
         from ..worker_trampoline import _monitor_argv_prefix
 
@@ -313,17 +315,28 @@ class WorkersMixin:
             sandbox_provider_uds_destinations,
         )
         provider_requested = any(value is not None for value in provider_options)
-        if provider_requested and not sandbox_experimental_opt_in:
+        provider_credential_options = (
+            sandbox_provider_credential_policy_name,
+            sandbox_provider_credential_fd,
+        )
+        provider_credential_requested = any(
+            value is not None for value in provider_credential_options
+        )
+        if (
+            provider_requested or provider_credential_requested
+        ) and not sandbox_experimental_opt_in:
             raise SupervisorError(
                 "sandbox_opt_in_required",
-                "provider UDS policy requires the explicit experimental sandbox opt-in",
+                "provider policy requires the explicit experimental sandbox opt-in",
             )
         if sandbox_experimental_opt_in is True:
             from . import oci_worker
             from .sandbox_launch_driver_service import (
                 _MAX_TIMEOUT_SECONDS,
+                _PROVIDER_CREDENTIAL_POLICY_NAME,
                 SandboxLaunchDriverServiceError,
                 _normalize_provider_egress_policy,
+                _read_provider_credential_fd,
             )
 
             try:
@@ -336,6 +349,42 @@ class WorkersMixin:
                     "invalid_sandbox_provider_uds_policy",
                     "experimental provider UDS policy requires one valid name and destination map",
                 ) from error
+
+            if (sandbox_provider_credential_policy_name is None) != (
+                sandbox_provider_credential_fd is None
+            ):
+                raise SupervisorError(
+                    "invalid_sandbox_provider_credential_policy",
+                    "provider credential policy requires one sealed descriptor",
+                )
+            if sandbox_provider_credential_policy_name is not None:
+                if sandbox_provider_credential_policy_name != _PROVIDER_CREDENTIAL_POLICY_NAME:
+                    raise SupervisorError(
+                        "invalid_sandbox_provider_credential_policy",
+                        "provider credential policy name is unsupported",
+                    )
+                if not provider_requested:
+                    raise SupervisorError(
+                        "invalid_sandbox_provider_credential_policy",
+                        "provider credential policy requires a named UDS egress policy",
+                    )
+                try:
+                    provider_credential_payload = _read_provider_credential_fd(
+                        sandbox_provider_credential_fd
+                    )
+                except SandboxLaunchDriverServiceError as error:
+                    raise SupervisorError(
+                        "invalid_sandbox_provider_credential_descriptor",
+                        "provider credential must be a bounded, sealed anonymous descriptor",
+                    ) from error
+                if provider_credential_payload is None or any(
+                    provider_credential_payload in part.encode("utf-8") for part in command
+                ):
+                    raise SupervisorError(
+                        "invalid_sandbox_provider_credential_descriptor",
+                        "provider credential is missing or included in the worker command",
+                    )
+                del provider_credential_payload
 
             if result_manifest_path is not None:
                 raise SupervisorError(
@@ -378,8 +427,14 @@ class WorkersMixin:
                 timeout_seconds=sandbox_timeout_seconds,
                 provider_uds_policy_name=sandbox_provider_uds_policy_name,
                 provider_uds_destinations=sandbox_provider_uds_destinations,
+                provider_credential_policy_name=sandbox_provider_credential_policy_name,
+                provider_credential_fd=sandbox_provider_credential_fd,
             )
-        if any(value is not None for value in sandbox_options) or provider_requested:
+        if (
+            any(value is not None for value in sandbox_options)
+            or provider_requested
+            or provider_credential_requested
+        ):
             raise SupervisorError(
                 "sandbox_opt_in_required",
                 "sandbox resource limits require the explicit experimental opt-in",
@@ -729,13 +784,16 @@ class WorkersMixin:
         timeout_seconds: float,
         provider_uds_policy_name: str | None,
         provider_uds_destinations: dict[str, Any] | None,
+        provider_credential_policy_name: str | None,
+        provider_credential_fd: int | None,
     ) -> dict[str, Any]:
-        """Run an experimental OCI worker without provider credentials.
+        """Run an experimental OCI worker with optional descriptor-scoped credentials.
 
-        An optional labeled egress policy exposes only the mounted UDS proxy
-        path; there is no built-in provider-credential channel or generic
-        TCP/SDK bridge. Callers remain responsible for secrets in commands or
-        workspaces.
+        An optional named egress policy exposes only the mounted UDS proxy
+        path. A separate named policy passes a bounded, sealed fake/secret
+        source descriptor as read-only fd 4; it is not copied into argv, env,
+        durable receipts, or ACP-authored log metadata. There is no generic
+        TCP/SDK bridge.
         Result transfer is allowed only after the exact execution exits
         successfully, its independent cleanup verifier passes, and the
         existing host-side importer validates the private workspace diff.
@@ -764,6 +822,8 @@ class WorkersMixin:
                 timeout_seconds=float(timeout_seconds),
                 credential=credential,
                 experimental_opt_in=True,
+                provider_credential_policy_name=provider_credential_policy_name,
+                provider_credential_fd=provider_credential_fd,
                 provider_egress_policy_name=provider_uds_policy_name,
                 provider_egress_destinations=provider_uds_destinations,
             )

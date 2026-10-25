@@ -1926,3 +1926,29 @@ untouched. Exact-head hosted CI run `40154200500` passed all four
 Ubuntu/macOS × Python 3.11/3.12 jobs; independent exact-diff QC was GO. The
 default OCI worker remains disabled/fail-closed; #2370/#3441 remain open and
 PR #42 remains draft/open/unmerged.
+
+### Experimental named provider credential channel (2026-10-25)
+
+The experimental `run_worker()` path accepts a separate
+`sandbox_provider_credential_fd` only with policy name `read-only-fd4-v1` and a
+named UDS egress policy. The source must be an anonymous regular descriptor
+with `st_nlink == 0`, 8–4096 bytes, and all four required memfd seals. Invalid
+policy pairs, missing or unsealed descriptors, and command collisions fail
+before attempt reservation. The launch request persists the policy name, not
+secret bytes. The API caller retains ownership of the source descriptor and
+must close it when finished; ACP snapshots it before handing off to systemd.
+
+The producer snapshots the sealed descriptor into an anonymous FD, starts the
+service with `LoadCredential=`, and passes the credential only through its
+read-only private credential directory. The launch driver writes a bounded
+read-only pipe at FD 4; the worker receives no credential in argv or
+environment. The journal records the transport kind. Where CPython omits the
+`F_SEAL_*` constants, Linux UAPI values are used while still requiring the full
+seal mask.
+
+FD 4 is a delivery mechanism, not an isolation boundary: the worker, root, or
+another process with the same UID can read it, and worker output/result data
+can disclose it. Evidence is synthetic/fake-only. The opt-in remains limited
+to the named UDS/CONNECT path; it does not add a generic TCP or SDK bridge or
+inspect encrypted URLs/TLS redirects inside the proxy. See
+`WORKER_SANDBOX.md` for the exact replay and its limits.

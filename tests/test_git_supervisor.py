@@ -552,6 +552,8 @@ def test_experimental_sandbox_worker_retries_busy_cleanup_gate_before_import(
         assert kwargs["timeout_seconds"] == 10.0
         assert kwargs["provider_egress_policy_name"] == "test-provider"
         assert kwargs["provider_egress_destinations"] == {"api.example.com": [443]}
+        assert kwargs["provider_credential_policy_name"] == "read-only-fd4-v1"
+        assert kwargs["provider_credential_fd"] == 99
         return expected_execution, SimpleNamespace(
             attempt_id=attempt["id"],
             claim_token=attempt["claim_token"],
@@ -601,6 +603,11 @@ def test_experimental_sandbox_worker_retries_busy_cleanup_gate_before_import(
         "start_registered_no_model_sandbox_worker",
         fake_start,
     )
+    monkeypatch.setattr(
+        sandbox_launch_driver_service,
+        "_read_provider_credential_fd",
+        lambda descriptor: b"synthetic-provider-token" if descriptor == 99 else None,
+    )
     monkeypatch.setattr(supervisor, "_sandbox_execution_get", fake_get)
     monkeypatch.setattr(supervisor, "_sandbox_execution_verify_cleanup", fake_verify)
     monkeypatch.setattr(supervisor, "import_sandbox_execution_result", fake_import)
@@ -619,6 +626,8 @@ def test_experimental_sandbox_worker_retries_busy_cleanup_gate_before_import(
             sandbox_timeout_seconds=10,
             sandbox_provider_uds_policy_name="test-provider",
             sandbox_provider_uds_destinations={"api.example.com": [443]},
+            sandbox_provider_credential_policy_name="read-only-fd4-v1",
+            sandbox_provider_credential_fd=99,
         )
 
     if interrupt_during_wait:
@@ -803,6 +812,8 @@ def test_provider_uds_policy_requires_explicit_sandbox_opt_in(
 def test_provider_uds_policy_pair_is_validated_before_execution_reservation(
     repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    from agent_control_plane.supervisor import sandbox_launch_driver_service
+
     append_oci_config(repo, 'runc_executable = "/usr/bin/runc"\nrunc_version = "1.5.2"')
     pin = object()
     monkeypatch.setattr(oci_worker_module, "_pin_trusted_runc_executable", lambda *_args: pin)
@@ -836,6 +847,44 @@ def test_provider_uds_policy_pair_is_validated_before_execution_reservation(
         )
 
     assert error.value.code == "invalid_sandbox_provider_uds_policy"
+    assert supervisor.attempt(attempt["id"]) == attempt_before
+
+    valid_sandbox_options = {
+        "sandbox_experimental_opt_in": True,
+        "sandbox_memory_max_bytes": 64 * 1024 * 1024,
+        "sandbox_cpu_quota": 50_000,
+        "sandbox_cpu_period": 100_000,
+        "sandbox_pids_max": 32,
+        "sandbox_timeout_seconds": 10,
+        "sandbox_provider_uds_policy_name": "test-provider",
+        "sandbox_provider_uds_destinations": {"api.example.com": [443]},
+    }
+
+    with pytest.raises(SupervisorError) as missing_credential_fd:
+        supervisor.run_worker(
+            attempt["id"],
+            attempt["claim_token"],
+            ["/bin/busybox", "true"],
+            sandbox_provider_credential_policy_name="read-only-fd4-v1",
+            **valid_sandbox_options,
+        )
+    assert missing_credential_fd.value.code == "invalid_sandbox_provider_credential_policy"
+
+    monkeypatch.setattr(
+        sandbox_launch_driver_service,
+        "_read_provider_credential_fd",
+        lambda descriptor: b"synthetic-provider-token" if descriptor == 99 else None,
+    )
+    with pytest.raises(SupervisorError) as command_leak:
+        supervisor.run_worker(
+            attempt["id"],
+            attempt["claim_token"],
+            ["/bin/echo", "synthetic-provider-token"],
+            sandbox_provider_credential_policy_name="read-only-fd4-v1",
+            sandbox_provider_credential_fd=99,
+            **valid_sandbox_options,
+        )
+    assert command_leak.value.code == "invalid_sandbox_provider_credential_descriptor"
     assert supervisor.attempt(attempt["id"]) == attempt_before
 
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
@@ -20,7 +21,10 @@ from agent_control_plane.supervisor import sandbox_execution_journal as journal
 from agent_control_plane.supervisor.common import RuntimePortPool, SupervisorError, canonical_json
 from agent_control_plane.supervisor.sandbox_launch_driver_service import (
     SandboxLaunchDriverServiceError,
+    _provider_credential_pipe,
+    _read_provider_credential_fd,
     _read_request,
+    _read_service_provider_credential,
     _read_service_runner_credential,
     _read_service_test_worker_canary,
     _request_driver_failure_stop_and_cancel_monitor,
@@ -48,6 +52,32 @@ _RESOURCES = {
     "cpu_period": 100_000,
     "pids_max": 32,
 }
+_PROVIDER_CREDENTIAL_POLICY = "read-only-fd4-v1"
+
+
+def _sealed_memfd(payload: bytes, *, seals: int | None = None) -> int:
+    if not hasattr(os, "memfd_create") or not hasattr(os, "MFD_ALLOW_SEALING"):
+        pytest.skip("sealed memfd is only available on supported Linux hosts")
+    flags = os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING
+    descriptor = os.memfd_create("acp-test-provider", flags)
+    try:
+        view = memoryview(payload)
+        while view:
+            written = os.write(descriptor, view)
+            view = view[written:]
+        if seals is None:
+            seals = (
+                getattr(fcntl, "F_SEAL_WRITE", 0x0008)
+                | getattr(fcntl, "F_SEAL_GROW", 0x0004)
+                | getattr(fcntl, "F_SEAL_SHRINK", 0x0002)
+                | getattr(fcntl, "F_SEAL_SEAL", 0x0001)
+            )
+        fcntl.fcntl(descriptor, getattr(fcntl, "F_ADD_SEALS", 1033), seals)
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
 
 
 def _request(command: list[str] | tuple[str, ...] = ("/bin/busybox", "true")) -> dict:
@@ -717,6 +747,106 @@ def test_named_provider_policy_is_canonical_and_bound_to_the_launch_request(
     assert restored_digest == digest
 
 
+def test_named_provider_credential_policy_is_bound_to_named_egress_and_contains_no_bytes(
+    tmp_path: Path,
+) -> None:
+    payload = b"synthetic-provider-token"
+    request = _validate_request(
+        expected_identity=_IDENTITY,
+        command=("/bin/busybox", "true"),
+        timeout_seconds=30,
+        provider_egress_policy_name="local-mock",
+        provider_egress_destinations={"api.example.com": [443]},
+        provider_credential_policy_name=_PROVIDER_CREDENTIAL_POLICY,
+        **_RESOURCES,
+    )
+
+    assert request["provider_credential_policy"] == {"name": _PROVIDER_CREDENTIAL_POLICY}
+    assert payload.decode() not in canonical_json(request)
+    path = tmp_path / "provider-credential-launch-request.json"
+    digest = _write_request(path, request)
+    restored, restored_digest = _read_request(path, _IDENTITY)
+    assert restored == request
+    assert restored_digest == digest
+
+    with pytest.raises(SandboxLaunchDriverServiceError, match="supported named policy"):
+        _validate_request(
+            expected_identity=_IDENTITY,
+            command=("/bin/busybox", "true"),
+            timeout_seconds=30,
+            provider_credential_policy_name=_PROVIDER_CREDENTIAL_POLICY,
+            **_RESOURCES,
+        )
+    with pytest.raises(SandboxLaunchDriverServiceError, match="supported named policy"):
+        _validate_request(
+            expected_identity=_IDENTITY,
+            command=("/bin/busybox", "true"),
+            timeout_seconds=30,
+            provider_egress_policy_name="local-mock",
+            provider_egress_destinations={"api.example.com": [443]},
+            provider_credential_policy_name="unrecognized",
+            **_RESOURCES,
+        )
+
+
+def test_provider_credential_fd_requires_a_bounded_fully_sealed_memfd(
+    tmp_path: Path,
+) -> None:
+    payload = b"synthetic-provider-token"
+    descriptor = _sealed_memfd(payload)
+    try:
+        os.lseek(descriptor, 3, os.SEEK_SET)
+        assert _read_provider_credential_fd(descriptor) == payload
+        assert os.lseek(descriptor, 0, os.SEEK_CUR) == 3
+    finally:
+        os.close(descriptor)
+
+    for invalid in (b"", b"x" * 7, b"x" * 4097):
+        descriptor = _sealed_memfd(invalid)
+        try:
+            with pytest.raises(SandboxLaunchDriverServiceError, match="bounded and fully sealed"):
+                _read_provider_credential_fd(descriptor)
+        finally:
+            os.close(descriptor)
+
+    descriptor = _sealed_memfd(
+        payload,
+        seals=getattr(fcntl, "F_SEAL_WRITE", 0x0008) | getattr(fcntl, "F_SEAL_GROW", 0x0004),
+    )
+    try:
+        with pytest.raises(SandboxLaunchDriverServiceError, match="bounded and fully sealed"):
+            _read_provider_credential_fd(descriptor)
+    finally:
+        os.close(descriptor)
+
+    ordinary_file = tmp_path / "unsealed-provider-credential"
+    ordinary_file.write_bytes(payload)
+    with ordinary_file.open("rb") as stream:
+        with pytest.raises(SandboxLaunchDriverServiceError, match="sealed anonymous descriptor"):
+            _read_provider_credential_fd(stream.fileno())
+
+    with pytest.raises(SandboxLaunchDriverServiceError, match="descriptor is invalid"):
+        _read_provider_credential_fd(-1)
+    with pytest.raises(SandboxLaunchDriverServiceError, match="descriptor is invalid"):
+        _read_provider_credential_fd(True)
+    with pytest.raises(SandboxLaunchDriverServiceError, match="sealed anonymous descriptor"):
+        _read_provider_credential_fd(999_999)
+
+
+def test_provider_credential_pipe_is_bounded_read_only_and_eof_terminated() -> None:
+    payload = b"synthetic-provider-token"
+    read_fd = _provider_credential_pipe(payload)
+    try:
+        assert fcntl.fcntl(read_fd, fcntl.F_GETFL) & os.O_ACCMODE == os.O_RDONLY
+        assert os.read(read_fd, 4096) == payload
+        assert os.read(read_fd, 1) == b""
+    finally:
+        os.close(read_fd)
+
+    with pytest.raises(SandboxLaunchDriverServiceError, match="payload is invalid"):
+        _provider_credential_pipe(b"")
+
+
 @pytest.mark.parametrize(
     ("name", "destinations"),
     [
@@ -1345,6 +1475,33 @@ def test_test_worker_canary_is_read_only_bounded_and_explicitly_opted_in(
         _read_service_test_worker_canary()
 
 
+def test_provider_credential_is_read_only_and_requires_the_named_policy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    credential_dir = tmp_path / "provider-credentials"
+    credential_dir.mkdir(mode=0o700)
+    payload = b"synthetic-provider-token"
+    credential_path = credential_dir / "acp-provider-credential"
+    credential_path.write_bytes(payload)
+    credential_path.chmod(0o400)
+    monkeypatch.setenv("CREDENTIALS_DIRECTORY", str(credential_dir))
+
+    assert _read_service_provider_credential(_PROVIDER_CREDENTIAL_POLICY) == payload
+    with pytest.raises(SandboxLaunchDriverServiceError, match="without an explicit named policy"):
+        _read_service_provider_credential(None)
+    with pytest.raises(SandboxLaunchDriverServiceError, match="unsupported"):
+        _read_service_provider_credential("unrecognized")
+
+    credential_path.chmod(0o600)
+    with pytest.raises(SandboxLaunchDriverServiceError, match="file is unsafe"):
+        _read_service_provider_credential(_PROVIDER_CREDENTIAL_POLICY)
+    credential_path.unlink()
+    assert _read_service_provider_credential(None) is None
+    with pytest.raises(SandboxLaunchDriverServiceError, match="cannot be opened safely"):
+        _read_service_provider_credential(_PROVIDER_CREDENTIAL_POLICY)
+
+
 def test_authenticated_producer_uses_systemd_credential_descriptor_only(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1517,17 +1674,27 @@ def test_authenticated_producer_uses_systemd_credential_descriptor_only(
             _test_worker_canary=test_worker_canary,
             **_RESOURCES,
         )
+    monkeypatch.delenv("ACP_TEST_ALLOW_WORKER_CANARY")
 
-    receipt = start_sandbox_launch_driver(
-        supervisor,  # type: ignore[arg-type]
-        expected_identity=_IDENTITY,
-        command=["/bin/busybox", "true"],
-        credential=credential,
-        _test_worker_canary=test_worker_canary,
-        **_RESOURCES,
-    )
+    provider_payload = b"synthetic-provider-token"
+    provider_fd = _sealed_memfd(provider_payload)
+    try:
+        receipt = start_sandbox_launch_driver(
+            supervisor,  # type: ignore[arg-type]
+            expected_identity=_IDENTITY,
+            command=["/bin/busybox", "true"],
+            credential=credential,
+            provider_credential_policy_name=_PROVIDER_CREDENTIAL_POLICY,
+            provider_credential_fd=provider_fd,
+            provider_egress_policy_name="live-uds-only",
+            provider_egress_destinations={"api.example.com": [443]},
+            **_RESOURCES,
+        )
 
-    assert receipt.service_unit == unit
+        assert receipt.service_unit == unit
+        assert os.fstat(provider_fd).st_size == len(provider_payload)
+    finally:
+        os.close(provider_fd)
     assert supervisor.read_count == 3
     assert unit_property_reads[unit] == 2
     assert unit_property_reads[monitor_unit] == 1
@@ -1536,16 +1703,18 @@ def test_authenticated_producer_uses_systemd_credential_descriptor_only(
     command_text = "\n".join(observed_command)
     assert credential not in command_text
     assert test_worker_canary.decode("ascii") not in command_text
+    assert provider_payload.decode("ascii") not in command_text
     assert credential not in observed_environment.values()
     assert test_worker_canary.decode("ascii") not in "\n".join(observed_environment.values())
+    assert provider_payload.decode("ascii") not in "\n".join(observed_environment.values())
     assert any(
         part.startswith("--property=LoadCredential=acp-runner:/proc/") for part in observed_command
     )
     assert any(
-        part.startswith("--property=LoadCredential=acp-test-worker-canary:/proc/")
+        part.startswith("--property=LoadCredential=acp-provider-credential:/proc/")
         for part in observed_command
     )
-    assert "--setenv=ACP_TEST_ALLOW_WORKER_CANARY=1" in observed_command
+    assert "--setenv=ACP_TEST_ALLOW_WORKER_CANARY=1" not in observed_command
     credential_fds = [
         int(part.rsplit("/", maxsplit=1)[1])
         for part in observed_command
@@ -1559,6 +1728,7 @@ def test_authenticated_producer_uses_systemd_credential_descriptor_only(
     request = json.loads(request_path.read_text(encoding="utf-8"))
     assert credential not in request_path.read_text(encoding="utf-8")
     assert test_worker_canary.decode("ascii") not in request_path.read_text(encoding="utf-8")
+    assert provider_payload.decode("ascii") not in request_path.read_text(encoding="utf-8")
     assert set(request) == {
         "schema",
         "attempt_id",
@@ -1567,6 +1737,13 @@ def test_authenticated_producer_uses_systemd_credential_descriptor_only(
         "command",
         "resource_limits",
         "timeout_seconds",
+        "provider_egress_policy",
+        "provider_credential_policy",
+    }
+    assert request["provider_credential_policy"] == {"name": _PROVIDER_CREDENTIAL_POLICY}
+    assert request["provider_egress_policy"] == {
+        "name": "live-uds-only",
+        "destinations": {"api.example.com": [443]},
     }
 
     from agent_control_plane.supervisor import sandbox_launch_driver_service as service

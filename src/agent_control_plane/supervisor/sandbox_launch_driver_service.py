@@ -7,10 +7,10 @@ started by the journal outside the attempt slice. The explicit
 with this service; ``WorkersMixin.run_worker`` exposes that composition only
 behind the explicit sandbox experimental opt-in. This supervisor function
 makes no model/provider calls; callers must supply a local fake-worker command
-for the no-model experiment. An explicit named provider-egress policy can opt
-that helper into the per-attempt UDS proxy. Generic ``run_worker`` exposes no
-provider options, and the route remains disabled by default. Full workspace/Git
-isolation and general worker enablement remain separate gates.
+for the no-model experiment. Explicit named policies can opt that helper into
+the per-attempt UDS proxy and a sealed provider credential on read-only fd 4.
+Provider access remains experimental and disabled by default. Full
+workspace/Git isolation and general worker enablement remain separate gates.
 """
 
 from __future__ import annotations
@@ -59,6 +59,10 @@ _PROVIDER_POLICY_NAME = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}\Z")
 _MAX_TIMEOUT_SECONDS = 3540
 _RUNNER_CREDENTIAL_NAME = "acp-runner"
 _RUNNER_CREDENTIAL_LIMIT = 4096
+_PROVIDER_CREDENTIAL_NAME = "acp-provider-credential"
+_PROVIDER_CREDENTIAL_LIMIT = 4096
+_PROVIDER_CREDENTIAL_MIN_BYTES = 8
+_PROVIDER_CREDENTIAL_POLICY_NAME = "read-only-fd4-v1"
 _TEST_WORKER_CANARY_CREDENTIAL_NAME = "acp-test-worker-canary"
 _TEST_WORKER_CANARY_LIMIT = 4096
 
@@ -267,6 +271,7 @@ def _validate_request(
     timeout_seconds: Any,
     provider_egress_policy_name: Any = None,
     provider_egress_destinations: Any = None,
+    provider_credential_policy_name: Any = None,
 ) -> dict[str, Any]:
     if type(command) is list:
         command = tuple(command)
@@ -310,6 +315,15 @@ def _validate_request(
     )
     if provider_policy is not None:
         request["provider_egress_policy"] = provider_policy
+    if provider_credential_policy_name is not None:
+        if (
+            provider_credential_policy_name != _PROVIDER_CREDENTIAL_POLICY_NAME
+            or provider_policy is None
+        ):
+            raise SandboxLaunchDriverServiceError(
+                "provider credential policy requires the supported named policy and provider egress"
+            )
+        request["provider_credential_policy"] = {"name": _PROVIDER_CREDENTIAL_POLICY_NAME}
     return request
 
 
@@ -343,6 +357,52 @@ def _validate_runner_credential(credential: str | None) -> None:
         or len(credential.encode("utf-8")) > _RUNNER_CREDENTIAL_LIMIT
     ):
         raise SandboxLaunchDriverServiceError("launch-driver runner credential is invalid")
+
+
+def _read_provider_credential_fd(descriptor: int | None) -> bytes | None:
+    """Snapshot a bounded, fully sealed anonymous descriptor without changing its offset."""
+
+    if descriptor is None:
+        return None
+    if type(descriptor) is not int or descriptor < 0:
+        raise SandboxLaunchDriverServiceError("provider credential descriptor is invalid")
+    try:
+        import fcntl
+
+        info = os.fstat(descriptor)
+        seals = fcntl.fcntl(descriptor, getattr(fcntl, "F_GET_SEALS", 1034))
+        # linux/fcntl.h values cover Python builds that expose F_GET_SEALS but
+        # omit the symbolic F_SEAL_* constants.
+        required_seals = (
+            getattr(fcntl, "F_SEAL_WRITE", 0x0008)
+            | getattr(fcntl, "F_SEAL_GROW", 0x0004)
+            | getattr(fcntl, "F_SEAL_SHRINK", 0x0002)
+            | getattr(fcntl, "F_SEAL_SEAL", 0x0001)
+        )
+    except (AttributeError, OSError) as error:
+        raise SandboxLaunchDriverServiceError(
+            "provider credential must be an available sealed anonymous descriptor"
+        ) from error
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_nlink != 0
+        or not _PROVIDER_CREDENTIAL_MIN_BYTES <= info.st_size <= _PROVIDER_CREDENTIAL_LIMIT
+        or seals & required_seals != required_seals
+    ):
+        raise SandboxLaunchDriverServiceError(
+            "provider credential must be bounded and fully sealed against mutation"
+        )
+    try:
+        payload = os.pread(descriptor, info.st_size + 1, 0)
+    except OSError as error:
+        raise SandboxLaunchDriverServiceError(
+            "provider credential descriptor could not be read"
+        ) from error
+    if len(payload) != info.st_size:
+        raise SandboxLaunchDriverServiceError(
+            "provider credential descriptor changed while reading"
+        )
+    return payload
 
 
 def _require_private_directory(path: Path, *, create: bool = False) -> None:
@@ -477,9 +537,11 @@ def _read_request(
         "timeout_seconds",
     }
     provider_policy = request.get("provider_egress_policy")
-    policy_keys = expected_keys | {"provider_egress_policy"}
+    provider_credential_policy = request.get("provider_credential_policy")
+    allowed_keys = expected_keys | {"provider_egress_policy", "provider_credential_policy"}
     if (
-        set(request) not in (expected_keys, policy_keys)
+        not expected_keys.issubset(request)
+        or not set(request).issubset(allowed_keys)
         or type(request.get("schema")) is not int
         or request.get("schema") != _REQUEST_SCHEMA
         or type(request.get("claim_token")) is not int
@@ -499,6 +561,15 @@ def _read_request(
         type(provider_policy) is not dict or set(provider_policy) != {"name", "destinations"}
     ):
         raise SandboxLaunchDriverServiceError("launch-driver provider policy is malformed")
+    if "provider_credential_policy" in request and (
+        type(provider_credential_policy) is not dict
+        or set(provider_credential_policy) != {"name"}
+        or provider_credential_policy.get("name") != _PROVIDER_CREDENTIAL_POLICY_NAME
+        or provider_policy is None
+    ):
+        raise SandboxLaunchDriverServiceError(
+            "launch-driver provider credential policy is malformed"
+        )
     validated = _validate_request(
         expected_identity=expected_identity,
         command=request.get("command"),
@@ -512,6 +583,11 @@ def _read_request(
         ),
         provider_egress_destinations=(
             provider_policy.get("destinations") if provider_policy is not None else None
+        ),
+        provider_credential_policy_name=(
+            provider_credential_policy.get("name")
+            if provider_credential_policy is not None
+            else None
         ),
     )
     if validated != request:
@@ -648,11 +724,93 @@ def _read_service_test_worker_canary() -> bytes | None:
         os.close(descriptor)
 
 
-def _test_worker_canary_pipe(payload: bytes) -> int:
-    """Return a read-only pipe containing bounded fake test-canary bytes."""
+def _read_service_provider_credential(policy_name: str | None) -> bytes | None:
+    """Read only the credential explicitly declared by the launch request."""
 
-    if type(payload) is not bytes or not 1 <= len(payload) <= _TEST_WORKER_CANARY_LIMIT:
-        raise SandboxLaunchDriverServiceError("test canary credential is invalid")
+    if policy_name is None:
+        directory_value = os.environ.get("CREDENTIALS_DIRECTORY")
+        if directory_value:
+            directory = Path(directory_value)
+            if not directory.is_absolute() or directory.as_posix() != directory_value:
+                raise SandboxLaunchDriverServiceError("provider credential directory is invalid")
+            try:
+                directory_info = directory.lstat()
+                if (
+                    not stat.S_ISDIR(directory_info.st_mode)
+                    or stat.S_ISLNK(directory_info.st_mode)
+                    or directory_info.st_uid != os.geteuid()
+                    or directory_info.st_mode & 0o077
+                ):
+                    raise SandboxLaunchDriverServiceError(
+                        "provider credential directory is not private"
+                    )
+                unexpected = directory / _PROVIDER_CREDENTIAL_NAME
+                unexpected.lstat()
+            except FileNotFoundError:
+                return None
+            except OSError as error:
+                raise SandboxLaunchDriverServiceError(
+                    "unexpected provider credential state cannot be checked"
+                ) from error
+            raise SandboxLaunchDriverServiceError(
+                "provider credential exists without an explicit named policy"
+            )
+        return None
+    if policy_name != _PROVIDER_CREDENTIAL_POLICY_NAME:
+        raise SandboxLaunchDriverServiceError("provider credential policy is unsupported")
+    directory_value = os.environ.get("CREDENTIALS_DIRECTORY")
+    if not directory_value:
+        raise SandboxLaunchDriverServiceError("provider credential directory is unavailable")
+    directory = Path(directory_value)
+    if not directory.is_absolute() or directory.as_posix() != directory_value:
+        raise SandboxLaunchDriverServiceError("provider credential directory is invalid")
+    try:
+        directory_info = directory.lstat()
+        if (
+            not stat.S_ISDIR(directory_info.st_mode)
+            or stat.S_ISLNK(directory_info.st_mode)
+            or directory_info.st_uid != os.geteuid()
+            or directory_info.st_mode & 0o077
+        ):
+            raise SandboxLaunchDriverServiceError("provider credential directory is not private")
+        descriptor = os.open(
+            directory / _PROVIDER_CREDENTIAL_NAME,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+        )
+    except OSError as error:
+        raise SandboxLaunchDriverServiceError(
+            "provider credential cannot be opened safely"
+        ) from error
+    try:
+        info = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.geteuid()
+            or info.st_mode & 0o222
+            or not 1 <= info.st_size <= _PROVIDER_CREDENTIAL_LIMIT
+        ):
+            raise SandboxLaunchDriverServiceError("provider credential file is unsafe")
+        chunks: list[bytes] = []
+        remaining = _PROVIDER_CREDENTIAL_LIMIT + 1
+        while remaining:
+            chunk = os.read(descriptor, min(1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        payload = b"".join(chunks)
+        if len(payload) != info.st_size or len(payload) > _PROVIDER_CREDENTIAL_LIMIT:
+            raise SandboxLaunchDriverServiceError("provider credential changed while reading")
+        return payload
+    finally:
+        os.close(descriptor)
+
+
+def _provider_credential_pipe(payload: bytes) -> int:
+    """Return a read-only pipe containing bounded, execution-scoped bytes."""
+
+    if type(payload) is not bytes or not 1 <= len(payload) <= _PROVIDER_CREDENTIAL_LIMIT:
+        raise SandboxLaunchDriverServiceError("provider credential payload is invalid")
     if hasattr(os, "pipe2"):
         read_fd, write_fd = os.pipe2(os.O_CLOEXEC)
     else:
@@ -664,7 +822,7 @@ def _test_worker_canary_pipe(payload: bytes) -> int:
         while remaining:
             written = os.write(write_fd, remaining)
             if written <= 0:
-                raise OSError("could not stage the bounded test canary pipe")
+                raise OSError("could not stage the bounded provider credential pipe")
             remaining = remaining[written:]
     except BaseException:
         os.close(read_fd)
@@ -672,6 +830,14 @@ def _test_worker_canary_pipe(payload: bytes) -> int:
     finally:
         os.close(write_fd)
     return read_fd
+
+
+def _test_worker_canary_pipe(payload: bytes) -> int:
+    """Compatibility wrapper for the explicit test-only canary seam."""
+
+    if type(payload) is not bytes or not 1 <= len(payload) <= _TEST_WORKER_CANARY_LIMIT:
+        raise SandboxLaunchDriverServiceError("test canary credential is invalid")
+    return _provider_credential_pipe(payload)
 
 
 def _unit_properties(unit: str, properties: tuple[str, ...]) -> dict[str, str]:
@@ -1087,6 +1253,8 @@ def start_sandbox_launch_driver(
     startup_timeout_seconds: float = 15.0,
     credential: str | None = None,
     _test_worker_canary: bytes | None = None,
+    provider_credential_policy_name: str | None = None,
+    provider_credential_fd: int | None = None,
     provider_egress_policy_name: str | None = None,
     provider_egress_destinations: dict[str, Any] | None = None,
 ) -> SandboxLaunchDriverReceipt:
@@ -1118,6 +1286,7 @@ def start_sandbox_launch_driver(
         timeout_seconds=timeout_seconds,
         provider_egress_policy_name=provider_egress_policy_name,
         provider_egress_destinations=provider_egress_destinations,
+        provider_credential_policy_name=provider_credential_policy_name,
     )
     _require_provider_proxy_runtime(request)
     _reject_runner_credential_in_command(request, credential)
@@ -1129,6 +1298,21 @@ def start_sandbox_launch_driver(
     ):
         raise SandboxLaunchDriverServiceError(
             "test worker canary requires the bounded explicit test-only opt-in"
+        )
+    if (provider_credential_policy_name is None) != (provider_credential_fd is None):
+        raise SandboxLaunchDriverServiceError(
+            "provider credential descriptor requires its explicit named policy"
+        )
+    if _test_worker_canary is not None and provider_credential_fd is not None:
+        raise SandboxLaunchDriverServiceError(
+            "test canary and provider credential channels are mutually exclusive"
+        )
+    provider_credential_payload = _read_provider_credential_fd(provider_credential_fd)
+    if provider_credential_payload is not None and any(
+        provider_credential_payload in part.encode("utf-8") for part in request["command"]
+    ):
+        raise SandboxLaunchDriverServiceError(
+            "provider credential must not be included in the worker command"
         )
     if _test_worker_canary is not None and any(
         _test_worker_canary in part.encode("utf-8") for part in request["command"]
@@ -1192,17 +1376,25 @@ def start_sandbox_launch_driver(
     request_path = _state_request_path(supervisor, execution)
     credential_fd: int | None = None
     test_worker_canary_fd: int | None = None
+    provider_credential_source_fd: int | None = None
 
     def close_credential_fds() -> None:
-        nonlocal credential_fd, test_worker_canary_fd
+        nonlocal credential_fd, test_worker_canary_fd, provider_credential_source_fd
         if credential_fd is not None:
             descriptor, credential_fd = credential_fd, None
             os.close(descriptor)
         if test_worker_canary_fd is not None:
             descriptor, test_worker_canary_fd = test_worker_canary_fd, None
             os.close(descriptor)
+        if provider_credential_source_fd is not None:
+            descriptor, provider_credential_source_fd = provider_credential_source_fd, None
+            os.close(descriptor)
 
-    if credential is not None or _test_worker_canary is not None:
+    if (
+        credential is not None
+        or _test_worker_canary is not None
+        or provider_credential_fd is not None
+    ):
         runtime_dir = Path(environment["XDG_RUNTIME_DIR"])
         try:
             runtime_info = runtime_dir.lstat()
@@ -1234,6 +1426,22 @@ def start_sandbox_launch_driver(
                 raise SandboxLaunchDriverServiceError(
                     "test worker canary could not be materialized privately"
                 ) from error
+        if provider_credential_fd is not None:
+            try:
+                if provider_credential_payload is None:
+                    raise OSError("provider credential descriptor was unavailable")
+                provider_credential_source_fd = _anonymous_fd(
+                    provider_credential_payload,
+                    runtime_dir,
+                )
+                _read_provider_credential_fd(provider_credential_source_fd)
+            except (OSError, SandboxLaunchDriverServiceError) as error:
+                close_credential_fds()
+                raise SandboxLaunchDriverServiceError(
+                    "provider credential could not be materialized privately"
+                ) from error
+    if provider_credential_payload is not None:
+        del provider_credential_payload
     command_line = [
         str(systemd_run),
         "--user",
@@ -1268,6 +1476,11 @@ def start_sandbox_launch_driver(
                 "--property=LoadCredential="
                 f"{_TEST_WORKER_CANARY_CREDENTIAL_NAME}:/proc/{os.getpid()}/fd/{test_worker_canary_fd}",
             ]
+        )
+    if provider_credential_source_fd is not None:
+        command_line.append(
+            "--property=LoadCredential="
+            f"{_PROVIDER_CREDENTIAL_NAME}:/proc/{os.getpid()}/fd/{provider_credential_source_fd}"
         )
     try:
         request_digest = _write_request(request_path, request)
@@ -1549,6 +1762,7 @@ def _run_driver(
     credential = _read_service_runner_credential()
     _reject_runner_credential_in_command(request, credential)
     test_worker_canary = _read_service_test_worker_canary()
+    provider_credential_policy = request.get("provider_credential_policy")
     redemption = collect_launch_driver_start_redemption(
         expected_identity=expected_identity,
         expected_container_id=execution["container_id"],
@@ -1577,6 +1791,11 @@ def _run_driver(
         request,
         credential=credential,
         test_worker_canary=test_worker_canary,
+        provider_credential_policy_name=(
+            provider_credential_policy.get("name")
+            if provider_credential_policy is not None
+            else None
+        ),
     )
 
 
@@ -1870,10 +2089,31 @@ def _execute_pinned_request(
     *,
     credential: str | None,
     test_worker_canary: bytes | None = None,
+    provider_credential_policy_name: str | None = None,
 ) -> None:
     """Keep all launch, attestation, gate, and runc wait capabilities in this process."""
 
     _require_provider_proxy_runtime(request)
+    provider_credential_policy = request.get("provider_credential_policy")
+    request_policy_name = (
+        provider_credential_policy.get("name") if provider_credential_policy is not None else None
+    )
+    if request_policy_name != provider_credential_policy_name:
+        raise SandboxLaunchDriverServiceError(
+            "provider credential policy changed before worker launch"
+        )
+    provider_credential = _read_service_provider_credential(provider_credential_policy_name)
+    if provider_credential is not None and test_worker_canary is not None:
+        raise SandboxLaunchDriverServiceError(
+            "test canary and provider credential channels are mutually exclusive"
+        )
+    worker_credential_transport = (
+        provider_credential_policy_name
+        if provider_credential is not None
+        else "test_canary_fd4"
+        if test_worker_canary is not None
+        else "none"
+    )
     attempt_id, claim_token, execution_id = expected_identity
     execution = supervisor._sandbox_execution_get(attempt_id)
     if (
@@ -2092,17 +2332,25 @@ def _execute_pinned_request(
 
     handle: oci_worker.RuncLaunchHandle | None = None
     try:
-        test_worker_credential_fd = (
-            _test_worker_canary_pipe(test_worker_canary) if test_worker_canary is not None else None
+        worker_credential_payload = (
+            provider_credential if provider_credential is not None else test_worker_canary
         )
+        worker_credential_fd = (
+            _provider_credential_pipe(worker_credential_payload)
+            if worker_credential_payload is not None
+            else None
+        )
+        del worker_credential_payload
+        del provider_credential
         try:
             spawn_kwargs: dict[str, Any] = {
                 "stdout": subprocess.DEVNULL,
                 "stderr": subprocess.DEVNULL,
                 "_authorize_runc_submission": authorize,
             }
-            if test_worker_credential_fd is not None:
-                spawn_kwargs["_test_worker_credential_fd"] = test_worker_credential_fd
+            if worker_credential_fd is not None:
+                spawn_kwargs["_provider_credential_fd"] = worker_credential_fd
+                spawn_kwargs["_provider_credential_transport"] = worker_credential_transport
             handle = oci_worker.spawn_pinned_runc(
                 runtime_binding,
                 state_root,
@@ -2113,8 +2361,8 @@ def _execute_pinned_request(
                 **spawn_kwargs,
             )
         finally:
-            if test_worker_credential_fd is not None:
-                os.close(test_worker_credential_fd)
+            if worker_credential_fd is not None:
+                os.close(worker_credential_fd)
         client_pid = oci_worker._runc_launch_pid(handle)
         client_identity = oci_worker._runc_launch_process_identity(handle)
         if submission is None or client_pid is None or client_identity is None:
@@ -2368,6 +2616,8 @@ def start_registered_no_model_sandbox_worker(
     credential: str | None = None,
     _test_worker_canary: bytes | None = None,
     experimental_opt_in: bool = False,
+    provider_credential_policy_name: str | None = None,
+    provider_credential_fd: int | None = None,
     provider_egress_policy_name: str | None = None,
     provider_egress_destinations: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], SandboxLaunchDriverReceipt]:
@@ -2380,11 +2630,12 @@ def start_registered_no_model_sandbox_worker(
     journal, and hands off to the authenticated launch-driver service. It does
     not call a model/provider or import results; the caller retains the
     cleanup-gated result-import decision.
-    An optional labeled UDS egress policy grants only the proxy capability;
-    this helper has no general provider-credential delivery channel. A private
-    test-only fake-canary path exercises FD4 and is unavailable without the
-    explicit ``ACP_TEST_ALLOW_WORKER_CANARY=1`` opt-in. Callers remain
-    responsible for secrets embedded in commands or workspaces.
+    An optional named UDS egress policy grants only the proxy capability. A
+    separate named credential policy can pass a bounded sealed descriptor as
+    worker fd 4; no credential bytes enter the request or launcher argv/env.
+    The private test-only canary path remains gated by
+    ``ACP_TEST_ALLOW_WORKER_CANARY=1``. Callers remain responsible for secrets
+    embedded in commands or workspaces.
 
     The default worker entrypoint remains fail-closed. Every argument that can
     be rejected without side effects is validated before reservation. During
@@ -2420,6 +2671,15 @@ def start_registered_no_model_sandbox_worker(
         raise SandboxLaunchDriverServiceError(
             "test worker canary requires the bounded explicit test-only opt-in"
         )
+    if (provider_credential_policy_name is None) != (provider_credential_fd is None):
+        raise SandboxLaunchDriverServiceError(
+            "provider credential descriptor requires its explicit named policy"
+        )
+    if _test_worker_canary is not None and provider_credential_fd is not None:
+        raise SandboxLaunchDriverServiceError(
+            "test canary and provider credential channels are mutually exclusive"
+        )
+    provider_credential_payload = _read_provider_credential_fd(provider_credential_fd)
     preflight_request = _validate_request(
         expected_identity=(attempt_id, claim_token, "preflight"),
         command=command,
@@ -2430,6 +2690,7 @@ def start_registered_no_model_sandbox_worker(
         timeout_seconds=timeout_seconds,
         provider_egress_policy_name=provider_egress_policy_name,
         provider_egress_destinations=provider_egress_destinations,
+        provider_credential_policy_name=provider_credential_policy_name,
     )
     _reject_runner_credential_in_command(preflight_request, credential)
     if _test_worker_canary is not None and any(
@@ -2438,6 +2699,13 @@ def start_registered_no_model_sandbox_worker(
         raise SandboxLaunchDriverServiceError(
             "test worker canary must not be included in the worker command"
         )
+    if provider_credential_payload is not None and any(
+        provider_credential_payload in part.encode("utf-8") for part in preflight_request["command"]
+    ):
+        raise SandboxLaunchDriverServiceError(
+            "provider credential must not be included in the worker command"
+        )
+    del provider_credential_payload
     validated_command = tuple(preflight_request["command"])
     _require_provider_proxy_runtime(preflight_request)
 
@@ -2580,6 +2848,8 @@ def start_registered_no_model_sandbox_worker(
             startup_timeout_seconds=startup_timeout_seconds,
             credential=credential,
             _test_worker_canary=_test_worker_canary,
+            provider_credential_policy_name=provider_credential_policy_name,
+            provider_credential_fd=provider_credential_fd,
             provider_egress_policy_name=preflight_request.get("provider_egress_policy", {}).get(
                 "name"
             ),

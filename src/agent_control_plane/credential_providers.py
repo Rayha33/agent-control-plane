@@ -317,10 +317,15 @@ def _anonymous_fd(payload: bytes, runtime_dir: Path) -> int:
             try:
                 import fcntl
 
+                # Linux UAPI seal bits, used when this CPython build omits
+                # the symbolic F_SEAL_* exports from its fcntl module.
                 seals = (
-                    fcntl.F_SEAL_SEAL | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_GROW | fcntl.F_SEAL_WRITE
+                    getattr(fcntl, "F_SEAL_SEAL", 0x0001)
+                    | getattr(fcntl, "F_SEAL_SHRINK", 0x0002)
+                    | getattr(fcntl, "F_SEAL_GROW", 0x0004)
+                    | getattr(fcntl, "F_SEAL_WRITE", 0x0008)
                 )
-                fcntl.fcntl(fd, fcntl.F_ADD_SEALS, seals)
+                fcntl.fcntl(fd, getattr(fcntl, "F_ADD_SEALS", 1033), seals)
             except (AttributeError, OSError):
                 # Descriptor delivery is still safe on kernels/filesystems
                 # without sealing; the file is private and already unlinked.

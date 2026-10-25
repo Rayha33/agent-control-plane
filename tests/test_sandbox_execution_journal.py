@@ -1251,6 +1251,30 @@ def test_launch_binds_rootfs_pins_and_persists_exact_config_digest(repo: Path) -
     ).hexdigest()
     assert not journal_module._sandbox_launch_plan_binding_is_self_consistent(mismatched_canary_row)
 
+    production_credential_plan = json.loads(canonical_json(durable["launch_plan"]))
+    production_credential_plan["launch"]["worker_credential_transport"] = "read-only-fd4-v1"
+    production_credential_plan["launch"]["argv"][10] = "2"
+    production_credential_argv_digest = hashlib.sha256(
+        canonical_json(production_credential_plan["launch"]["argv"]).encode("utf-8")
+    ).hexdigest()
+    production_credential_plan["launch"]["argv_sha256"] = production_credential_argv_digest
+    production_credential_row = dict(durable)
+    production_credential_row["launch_argv_digest"] = production_credential_argv_digest
+    production_credential_row["launch_plan_json"] = canonical_json(production_credential_plan)
+    production_credential_row["launch_plan_digest"] = hashlib.sha256(
+        production_credential_row["launch_plan_json"].encode("utf-8")
+    ).hexdigest()
+    assert journal_module._sandbox_launch_plan_binding_is_self_consistent(production_credential_row)
+
+    unknown_credential_transport = json.loads(canonical_json(production_credential_plan))
+    unknown_credential_transport["launch"]["worker_credential_transport"] = "ambient-env"
+    unknown_transport_row = dict(production_credential_row)
+    unknown_transport_row["launch_plan_json"] = canonical_json(unknown_credential_transport)
+    unknown_transport_row["launch_plan_digest"] = hashlib.sha256(
+        unknown_transport_row["launch_plan_json"].encode("utf-8")
+    ).hexdigest()
+    assert not journal_module._sandbox_launch_plan_binding_is_self_consistent(unknown_transport_row)
+
     # Version 4 remains auditable under its original ownership evidence, but
     # does not carry the split-monitor placement contract required for running.
     legacy_v4_plan = json.loads(canonical_json(durable["launch_plan"]))
