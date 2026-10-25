@@ -259,6 +259,88 @@ def test_cli_run_forwards_result_manifest_to_worker(
     }
 
 
+def test_cli_run_forwards_explicit_experimental_sandbox_limits(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    repo = _repo(tmp_path)
+    observed: dict = {}
+
+    def fake_run_worker(
+        _supervisor,
+        attempt_id: str,
+        claim_token: int,
+        command: list[str],
+        credential: str | None = None,
+        result_manifest_path: str | None = None,
+        **sandbox_options: object,
+    ) -> dict:
+        observed.update(
+            {
+                "attempt_id": attempt_id,
+                "claim_token": claim_token,
+                "command": command,
+                "credential": credential,
+                "result_manifest_path": result_manifest_path,
+                **sandbox_options,
+            }
+        )
+        return {"status": "pending_qc"}
+
+    monkeypatch.setattr(cli.GitSupervisor, "run_worker", fake_run_worker)
+
+    result = cli.main(
+        [
+            "--repo",
+            str(repo),
+            "run",
+            "--token",
+            "8",
+            "--sandbox-experimental-opt-in",
+            "--sandbox-memory-max-bytes",
+            "67108864",
+            "--sandbox-cpu-quota",
+            "50000",
+            "--sandbox-cpu-period",
+            "100000",
+            "--sandbox-pids-max",
+            "32",
+            "--sandbox-timeout-seconds",
+            "10",
+            "--sandbox-provider-uds-policy-name",
+            "openai-api",
+            "--sandbox-provider-uds-destination",
+            "api.openai.com:443",
+            "--sandbox-provider-uds-destination",
+            "api.anthropic.com:443",
+            "attempt-1",
+            "--",
+            "python",
+            "worker.py",
+        ]
+    )
+    capsys.readouterr()
+
+    assert result == 0
+    assert observed == {
+        "attempt_id": "attempt-1",
+        "claim_token": 8,
+        "command": ["python", "worker.py"],
+        "credential": None,
+        "result_manifest_path": None,
+        "sandbox_experimental_opt_in": True,
+        "sandbox_memory_max_bytes": 67_108_864,
+        "sandbox_cpu_quota": 50_000,
+        "sandbox_cpu_period": 100_000,
+        "sandbox_pids_max": 32,
+        "sandbox_timeout_seconds": 10.0,
+        "sandbox_provider_uds_policy_name": "openai-api",
+        "sandbox_provider_uds_destinations": {
+            "api.openai.com": [443],
+            "api.anthropic.com": [443],
+        },
+    }
+
+
 def test_cli_init_create_claim_and_doctor(tmp_path: Path) -> None:
     subprocess.run(["git", "-C", str(tmp_path), "init", "-b", "main"], check=True)
     subprocess.run(

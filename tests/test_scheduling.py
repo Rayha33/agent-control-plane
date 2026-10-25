@@ -278,10 +278,15 @@ def test_ready_queue_is_deterministic_and_read_only(repo: Path) -> None:
     make_task(supervisor, "gamma.txt", title="c", priority=99)
     before = state_fingerprint(supervisor)
 
-    first = json.dumps(supervisor.ready_queue(), sort_keys=True)
-    second = json.dumps(supervisor.ready_queue(), sort_keys=True)
+    first_snapshot = supervisor.ready_queue()
+    second_snapshot = supervisor.ready_queue()
+    first_generated_at = first_snapshot.pop("generated_at")
+    second_generated_at = second_snapshot.pop("generated_at")
+    first = json.dumps(first_snapshot, sort_keys=True)
 
-    assert first == second
+    assert type(first_generated_at) is int
+    assert type(second_generated_at) is int
+    assert first == json.dumps(second_snapshot, sort_keys=True)
     assert state_fingerprint(supervisor) == before
     assert [entry["title"] for entry in json.loads(first)["ready"]] == ["c", "a", "b"]
 

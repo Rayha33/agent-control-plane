@@ -283,13 +283,28 @@ outside this integration.
 
 ACP's `namespace_runtime` is a resource driver, not the supervised worker's
 execution boundary. It launches a configured payload in a transient systemd user
-service and mounts the registered worktree read-only at `/workspace`. The supervised
-`run_worker` path instead launches ACP's packaged `worker_trampoline.py` with the
-registered worktree as its current working directory; it does not enter that runtime.
-The bounded no-model probe ran source-generated setup, probe, and teardown commands
-against a synthetic fixture; it did not run an installed ACP supervisor or a registered
-ACP worker. Do not treat the driver's private root, quotas, or a separate attempt
-worktree as proof that a worker cannot read the host.
+service and mounts the registered worktree read-only at `/workspace`. That driver
+is still not the supervised worker boundary. Without configured OCI, the default
+`run_worker` branch launches ACP's packaged `worker_trampoline.py` with the
+registered worktree as its current working directory. With OCI configured, that
+default branch fails closed; only the explicit experimental no-provider opt-in
+enters the separate rootless-runc launch-driver lifecycle.
+
+The experimental branch now snapshots the registered attempt into a private
+mutable workspace without `.git`, waits for exact execution identity and
+independent cleanup verification, then imports only the host-validated workspace
+diff. An opt-in live guest replay exercised this public `run_worker` path alongside
+host-path sentinels for home/config, temporary files, the task base and sibling
+worktree, an unrelated project, symlink/canonical traversal, process visibility,
+Unix sockets, and direct network denial. This is evidence for the pinned test
+rootfs/runtime on one disposable Linux guest, not proof of provider authentication
+or egress, every same-UID attack, or recovery across daemon restart/reboot.
+
+The separate bounded no-model `namespace_runtime` probe still ran only
+source-generated setup, probe, and teardown commands against a synthetic fixture;
+it did not run an installed ACP supervisor or registered worker. Do not treat that
+driver's private root, quotas, or a separate attempt worktree alone as proof that a
+worker cannot read the host.
 
 On Linux, trusted `systemd-run` and `systemctl` calls receive `XDG_RUNTIME_DIR` only
 when `/run/user/<euid>` and its parent directories pass owner and mode checks. Other
@@ -304,14 +319,55 @@ The driver's `egress = "deny"` option creates a private network namespace, while
 Neither mode currently provides a provider-connected worker with both model access and
 independently enforced, destination-restricted egress.
 
+The private root now generates only a minimal `/etc/os-release`; it does not
+inherit host resolver or CA files. Consequently, `egress = "allow"` means the
+payload keeps the host network namespace, not that DNS lookup or HTTPS trust is
+configured. Payloads requiring those services need explicit, reviewed runtime
+configuration; broad host `/etc` must not be restored as a shortcut.
+
 Codex App Server's `sandboxPolicy.type = "externalSandbox"` tells Codex to skip its
 own command sandbox because an outer sandbox is already in force. It does not create
 or select an ACP namespace. Do not use this mode for an ACP worker until every
 untrusted command-execution path is routed through a separately enforced boundary.
-An implementation still needs an isolated mutable attempt root, private Git metadata
-and validated result transfer, least-privilege credentials, bounded provider egress,
-and cancellation/recovery tied to the registered worker lifecycle. Until those are
-proven, ACP's supervised Codex integration does not claim OS-enforced read isolation.
+Remaining acceptance includes least-privilege provider authentication, independently
+destination-restricted provider egress, and recovery across daemon/user-manager
+restart and reboot. These boundaries have not been proven for a production provider
+worker. Keep the default path fail-closed; the experimental no-provider replay is not
+production readiness and does not close parent task #2370.
+
+The opt-in `test_live_rootless_runc_mounts_attempt_proxy_socket_directory_read_only`
+probe also ran on the disposable Debian 12 ARM64 guest (kernel
+`6.1.0-53-cloud-arm64`, runc 1.5.2). The worker launched and reached the
+mode-0600 provider socket through its read-only mount; its socket write/remove
+probes were denied. Peer authentication then stopped at `SO_PEERPIDFD` with
+`errno 92` (`Protocol not available`), so the probe failed before cgroup
+authorization or CONNECT relay. Cleanup was verified; the test failed before
+dialing its local CONNECT fixture. No provider credential or external provider
+endpoint was used. This kernel therefore cannot prove the
+proxy's peer-identity path. The NAS kernel was observed read-only as `6.18.15`,
+but that observation is not a live proxy qualification.
+
+To separate kernel support from a code failure, a clone of that disposable guest
+was booted with Debian Bookworm backports `linux-image-cloud-arm64`
+`6.12.95-1~bpo12+1` (kernel `6.12.95+deb12-cloud-arm64`); the original 6.1 guest
+was left unchanged. On the clone, the exact `a77219f` source passed the live
+rootless-runc proxy probe and all proxy unit tests: **24 passed in 5.61s**. The
+probe verified a non-inheritable peer pidfd, exact worker-cgroup authorization,
+read-only socket-directory behavior, and CONNECT relay to its local TCP fixture.
+The collector receipt is test-only. No provider credential or external provider
+endpoint was used; the CONNECT tunnel terminated at a local TCP fixture. The
+implementation still has no provider-enabled `run_worker`
+launch path, so this qualifies the proxy primitive only, not pre-launch auth
+setup, real provider access, destination-restricted egress, or restart recovery.
+
+Upstream Linux v6.5 defines `SO_PEERPIDFD` as socket option 77; vendors may
+backport it, so a runtime feature probe—not `uname` version comparison—must
+remain authoritative. Unsupported kernels must continue to fail closed. See
+the [v6.5 Linux socket UAPI](https://github.com/torvalds/linux/blob/v6.5/include/uapi/asm-generic/socket.h)
+and [upstream peer-pidfd implementation](https://github.com/torvalds/linux/commit/7b26952a91cf65ff1cc867a2382a8964d8c0ee7d).
+The NAS kernel remains unqualified until the same safe probe runs there. See
+[`test_oci_worker_runtime.py`](../tests/test_oci_worker_runtime.py) for the
+opt-in probe.
 See [Codex App Server](https://learn.chatgpt.com/docs/app-server) and
 [Agent approvals & security](https://learn.chatgpt.com/docs/agent-approvals-security).
 

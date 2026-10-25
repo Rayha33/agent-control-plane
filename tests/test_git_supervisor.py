@@ -359,7 +359,7 @@ def test_oci_runc_config_pins_executable_and_records_verified_version(
 ) -> None:
     write_config(repo)
     rootfs, rootfs_digest = append_oci_config(
-        repo, 'runc_executable = "/usr/bin/runc"\nrunc_version = "1.3.5"'
+        repo, 'runc_executable = "/usr/bin/runc"\nrunc_version = "1.5.2"'
     )
     pin = object()
     calls: list[tuple[str, str]] = []
@@ -370,8 +370,8 @@ def test_oci_runc_config_pins_executable_and_records_verified_version(
 
     def fake_probe(executable, expected_version: str) -> str:
         assert executable is pin
-        assert expected_version == "1.3.5"
-        return "1.3.5"
+        assert expected_version == "1.5.2"
+        return "1.5.2"
 
     monkeypatch.setattr(oci_worker_module, "_pin_trusted_runc_executable", fake_pin)
     monkeypatch.setattr(oci_worker_module, "_probe_trusted_runc_version", fake_probe)
@@ -379,7 +379,7 @@ def test_oci_runc_config_pins_executable_and_records_verified_version(
     supervisor = GitSupervisor(repo)
 
     assert supervisor.config.oci_runc_executable is pin
-    assert supervisor.config.oci_runc_version == "1.3.5"
+    assert supervisor.config.oci_runc_version == "1.5.2"
     assert supervisor.config.oci_rootfs_pin.path == rootfs.resolve()
     assert supervisor.config.oci_rootfs_pin.sha256 == rootfs_digest
     assert (
@@ -389,6 +389,32 @@ def test_oci_runc_config_pins_executable_and_records_verified_version(
     assert calls == [("/usr/bin/runc", str(repo.resolve()))]
 
 
+@pytest.mark.parametrize("unsupported_version", ["1.3.5", "1.3.6", "1.4.3"])
+def test_oci_runc_config_rejects_non_pinned_runc_before_opening_runtime(
+    repo: Path, monkeypatch: pytest.MonkeyPatch, unsupported_version: str
+) -> None:
+    write_config(repo)
+    append_oci_config(
+        repo,
+        f'runc_executable = "/usr/bin/runc"\nrunc_version = "{unsupported_version}"',
+    )
+    opened: list[str] = []
+
+    def forbidden(*_args, **_kwargs):
+        opened.append("runtime")
+        pytest.fail("unsupported runc version must be rejected before opening runtime files")
+
+    monkeypatch.setattr(oci_worker_module, "_pin_trusted_rootfs", forbidden)
+    monkeypatch.setattr(oci_worker_module, "_pin_trusted_runc_executable", forbidden)
+    monkeypatch.setattr(oci_worker_module, "_probe_trusted_runc_version", forbidden)
+
+    with pytest.raises(SupervisorError, match="supported exact release 1.5.2") as error:
+        GitSupervisor(repo)
+
+    assert error.value.code == "invalid_config"
+    assert not opened
+
+
 def test_oci_config_rejects_rootfs_drift_from_operator_digest(repo: Path) -> None:
     write_config(repo)
     rootfs, digest = _create_test_oci_rootfs(repo)
@@ -396,7 +422,7 @@ def test_oci_config_rejects_rootfs_drift_from_operator_digest(repo: Path) -> Non
     with (repo / "acp.toml").open("a", encoding="utf-8") as handle:
         handle.write(
             '\n[sandbox.oci]\nrunc_executable = "/usr/bin/runc"\n'
-            'runc_version = "1.3.5"\n'
+            'runc_version = "1.5.2"\n'
             f"rootfs_path = {json.dumps(str(rootfs))}\n"
             f"rootfs_sha256 = {json.dumps(digest)}\n"
             f"rootfs_closure_sha256 = {json.dumps(closure_digest)}\n"
@@ -415,7 +441,7 @@ def test_oci_config_rejects_rootfs_closure_drift(repo: Path) -> None:
     with (repo / "acp.toml").open("a", encoding="utf-8") as handle:
         handle.write(
             '\n[sandbox.oci]\nrunc_executable = "/usr/bin/runc"\n'
-            'runc_version = "1.3.5"\n'
+            'runc_version = "1.5.2"\n'
             f"rootfs_path = {json.dumps(str(rootfs))}\n"
             f"rootfs_sha256 = {json.dumps(digest)}\n"
             f"rootfs_closure_sha256 = {json.dumps('0' * 64)}\n"
@@ -430,7 +456,7 @@ def test_oci_config_rejects_rootfs_closure_drift(repo: Path) -> None:
 def test_oci_config_requires_a_rootfs_path_and_digest(repo: Path) -> None:
     write_config(repo)
     with (repo / "acp.toml").open("a", encoding="utf-8") as handle:
-        handle.write('\n[sandbox.oci]\nrunc_executable = "/usr/bin/runc"\nrunc_version = "1.3.5"\n')
+        handle.write('\n[sandbox.oci]\nrunc_executable = "/usr/bin/runc"\nrunc_version = "1.5.2"\n')
 
     with pytest.raises(
         SupervisorError, match="requires runc_executable.*rootfs_sha256.*rootfs_closure_sha256"
@@ -444,7 +470,7 @@ def test_oci_configured_worker_fails_closed_before_host_fallback(
     repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     write_config(repo)
-    append_oci_config(repo, 'runc_executable = "/usr/bin/runc"\nrunc_version = "1.3.5"')
+    append_oci_config(repo, 'runc_executable = "/usr/bin/runc"\nrunc_version = "1.5.2"')
     pin = object()
     monkeypatch.setattr(oci_worker_module, "_pin_trusted_runc_executable", lambda *_args: pin)
     monkeypatch.setattr(
@@ -457,6 +483,8 @@ def test_oci_configured_worker_fails_closed_before_host_fallback(
     created = task(supervisor, "alpha.txt")
     attempt = supervisor.claim(created["id"], "worker")
     marker = repo / "host-fallback-worker-ran"
+    attempt_before = supervisor.attempt(attempt["id"])
+    worker_log = supervisor.state_dir / "logs" / f"worker-{attempt['id']}.log"
 
     def heartbeat_must_not_run(*_args, **_kwargs):
         pytest.fail("configured OCI fallback must fail before worker heartbeat")
@@ -479,20 +507,666 @@ def test_oci_configured_worker_fails_closed_before_host_fallback(
     assert error.value.code == "sandbox_executor_unavailable"
     assert "refusing host fallback" in str(error.value)
     assert not marker.exists()
-    assert supervisor.attempt(attempt["id"])["pid"] is None
+    attempt_after = supervisor.attempt(attempt["id"])
+    assert attempt_after["pid"] is None
+    assert attempt_after["updated_at"] == attempt_before["updated_at"]
+    assert not worker_log.exists()
+
+
+@pytest.mark.parametrize("interrupt_during_wait", [False, True])
+def test_experimental_sandbox_worker_retries_busy_cleanup_gate_before_import(
+    repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    interrupt_during_wait: bool,
+) -> None:
+    from agent_control_plane.supervisor import sandbox_launch_driver_service
+
+    append_oci_config(repo, 'runc_executable = "/usr/bin/runc"\nrunc_version = "1.5.2"')
+    pin = object()
+    monkeypatch.setattr(oci_worker_module, "_pin_trusted_runc_executable", lambda *_args: pin)
+    monkeypatch.setattr(
+        oci_worker_module,
+        "_probe_trusted_runc_version",
+        lambda _pin, expected: expected,
+    )
+
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "sandbox-worker")
+    events: list[str] = []
+    expected_execution = {
+        "attempt_id": attempt["id"],
+        "claim_token": attempt["claim_token"],
+        "execution_id": "execution-test-1",
+        "phase": "running",
+    }
+    observations = 0
+
+    def fake_start(_supervisor, **kwargs):
+        events.append("start")
+        assert kwargs["experimental_opt_in"] is True
+        assert kwargs["memory_max_bytes"] == 64 * 1024 * 1024
+        assert kwargs["cpu_quota"] == 50_000
+        assert kwargs["cpu_period"] == 100_000
+        assert kwargs["pids_max"] == 32
+        assert kwargs["timeout_seconds"] == 10.0
+        assert kwargs["provider_egress_policy_name"] == "test-provider"
+        assert kwargs["provider_egress_destinations"] == {"api.example.com": [443]}
+        assert kwargs["provider_credential_policy_name"] == "read-only-fd4-v1"
+        assert kwargs["provider_credential_fd"] == 99
+        return expected_execution, SimpleNamespace(
+            attempt_id=attempt["id"],
+            claim_token=attempt["claim_token"],
+            execution_id="execution-test-1",
+            service_unit="acp-launch-driver-execution-test-1.service",
+            invocation_id="b" * 32,
+            driver_pid=1234,
+            driver_identity="linux:1234:1",
+            control_group="/user.slice/acp-test.service",
+        )
+
+    def fake_get(_attempt_id):
+        nonlocal observations
+        observations += 1
+        events.append("observe")
+        phase = "running" if observations == 1 else "cleanup_reported"
+        return {**expected_execution, "phase": phase}
+
+    busy_verification_remaining = True
+
+    def fake_verify(_attempt_id, _claim_token, *, credential=None):
+        nonlocal busy_verification_remaining
+        events.append("verify_cleanup")
+        assert credential is None
+        if busy_verification_remaining:
+            busy_verification_remaining = False
+            raise SupervisorError("sandbox_execution_gate_busy", "test lifecycle fence is busy")
+        return {**expected_execution, "phase": "cleanup_verified", "runc_exit_code": 0}
+
+    def fake_import(_attempt_id, _claim_token, *, credential=None):
+        if interrupt_during_wait:
+            pytest.fail("interrupted worker must never import a result")
+        events.append("import")
+        assert credential is None
+        return {"status": "pending_qc", "commit_sha": "a" * 40}
+
+    interrupted = False
+
+    def fake_sleep(_seconds):
+        nonlocal interrupted
+        if interrupt_during_wait and not interrupted:
+            interrupted = True
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(
+        sandbox_launch_driver_service,
+        "start_registered_no_model_sandbox_worker",
+        fake_start,
+    )
+    monkeypatch.setattr(
+        sandbox_launch_driver_service,
+        "_read_provider_credential_fd",
+        lambda descriptor: b"synthetic-provider-token" if descriptor == 99 else None,
+    )
+    monkeypatch.setattr(supervisor, "_sandbox_execution_get", fake_get)
+    monkeypatch.setattr(supervisor, "_sandbox_execution_verify_cleanup", fake_verify)
+    monkeypatch.setattr(supervisor, "import_sandbox_execution_result", fake_import)
+    monkeypatch.setattr(workers_module.time, "sleep", fake_sleep)
+
+    def run_worker():
+        return supervisor.run_worker(
+            attempt["id"],
+            attempt["claim_token"],
+            ["/bin/busybox", "sh", "-c", "exit 0"],
+            sandbox_experimental_opt_in=True,
+            sandbox_memory_max_bytes=64 * 1024 * 1024,
+            sandbox_cpu_quota=50_000,
+            sandbox_cpu_period=100_000,
+            sandbox_pids_max=32,
+            sandbox_timeout_seconds=10,
+            sandbox_provider_uds_policy_name="test-provider",
+            sandbox_provider_uds_destinations={"api.example.com": [443]},
+            sandbox_provider_credential_policy_name="read-only-fd4-v1",
+            sandbox_provider_credential_fd=99,
+        )
+
+    if interrupt_during_wait:
+        with pytest.raises(KeyboardInterrupt):
+            run_worker()
+        assert events == [
+            "start",
+            "observe",
+            "observe",
+            "observe",
+            "verify_cleanup",
+            "observe",
+            "verify_cleanup",
+        ]
+        return
+
+    result = run_worker()
+
+    assert events == [
+        "start",
+        "observe",
+        "observe",
+        "verify_cleanup",
+        "observe",
+        "verify_cleanup",
+        "import",
+    ]
+    assert result == {
+        "status": "pending_qc",
+        "commit_sha": "a" * 40,
+        "sandbox_execution_id": "execution-test-1",
+        "sandbox_cleanup_verified": True,
+        "sandbox_launch_receipt": {
+            "attempt_id": attempt["id"],
+            "claim_token": attempt["claim_token"],
+            "execution_id": "execution-test-1",
+            "service_unit": "acp-launch-driver-execution-test-1.service",
+            "invocation_id": "b" * 32,
+            "driver_pid": 1234,
+            "driver_identity": "linux:1234:1",
+            "control_group": "/user.slice/acp-test.service",
+        },
+    }
+
+
+def test_experimental_sandbox_worker_rejects_missing_limits_and_manifest(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from agent_control_plane.supervisor import sandbox_launch_driver_service
+
+    append_oci_config(repo, 'runc_executable = "/usr/bin/runc"\nrunc_version = "1.5.2"')
+    pin = object()
+    monkeypatch.setattr(oci_worker_module, "_pin_trusted_runc_executable", lambda *_args: pin)
+    monkeypatch.setattr(
+        oci_worker_module,
+        "_probe_trusted_runc_version",
+        lambda _pin, expected: expected,
+    )
+    monkeypatch.setattr(
+        sandbox_launch_driver_service,
+        "start_registered_no_model_sandbox_worker",
+        lambda *_args, **_kwargs: pytest.fail("invalid sandbox request reached launch"),
+    )
+
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "sandbox-worker")
+
+    with pytest.raises(SupervisorError) as missing_limits:
+        supervisor.run_worker(
+            attempt["id"],
+            attempt["claim_token"],
+            ["/bin/busybox", "true"],
+            sandbox_experimental_opt_in=True,
+        )
+    assert missing_limits.value.code == "sandbox_resource_limits_required"
+
+    with pytest.raises(SupervisorError) as manifest:
+        supervisor.run_worker(
+            attempt["id"],
+            attempt["claim_token"],
+            ["/bin/busybox", "true"],
+            result_manifest_path="reports/result.json",
+            sandbox_experimental_opt_in=True,
+            sandbox_memory_max_bytes=64 * 1024 * 1024,
+            sandbox_cpu_quota=50_000,
+            sandbox_cpu_period=100_000,
+            sandbox_pids_max=32,
+            sandbox_timeout_seconds=10,
+        )
+    assert manifest.value.code == "sandbox_result_manifest_unsupported"
+
+    attempt_before = supervisor.attempt(attempt["id"])
+    compiler_boundary_cases = [
+        {"sandbox_memory_max_bytes": 1},
+        {"sandbox_memory_max_bytes": oci_worker_module._MAX_INT64 + 1},
+        {"sandbox_cpu_quota": oci_worker_module._MAX_INT64 + 1},
+        {"sandbox_cpu_period": oci_worker_module._MAX_UINT64 + 1},
+        {"sandbox_pids_max": oci_worker_module._MAX_PIDS + 1},
+    ]
+    valid_limits = {
+        "sandbox_memory_max_bytes": 64 * 1024 * 1024,
+        "sandbox_cpu_quota": 50_000,
+        "sandbox_cpu_period": 100_000,
+        "sandbox_pids_max": 32,
+        "sandbox_timeout_seconds": 10,
+    }
+    for overrides in compiler_boundary_cases:
+        with pytest.raises(SupervisorError) as invalid_limits:
+            supervisor.run_worker(
+                attempt["id"],
+                attempt["claim_token"],
+                ["/bin/busybox", "true"],
+                sandbox_experimental_opt_in=True,
+                **(valid_limits | overrides),
+            )
+        assert invalid_limits.value.code == "invalid_sandbox_resource_limits"
+    assert supervisor.attempt(attempt["id"]) == attempt_before
+
+
+@pytest.mark.parametrize("opt_in", [None, 0, 1, "true"])
+def test_worker_rejects_non_boolean_sandbox_opt_in_before_host_launch(
+    repo: Path, monkeypatch: pytest.MonkeyPatch, opt_in: object
+) -> None:
+    write_config(repo)
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "sandbox-worker")
+    attempt_before = supervisor.attempt(attempt["id"])
+    worker_log = supervisor.state_dir / "logs" / f"worker-{attempt['id']}.log"
+
+    def launch_must_not_run(*_args, **_kwargs):
+        pytest.fail("invalid sandbox opt-in must fail before host worker side effects")
+
+    monkeypatch.setattr(workers_module.sys, "platform", "linux")
+    monkeypatch.setattr(supervisor, "heartbeat", launch_must_not_run)
+    monkeypatch.setattr(supervisor, "_reserve_worker_launch", launch_must_not_run)
+    monkeypatch.setattr(workers_module.subprocess, "Popen", launch_must_not_run)
+
+    with pytest.raises(SupervisorError) as invalid_opt_in:
+        supervisor.run_worker(
+            attempt["id"],
+            attempt["claim_token"],
+            [sys.executable, "-c", "pass"],
+            sandbox_experimental_opt_in=opt_in,  # type: ignore[arg-type]
+        )
+
+    assert invalid_opt_in.value.code == "invalid_sandbox_opt_in"
+    assert supervisor.attempt(attempt["id"]) == attempt_before
+    assert not worker_log.exists()
+
+
+def test_provider_uds_policy_requires_explicit_sandbox_opt_in(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write_config(repo)
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "sandbox-worker")
+    attempt_before = supervisor.attempt(attempt["id"])
+
+    def launch_must_not_run(*_args, **_kwargs):
+        pytest.fail("provider UDS policy must fail before host worker side effects")
+
+    monkeypatch.setattr(supervisor, "heartbeat", launch_must_not_run)
+    monkeypatch.setattr(supervisor, "_reserve_worker_launch", launch_must_not_run)
+    monkeypatch.setattr(workers_module.subprocess, "Popen", launch_must_not_run)
+
+    with pytest.raises(SupervisorError) as error:
+        supervisor.run_worker(
+            attempt["id"],
+            attempt["claim_token"],
+            ["/bin/busybox", "true"],
+            sandbox_provider_uds_policy_name="test-provider",
+            sandbox_provider_uds_destinations={"api.example.com": [443]},
+        )
+
+    assert error.value.code == "sandbox_opt_in_required"
+    assert supervisor.attempt(attempt["id"]) == attempt_before
+
+
+def test_provider_uds_policy_pair_is_validated_before_execution_reservation(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from agent_control_plane.supervisor import sandbox_launch_driver_service
+
+    append_oci_config(repo, 'runc_executable = "/usr/bin/runc"\nrunc_version = "1.5.2"')
+    pin = object()
+    monkeypatch.setattr(oci_worker_module, "_pin_trusted_runc_executable", lambda *_args: pin)
+    monkeypatch.setattr(
+        oci_worker_module,
+        "_probe_trusted_runc_version",
+        lambda _pin, expected: expected,
+    )
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "sandbox-worker")
+    attempt_before = supervisor.attempt(attempt["id"])
+    monkeypatch.setattr(
+        workers_module.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: pytest.fail("invalid provider policy reached process launch"),
+    )
+
+    with pytest.raises(SupervisorError) as error:
+        supervisor.run_worker(
+            attempt["id"],
+            attempt["claim_token"],
+            ["/bin/busybox", "true"],
+            sandbox_experimental_opt_in=True,
+            sandbox_memory_max_bytes=64 * 1024 * 1024,
+            sandbox_cpu_quota=50_000,
+            sandbox_cpu_period=100_000,
+            sandbox_pids_max=32,
+            sandbox_timeout_seconds=10,
+            sandbox_provider_uds_policy_name="test-provider",
+        )
+
+    assert error.value.code == "invalid_sandbox_provider_uds_policy"
+    assert supervisor.attempt(attempt["id"]) == attempt_before
+
+    valid_sandbox_options = {
+        "sandbox_experimental_opt_in": True,
+        "sandbox_memory_max_bytes": 64 * 1024 * 1024,
+        "sandbox_cpu_quota": 50_000,
+        "sandbox_cpu_period": 100_000,
+        "sandbox_pids_max": 32,
+        "sandbox_timeout_seconds": 10,
+        "sandbox_provider_uds_policy_name": "test-provider",
+        "sandbox_provider_uds_destinations": {"api.example.com": [443]},
+    }
+
+    with pytest.raises(SupervisorError) as missing_credential_fd:
+        supervisor.run_worker(
+            attempt["id"],
+            attempt["claim_token"],
+            ["/bin/busybox", "true"],
+            sandbox_provider_credential_policy_name="read-only-fd4-v1",
+            **valid_sandbox_options,
+        )
+    assert missing_credential_fd.value.code == "invalid_sandbox_provider_credential_policy"
+
+    monkeypatch.setattr(
+        sandbox_launch_driver_service,
+        "_read_provider_credential_fd",
+        lambda descriptor: b"synthetic-provider-token" if descriptor == 99 else None,
+    )
+    with pytest.raises(SupervisorError) as command_leak:
+        supervisor.run_worker(
+            attempt["id"],
+            attempt["claim_token"],
+            ["/bin/echo", "synthetic-provider-token"],
+            sandbox_provider_credential_policy_name="read-only-fd4-v1",
+            sandbox_provider_credential_fd=99,
+            **valid_sandbox_options,
+        )
+    assert command_leak.value.code == "invalid_sandbox_provider_credential_descriptor"
+    assert supervisor.attempt(attempt["id"]) == attempt_before
+
+
+class _UnstableWorkerCommand(tuple):
+    def __iter__(self):
+        return iter(("/bin/echo", "substituted"))
+
+
+class _UnstableWorkerCommandList(list):
+    def __iter__(self):
+        return iter(("/bin/echo", "substituted"))
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "echo hello",
+        b"echo hello",
+        (),
+        ("",),
+        ("/bin/echo\x00bad",),
+        ("/bin/echo", "bad\x00argument"),
+        ("/bin/echo", 7),
+        7,
+        pytest.param(
+            _UnstableWorkerCommand(("/bin/echo", "true")),
+            id="tuple-subclass-with-overridden-iteration",
+        ),
+        pytest.param(
+            _UnstableWorkerCommandList(("/bin/echo", "true")),
+            id="list-subclass-with-overridden-iteration",
+        ),
+    ],
+)
+def test_worker_rejects_malformed_argv_before_host_launch(
+    repo: Path, monkeypatch: pytest.MonkeyPatch, command: object
+) -> None:
+    write_config(repo)
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "worker")
+    attempt_before = supervisor.attempt(attempt["id"])
+    worker_log = supervisor.state_dir / "logs" / f"worker-{attempt['id']}.log"
+
+    def launch_must_not_run(*_args, **_kwargs):
+        pytest.fail("malformed worker argv must fail before host worker side effects")
+
+    monkeypatch.setattr(workers_module.sys, "platform", "linux")
+    monkeypatch.setattr(supervisor, "heartbeat", launch_must_not_run)
+    monkeypatch.setattr(supervisor, "_reserve_worker_launch", launch_must_not_run)
+    monkeypatch.setattr(workers_module.subprocess, "Popen", launch_must_not_run)
+
+    with pytest.raises(SupervisorError) as invalid_command:
+        supervisor.run_worker(
+            attempt["id"],
+            attempt["claim_token"],
+            command,  # type: ignore[arg-type]
+        )
+
+    assert invalid_command.value.code == "invalid_command"
+    assert supervisor.attempt(attempt["id"]) == attempt_before
+    assert not worker_log.exists()
+
+
+def test_experimental_sandbox_worker_fails_closed_without_pinned_runtime(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write_config(repo)
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "sandbox-worker")
+    attempt_before = supervisor.attempt(attempt["id"])
+    worker_log = supervisor.state_dir / "logs" / f"worker-{attempt['id']}.log"
+
+    def launch_must_not_run(*_args, **_kwargs):
+        pytest.fail("missing sandbox runtime prerequisites must not fall back to host launch")
+
+    monkeypatch.setattr(workers_module.sys, "platform", "linux")
+    monkeypatch.setattr(supervisor, "heartbeat", launch_must_not_run)
+    monkeypatch.setattr(supervisor, "_reserve_worker_launch", launch_must_not_run)
+    monkeypatch.setattr(workers_module.subprocess, "Popen", launch_must_not_run)
+
+    with pytest.raises(SupervisorError) as unavailable:
+        supervisor.run_worker(
+            attempt["id"],
+            attempt["claim_token"],
+            [sys.executable, "-c", "pass"],
+            sandbox_experimental_opt_in=True,
+            sandbox_memory_max_bytes=64 * 1024 * 1024,
+            sandbox_cpu_quota=50_000,
+            sandbox_cpu_period=100_000,
+            sandbox_pids_max=32,
+            sandbox_timeout_seconds=10,
+        )
+
+    assert unavailable.value.code == "sandbox_executor_unavailable"
+    assert "requires configured pinned runc and rootfs" in str(unavailable.value)
+    assert supervisor.attempt(attempt["id"]) == attempt_before
+    assert not worker_log.exists()
+
+
+def test_experimental_sandbox_worker_never_imports_nonzero_exit(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from agent_control_plane.supervisor import sandbox_launch_driver_service
+
+    append_oci_config(repo, 'runc_executable = "/usr/bin/runc"\nrunc_version = "1.5.2"')
+    pin = object()
+    monkeypatch.setattr(oci_worker_module, "_pin_trusted_runc_executable", lambda *_args: pin)
+    monkeypatch.setattr(
+        oci_worker_module,
+        "_probe_trusted_runc_version",
+        lambda _pin, expected: expected,
+    )
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "sandbox-worker")
+    execution = {
+        "attempt_id": attempt["id"],
+        "claim_token": attempt["claim_token"],
+        "execution_id": "execution-test-failed",
+        "phase": "cleanup_reported",
+    }
+    events: list[str] = []
+    monkeypatch.setattr(
+        sandbox_launch_driver_service,
+        "start_registered_no_model_sandbox_worker",
+        lambda *_args, **_kwargs: (execution, object()),
+    )
+    monkeypatch.setattr(supervisor, "_sandbox_execution_get", lambda _attempt_id: execution)
+    monkeypatch.setattr(
+        supervisor,
+        "_sandbox_execution_verify_cleanup",
+        lambda *_args, **_kwargs: (
+            events.append("verify_cleanup")
+            or {**execution, "phase": "cleanup_verified", "runc_exit_code": 9}
+        ),
+    )
+    monkeypatch.setattr(
+        supervisor,
+        "import_sandbox_execution_result",
+        lambda *_args, **_kwargs: pytest.fail("nonzero worker result reached import"),
+    )
+
+    with pytest.raises(SupervisorError) as failure:
+        supervisor.run_worker(
+            attempt["id"],
+            attempt["claim_token"],
+            ["/bin/busybox", "false"],
+            sandbox_experimental_opt_in=True,
+            sandbox_memory_max_bytes=64 * 1024 * 1024,
+            sandbox_cpu_quota=50_000,
+            sandbox_cpu_period=100_000,
+            sandbox_pids_max=32,
+            sandbox_timeout_seconds=10,
+        )
+    assert failure.value.code == "worker_failed"
+    assert events == ["verify_cleanup"]
+
+
+def test_experimental_sandbox_worker_cancellation_uses_monitor_and_verifies_cleanup(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from agent_control_plane.supervisor import sandbox_launch_driver_service
+
+    append_oci_config(repo, 'runc_executable = "/usr/bin/runc"\nrunc_version = "1.5.2"')
+    pin = object()
+    monkeypatch.setattr(oci_worker_module, "_pin_trusted_runc_executable", lambda *_args: pin)
+    monkeypatch.setattr(
+        oci_worker_module,
+        "_probe_trusted_runc_version",
+        lambda _pin, expected: expected,
+    )
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "sandbox-worker")
+    base = {
+        "attempt_id": attempt["id"],
+        "claim_token": attempt["claim_token"],
+        "execution_id": "execution-test-cancel",
+    }
+    events: list[str] = []
+    states = iter(
+        [
+            {**base, "phase": "running"},
+            {**base, "phase": "running"},
+            {**base, "phase": "cleanup_reported"},
+        ]
+    )
+    monkeypatch.setattr(
+        sandbox_launch_driver_service,
+        "start_registered_no_model_sandbox_worker",
+        lambda *_args, **_kwargs: ({**base, "phase": "running"}, object()),
+    )
+    monkeypatch.setattr(
+        supervisor,
+        "_sandbox_execution_get",
+        lambda _attempt_id: events.append("observe") or next(states),
+    )
+    monkeypatch.setattr(
+        supervisor,
+        "terminate_worker",
+        lambda _attempt_id, credential=None: events.append("terminate_monitor"),
+    )
+    monkeypatch.setattr(
+        supervisor,
+        "_sandbox_execution_verify_cleanup",
+        lambda *_args, **_kwargs: (
+            events.append("verify_cleanup")
+            or {**base, "phase": "cleanup_verified", "runc_exit_code": 137}
+        ),
+    )
+    monkeypatch.setattr(
+        supervisor,
+        "import_sandbox_execution_result",
+        lambda *_args, **_kwargs: pytest.fail("cancelled worker result reached import"),
+    )
+    sleep_count = 0
+
+    def interrupt_first_wait(_seconds: float) -> None:
+        nonlocal sleep_count
+        sleep_count += 1
+        if sleep_count == 1:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(workers_module.time, "sleep", interrupt_first_wait)
+
+    with pytest.raises(KeyboardInterrupt):
+        supervisor.run_worker(
+            attempt["id"],
+            attempt["claim_token"],
+            ["/bin/busybox", "sleep", "30"],
+            sandbox_experimental_opt_in=True,
+            sandbox_memory_max_bytes=64 * 1024 * 1024,
+            sandbox_cpu_quota=50_000,
+            sandbox_cpu_period=100_000,
+            sandbox_pids_max=32,
+            sandbox_timeout_seconds=30,
+        )
+    assert events == ["observe", "observe", "terminate_monitor", "observe", "verify_cleanup"]
+
+
+def test_unsupported_worker_platform_fails_before_attempt_mutation(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write_config(repo)
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "worker")
+    attempt_before = supervisor.attempt(attempt["id"])
+    worker_log = supervisor.state_dir / "logs" / f"worker-{attempt['id']}.log"
+
+    def side_effect_must_not_run(*_args, **_kwargs):
+        pytest.fail("unsupported worker platform must fail before heartbeat or launch")
+
+    monkeypatch.setattr(workers_module.sys, "platform", "darwin")
+    monkeypatch.setattr(supervisor, "heartbeat", side_effect_must_not_run)
+    monkeypatch.setattr(supervisor, "_reserve_worker_launch", side_effect_must_not_run)
+    monkeypatch.setattr(workers_module.subprocess, "Popen", side_effect_must_not_run)
+
+    with pytest.raises(SupervisorError) as error:
+        supervisor.run_worker(attempt["id"], attempt["claim_token"], [sys.executable, "-c", "pass"])
+
+    assert error.value.code == "process_containment_unavailable"
+    assert "require Linux child-subreaper containment" in str(error.value)
+    attempt_after = supervisor.attempt(attempt["id"])
+    assert attempt_after["pid"] is None
+    assert attempt_after["updated_at"] == attempt_before["updated_at"]
+    assert not worker_log.exists()
 
 
 @pytest.mark.parametrize(
     ("entry", "message"),
     [
-        ('runc_executable = "runc"\nrunc_version = "1.3.5"', "absolute path"),
+        ('runc_executable = "runc"\nrunc_version = "1.5.2"', "absolute path"),
         ('runc_executable = "/usr/bin/runc"\nrunc_version = "latest"', "release version"),
-        ('runc_executable = "/usr/bin/runc"\nrunc_version = "1.3.5-01"', "release version"),
-        ('runc_executable = "/usr/bin/runc"\nrunc_version = "1.3.5-a..b"', "release version"),
-        ('runc_executable = "/usr/bin/runc"\nrunc_version = "1.3.5-a."', "release version"),
-        ('runc_executable = "/usr/bin/runc"\nrunc_version = "1.3.5+meta."', "release version"),
+        ('runc_executable = "/usr/bin/runc"\nrunc_version = "1.5.2-01"', "release version"),
+        ('runc_executable = "/usr/bin/runc"\nrunc_version = "1.5.2-a..b"', "release version"),
+        ('runc_executable = "/usr/bin/runc"\nrunc_version = "1.5.2-a."', "release version"),
+        ('runc_executable = "/usr/bin/runc"\nrunc_version = "1.5.2+meta."', "release version"),
         (
-            'runc_executable = "/usr/bin/runc"\nrunc_version = "1.3.5"\nextra = true',
+            'runc_executable = "/usr/bin/runc"\nrunc_version = "1.5.2"\nextra = true',
             "requires runc_executable",
         ),
     ],
@@ -2910,6 +3584,100 @@ def test_reaper_tears_down_expired_runtime(repo: Path) -> None:
     assert supervisor.runtime_environment(attempt["id"])["state"] == "released"
 
 
+def test_quarantined_cleanup_finalizes_without_registered_worker_identity(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt", "sandbox-only attempt")
+    attempt = supervisor.claim(created["id"], "worker")
+    with supervisor.connect() as connection:
+        connection.execute(
+            "UPDATE attempts SET status = 'terminating', termination_target_status = 'quarantined' "
+            "WHERE id = ?",
+            (attempt["id"],),
+        )
+        connection.execute(
+            "UPDATE tasks SET status = 'cleanup_pending', cleanup_target_status = 'blocked' "
+            "WHERE id = ?",
+            (created["id"],),
+        )
+        connection.execute(
+            "UPDATE runtime_environments SET state = 'released' WHERE attempt_id = ?",
+            (attempt["id"],),
+        )
+    monkeypatch.setattr(
+        workers_module,
+        "_sandbox_execution_cleanup_is_verified",
+        lambda _connection, _attempt_id: True,
+    )
+
+    assert supervisor._finalize_registered_worker_cleanup(attempt["id"]) == "quarantined"
+
+    finalized = supervisor.attempt(attempt["id"])
+    assert finalized["status"] == "quarantined"
+    assert finalized["pid"] is None
+    assert finalized["pid_identity"] == ""
+    assert finalized["termination_proof"] == ""
+    assert finalized["termination_target_status"] == ""
+
+
+@pytest.mark.parametrize(
+    ("registered_pid", "launch_owner_column", "launch_owner_value"),
+    (
+        (None, "launch_owner_pid", 424242),
+        (None, "launch_owner_identity", "linux:424242:9"),
+        (424243, "launch_owner_pid", 424242),
+        (424243, "launch_owner_identity", "linux:424242:9"),
+    ),
+)
+def test_quarantined_cleanup_retains_unproven_launch_owner(
+    repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    registered_pid: int | None,
+    launch_owner_column: str,
+    launch_owner_value: int | str,
+) -> None:
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt", "sandbox-only attempt with launch owner")
+    attempt = supervisor.claim(created["id"], "worker")
+    with supervisor.connect() as connection:
+        connection.execute(
+            "UPDATE attempts SET status = 'terminating', termination_target_status = 'quarantined', "
+            f"{launch_owner_column} = ?, pid = ?, pid_identity = ?, termination_proof = ? "
+            "WHERE id = ?",
+            (
+                launch_owner_value,
+                registered_pid,
+                "linux:424243:10" if registered_pid is not None else "",
+                "worker-death-proof" if registered_pid is not None else "",
+                attempt["id"],
+            ),
+        )
+        connection.execute(
+            "UPDATE tasks SET status = 'cleanup_pending', cleanup_target_status = 'blocked' "
+            "WHERE id = ?",
+            (created["id"],),
+        )
+        connection.execute(
+            "UPDATE runtime_environments SET state = 'released' WHERE attempt_id = ?",
+            (attempt["id"],),
+        )
+    monkeypatch.setattr(
+        workers_module,
+        "_sandbox_execution_cleanup_is_verified",
+        lambda _connection, _attempt_id: True,
+    )
+
+    with pytest.raises(SupervisorError) as error:
+        supervisor._finalize_registered_worker_cleanup(attempt["id"])
+
+    assert error.value.code == "worker_cleanup_unproven"
+    retained = supervisor.attempt(attempt["id"])
+    assert retained["status"] == "terminating"
+    assert retained["termination_target_status"] == "quarantined"
+    assert retained[launch_owner_column] == launch_owner_value
+
+
 @requires_linux_worker
 def test_reaper_stops_supervised_worker_before_releasing_runtime(repo: Path) -> None:
     start, _ = two_free_ports()
@@ -2930,9 +3698,21 @@ def test_reaper_stops_supervised_worker_before_releasing_runtime(repo: Path) -> 
 
     with ThreadPoolExecutor(max_workers=1) as pool:
         worker = pool.submit(supervisor.run_worker, attempt["id"], attempt["claim_token"], command)
-        deadline = time.time() + 5
-        while supervisor._port_available(port) and time.time() < deadline:
+        deadline = time.monotonic() + 15
+        while supervisor._port_available(port) and time.monotonic() < deadline:
+            if worker.done():
+                # Surface a launch failure directly instead of reporting a
+                # misleading listener-readiness timeout.
+                worker.result()
             time.sleep(0.02)
+        if supervisor._port_available(port):
+            if worker.done():
+                worker.result()
+            state = supervisor.attempt(attempt["id"])
+            pytest.fail(
+                f"worker did not bind assigned port {port} within 15 seconds "
+                f"(future_done={worker.done()}, attempt_status={state['status']})"
+            )
         assert not supervisor._port_available(port)
         result = supervisor.reap_expired(now=supervisor.attempt(attempt["id"])["lease_expires_at"])
         with pytest.raises(SupervisorError):
@@ -4819,6 +5599,7 @@ def test_worker_payload_waits_for_durable_command_identity_receipt(
     ready_entered = Event()
     release_ready = Event()
     original_record = supervisor._record_worker_command_ready
+    secret_argument = "worker-argument-secret-sentinel"
 
     def block_before_receipt(*arguments, **keywords):
         ready_entered.set()
@@ -4836,6 +5617,7 @@ def test_worker_payload_waits_for_durable_command_identity_receipt(
             "subprocess.run(['git','add','alpha.txt'],check=True); "
             "subprocess.run(['git','commit','-m','gated worker'],check=True)"
         ),
+        secret_argument,
     ]
     with ThreadPoolExecutor(max_workers=1) as pool:
         future = pool.submit(supervisor.run_worker, attempt["id"], attempt["claim_token"], command)
@@ -4872,6 +5654,23 @@ def test_worker_payload_waits_for_durable_command_identity_receipt(
             json.dumps(list(command), ensure_ascii=True, separators=(",", ":")).encode("ascii")
         ).hexdigest()
     )
+    with supervisor.connect() as connection:
+        telemetry = connection.execute(
+            "SELECT event_type, payload_json FROM events "
+            "WHERE json_extract(payload_json, '$.attempt_id') = ?",
+            (attempt["id"],),
+        ).fetchall()
+    assert telemetry
+    assert all(secret_argument not in row["payload_json"] for row in telemetry)
+    started = next(row for row in telemetry if row["event_type"] == "worker.started")
+    started_payload = json.loads(started["payload_json"])
+    assert started_payload["command_digest"] == ready["command_digest"]
+    assert started_payload["command_argument_count"] == len(command)
+    assert "command" not in started_payload
+    checkpoint = supervisor.attempt(attempt["id"])["checkpoint"]
+    assert secret_argument not in canonical_json(checkpoint)
+    assert checkpoint["command_digest"] == ready["command_digest"]
+    assert checkpoint["command_argument_count"] == len(command)
 
 
 @requires_linux_worker

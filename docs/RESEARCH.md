@@ -1,6 +1,6 @@
 # Research: the missing safety layer for parallel coding agents
 
-Research updated: 2026-10-06.
+Research updated: 2026-10-22.
 
 ## Verdict
 
@@ -57,6 +57,29 @@ cannot prove that a resource is free.
 The pattern is consistent: products are improving how agents are launched and
 observed. The weakest common layer is the correctness protocol between task
 assignment and merge.
+
+## Integration boundary finding (2026-10-22)
+
+This is a current vendor-documentation finding, not a practitioner prevalence
+claim. Codex's App Server API lists `thread/shellCommand` as a user-initiated,
+full-access command outside the sandbox and experimental `process/spawn` as an
+execution surface outside the sandbox. Its command network proxy only filters
+programs running inside the local command sandbox; separate model/authentication
+traffic and several separately controlled surfaces are outside that proxy's
+scope, including web search, apps/connectors, MCP, browser/Computer Use, and
+cloud tasks ([App Server API
+overview](https://learn.chatgpt.com/docs/app-server#api-overview), [agent
+security guidance](https://learn.chatgpt.com/docs/agent-approvals-security#traffic-outside-the-command-network-proxy)).
+
+**Product requirement:** each provider adapter needs a capability allowlist that
+records which principal executes every command/tool, which OS boundary contains
+it, and which network/credential controls apply. Do not expose undocumented or
+outside-sandbox execution methods to worker-controlled clients by default; an
+adapter must fail closed until every exposed method has explicit authorization
+and independently verified confinement. This extends the existing no-token-
+passthrough and external-sandbox requirements; it does not claim that a Codex
+App Server adapter exists or that the documented surfaces are a common user
+incident.
 
 ## User reports that sharpened the threat model
 
