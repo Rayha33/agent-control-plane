@@ -1889,3 +1889,40 @@ denials on this exact disposable Linux tuple; it does not prove confinement
 against a hostile kernel, other hosts/runtimes, Codex CLI profile-path reads,
 provider egress/authentication, real credential delivery, or default-worker
 activation. Tasks #2370 and #3441 remain open; PR #42 remains draft/open/unmerged.
+
+### Exact-head Linux 6.12 PIDFD-gated TLS/cancellation replay (2026-10-25)
+
+At exact PR #42 head
+`747c32988be7dbf72ffba4f042986848bed43533`, the opt-in
+`test_live_production_launch_driver_runs_exact_pinned_runc_request` passed on
+the existing disposable Debian 12 ARM64 Linux `6.12.95+deb12-cloud-arm64`
+guest (systemd `252.39`, CPython `3.11.2`, root-owned runc `1.5.2`). The exact
+source archive SHA-256 was
+`a21c09a9d5d8f3a12867bbfec0a2b71b1c15e0f7f30ee4cbe46302be0b299903`; host and
+guest hashes matched for `provider_proxy.py`
+(`02036e6d427c1ae5a4dcac580e3107bfafd668600607cfa50805b54e188c582f`),
+`sandbox_launch_driver_service.py`
+(`4f3c03a15881c0816219f6df027c1512f64a2af4f6f717ed0b24292ac2c3fc67`), the
+integration test (`d46b897c1d25e3c95a44a80cb970bbae1179ac44ec1994b806dccb59b838c51b`),
+`pyproject.toml`, and `uv.lock`. The runtime kernel returned a real
+`SO_PEERPIDFD` descriptor; the exact same code's Linux 6.1 path is separately
+verified to reject before provider attempt reservation.
+
+The cleared environment enabled supervised `run_worker()`, the explicit
+test-only FD4 canary, the production per-attempt UDS proxy, TLS redirect
+handling, and cancellation. The local TLS mock matched the synthetic bearer;
+the redirected disallowed CONNECT was rejected before resolver/dial, and the
+in-cgroup worker peer was authorized while a same-UID outside peer was denied.
+Cancellation reached exact `cleanup_verified`, removed the attempt proxy
+artifacts, and left the cancelled result unimported. No public network socket,
+external DNS, real provider credential/endpoint, model inference, or paid call
+was used. This is not production credential delivery or external-provider
+acceptance.
+
+The run exited 0 for the single targeted live test. Postflight found no new
+ACP service, test worker, runc process, or test-specific launch-driver root;
+the two previously quarantined monitors and older failed unit were left
+untouched. Exact-head hosted CI run `40154200500` passed all four
+Ubuntu/macOS × Python 3.11/3.12 jobs; independent exact-diff QC was GO. The
+default OCI worker remains disabled/fail-closed; #2370/#3441 remain open and
+PR #42 remains draft/open/unmerged.

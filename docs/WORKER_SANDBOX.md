@@ -1,23 +1,31 @@
 # Per-attempt worker sandbox decision
 
-**Current status (2026-10-22):** Provider-backed end-to-end acceptance remains
-incomplete. An explicit experimental, no-model `run_worker()` route now reaches
-the production launch driver, independent cleanup verifier, and host-side
-result-import path. It can carry an explicitly named UDS-only provider egress
-policy, but it does not provide a built-in provider-credential channel or generic
-TCP HTTP-proxy/SDK compatibility. Callers remain responsible for keeping secrets
-out of worker commands and workspaces. It does not enable the default OCI worker path. A live
-two-worker test on one shared repository recorded `/proc/self/mountinfo` from
+**Current status (2026-10-25):** Provider-backed end-to-end acceptance remains
+incomplete. At exact PR #42 head `747c32988be7dbf72ffba4f042986848bed43533`,
+the composed supervised `run_worker()` TLS-mock/redirect/cancellation proof
+passed on Linux 6.12 with the runtime `SO_PEERPIDFD` gate enabled. The same gate
+refuses provider mode before attempt reservation on Linux 6.1, where the kernel
+does not implement option 77. The supported-kernel replay exercised the
+attempt-scoped UDS policy, rejected an encrypted redirect's new CONNECT to a
+blocked authority, verified the synthetic bearer canary in the local mock, and
+reached `cleanup_verified` after cancellation. This is local-mock evidence only:
+no real provider credential, endpoint, model inference, or paid call was used;
+the synthetic resolver was invoked locally, but no external DNS query was made.
+The canary crossed a test-only FD4 seam, not a production credential API. The
+experimental, no-model `run_worker()` route still has no built-in
+provider-credential channel or generic TCP HTTP-proxy/SDK compatibility, and the
+default OCI worker path remains disabled/fail-closed. A separate live two-worker
+test from 2026-10-22 on one shared repository recorded `/proc/self/mountinfo` from
 each worker and verified its `/workspace` mount root matched that attempt's
 exact workspace path, `/tmp`, `/dev`, and `/home/agent` were tmpfs, `/proc` was
 procfs, and no mount root from the shared fixture appeared outside `/workspace`.
 Direct lookups of host-absolute peer-workspace and shared-Git sentinel paths
 were not visible; the peer-workspace sentinel was also tested through symlink
 and `..` paths. Cleanup was verified for both attempts. This is specific-path
-and live-mount evidence on one disposable Linux
-guest, not a general kernel-isolation proof. Provider authentication,
-production egress enforcement, supervisor-daemon restart, logout/linger, and
-reboot recovery remain unproven.
+and live-mount evidence on one disposable Linux guest, not a general
+kernel-isolation proof. Real-provider authentication/egress, production
+credential delivery, full supervisor-daemon restart, logout/linger, and reboot
+recovery remain unproven.
 The dated entries below describe evidence and status as of their stated dates;
 the current summary above supersedes older integration-status statements.
 
@@ -4524,3 +4532,48 @@ Host and guest SHA-256 values matched for the exact staged source and tests:
 | `sandbox_launch_driver_service.py` | `4f3c03a15881c0816219f6df027c1512f64a2af4f6f717ed0b24292ac2c3fc67` |
 | `test_provider_proxy.py` | `38446f531109d98251bc0fecb190da76ec2ed7654f9f9ed0d18ab9fe2a81ea80` |
 | `test_sandbox_launch_driver_service.py` | `38b79087778471bc0386373c97e0163e27932424d9f9a078d6db2190c116f3f4` |
+
+### Exact-head supported-kernel TLS/cancellation replay (2026-10-25)
+
+The exact `747c329` source archive had SHA-256
+`a21c09a9d5d8f3a12867bbfec0a2b71b1c15e0f7f30ee4cbe46302be0b299903` and was
+staged under a new private `/tmp` directory on the existing disposable Debian
+12 ARM64 guest `acp-2370-live-sandbox-kernel612-20261021` (Linux
+`6.12.95+deb12-cloud-arm64`, systemd `252.39`, CPython `3.11.2`, uv `0.5.9`,
+rootless root-owned runc `1.5.2`). The runc binary SHA-256 was
+`d10ecae898361832a059be2089bab92d158aec54661b18ed7346ed79628b46b0`; the uv
+Linux ARM64 release archive matched its published SHA-256
+`376d5d52a4b3a9875d66898261e2ce2d31d36c095a1d81cb88d953f5bf7273eb`. The
+guest's real AF_UNIX `SO_PEERPIDFD` probe returned a valid descriptor. Host and
+guest hashes matched for the exact staged archive and these runtime/test files:
+
+| File | SHA-256 |
+| --- | --- |
+| `provider_proxy.py` | `02036e6d427c1ae5a4dcac580e3107bfafd668600607cfa50805b54e188c582f` |
+| `sandbox_launch_driver_service.py` | `4f3c03a15881c0816219f6df027c1512f64a2af4f6f717ed0b24292ac2c3fc67` |
+| `test_sandbox_worker_lifecycle_integration.py` | `d46b897c1d25e3c95a44a80cb970bbae1179ac44ec1994b806dccb59b838c51b` |
+| `pyproject.toml` | `cfb987509711316640f448b0b87eeee3cd9ffe396bd30bac25cdd62b6299acca` |
+| `uv.lock` | `f3314012c2d1fcf5f05949a5c15c07e20be43283d8c927d5d676a24ea29f78b8` |
+
+With frozen dependencies and an `env -i` environment, the single opt-in
+`test_live_production_launch_driver_runs_exact_pinned_runc_request` passed
+(pytest exit 0). It composed supervised `run_worker()`, the explicit test-only
+FD4 synthetic-canary seam, the production attempt-scoped UDS proxy, a local TLS
+mock, a redirect to a disallowed authority, and cancellation. Assertions
+verified the mock's synthetic bearer match, denial of the redirected CONNECT
+before resolver/dial, the in-cgroup authorized channel versus same-UID outside
+peer denial, and exact cleanup verification; the cancelled result was not
+imported. The worker received no IPv4/IPv6 socket capability, and no public
+socket, external DNS, real provider endpoint/credential, model inference, or
+paid call was used. The pytest log contained no raw canary.
+
+Postflight retained the two previously quarantined monitor units and the
+previous failed launch-driver unit unchanged; no new ACP unit, test worker,
+runc process, or test-specific launch-driver root remained. No old fixture was
+cleaned or signaled. Exact-head hosted CI run
+`40154200500` also passed all four Ubuntu/macOS × Python 3.11/3.12 jobs, and
+independent exact-diff QC returned GO. This proves the test-only local-mock
+provider path on this Linux tuple; it still does not prove production
+credential-channel delivery, external provider authentication/egress, reboot
+recovery, or default OCI activation. Tasks #2370 and #3441 remain open; PR #42
+remains draft/open/unmerged.
