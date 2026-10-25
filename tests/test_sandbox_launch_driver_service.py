@@ -822,15 +822,19 @@ def test_provider_credential_fd_requires_a_bounded_fully_sealed_memfd(
     ordinary_file = tmp_path / "unsealed-provider-credential"
     ordinary_file.write_bytes(payload)
     with ordinary_file.open("rb") as stream:
-        with pytest.raises(SandboxLaunchDriverServiceError, match="sealed anonymous descriptor"):
+        # F_GET_SEALS may report either an error or an empty seal set for an
+        # ordinary file, so only the rejection type is portable across kernels.
+        with pytest.raises(SandboxLaunchDriverServiceError):
             _read_provider_credential_fd(stream.fileno())
 
     with pytest.raises(SandboxLaunchDriverServiceError, match="descriptor is invalid"):
         _read_provider_credential_fd(-1)
     with pytest.raises(SandboxLaunchDriverServiceError, match="descriptor is invalid"):
         _read_provider_credential_fd(True)
-    with pytest.raises(SandboxLaunchDriverServiceError, match="sealed anonymous descriptor"):
-        _read_provider_credential_fd(999_999)
+    invalid_descriptor = os.open(ordinary_file, os.O_RDONLY)
+    os.close(invalid_descriptor)
+    with pytest.raises(SandboxLaunchDriverServiceError):
+        _read_provider_credential_fd(invalid_descriptor)
 
 
 def test_provider_credential_pipe_is_bounded_read_only_and_eof_terminated() -> None:

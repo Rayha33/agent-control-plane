@@ -4640,9 +4640,12 @@ files in that tested snapshot were:
 | `test_sandbox_launch_driver_service.py` | `50c812de82fa13dc62d04e1069baa02d95f5478ac43fdbfb561cdabd6cbfcb5a` |
 | `test_sandbox_worker_lifecycle_integration.py` | `9c6fd18bb372544aca193a8ebb38e895dc78ea3fe4bc67132dd47d2ccca9a5be` |
 
-After that replay, only docstrings in `oci_worker.py` were clarified to
-distinguish the default offline path from the named opt-in; executable code
-and tests are unchanged from the hashes above.
+After that replay, docstrings in `oci_worker.py` were clarified to distinguish
+the default offline path from the named opt-in. The replayed runtime source is
+otherwise unchanged from the hashes above. A later Linux-CI portability fix
+changed only test code in `test_sandbox_launch_driver_service.py`; therefore,
+the test hash above identifies the replayed snapshot, not the current test
+file.
 
 The first replay attempt stopped before attempt reservation because this
 guest's CPython omitted symbolic `F_SEAL_*` constants. Linux UAPI fallback
