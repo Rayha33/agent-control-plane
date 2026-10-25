@@ -45,12 +45,14 @@ consumer continues to require runc exit code 0. Configured OCI
 `run_worker()` without `--sandbox-experimental-opt-in` still fails closed with
 `sandbox_executor_unavailable`.
 
-**Current PR #42 receipt (2026-10-25):** Head
-`749710807dcac615d41b10a994f1bd463304e628` passed exact-head Actions run
-`40159366849` (4/4 Ubuntu/macOS × Python 3.11/3.12). The latest follow-up only
-made a kernel-portable test correction and updated evidence wording; it did not
-add provider-credential recovery evidence or change runtime behavior. The dated
-replay sections below remain scoped to their recorded source snapshots.
+**Current PR #42 code/test receipt (2026-10-25):** Head
+`e2bca9615d995e59f8ee16d1450be705e95d6dde` passed exact-head Actions run
+`40161071493` (4/4 Ubuntu/macOS × Python 3.11/3.12). This follow-up changes
+tests, evidence wording, documentation, or docstrings only; sandbox runtime
+behavior is unchanged. CI leaves the new credential-bearing post-wait recovery
+and systemd credential-directory teardown paths opt-in, so neither is live
+acceptance evidence. The dated replay sections below remain scoped to their
+recorded source snapshots.
 
 ## Decision
 

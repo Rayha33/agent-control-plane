@@ -1,10 +1,14 @@
 # Per-attempt worker sandbox decision
 
-**Current status (2026-10-25):** Exact PR #42 head
-`749710807dcac615d41b10a994f1bd463304e628` passed hosted Actions run
-`40159366849` across Ubuntu/macOS × Python 3.11/3.12 (4/4 jobs). That follow-up
-changes only the portable test and evidence wording; runtime behavior is
-unchanged from the synthetic sealed-FD replay snapshot documented below.
+**Current status (2026-10-25):** Exact PR #42 code/test head
+`e2bca9615d995e59f8ee16d1450be705e95d6dde` passed hosted Actions run
+`40161071493` across Ubuntu/macOS × Python 3.11/3.12 (4/4 jobs). The follow-up
+changes tests, documentation, and a module docstring only; sandbox runtime
+behavior is unchanged from the synthetic sealed-FD replay snapshot documented
+below. It adds an opt-in provider-credential post-wait recovery path and a
+systemd credential-directory teardown assertion. Neither new opt-in path has
+been run on a disposable Linux host, so they are test coverage awaiting replay,
+not new acceptance evidence.
 
 The latest credential-bearing supervised `run_worker()` live replay used a
 synthetic sealed memfd, the named UDS policy, a local TLS mock, a blocked TLS
@@ -12,9 +16,9 @@ redirect, and cancellation; it reached `cleanup_verified` once on Debian 12
 ARM64/Linux 6.12.95, systemd 252.39, CPython 3.12.15, and runc 1.5.2. This is
 local-mock evidence only: no real provider credential or endpoint, external
 DNS/network request, model inference, or paid call was used. The runtime-source
-hashes and test-snapshot hash are recorded in the dated replay section; after
-that replay, only `oci_worker.py` docstrings changed before the portability fix
-changed the launch-driver test code.
+hashes and test-snapshot hash are recorded in the dated replay section.
+Subsequent changes through head `e2bca96` affect tests, documentation, or
+docstrings only; runtime behavior is unchanged.
 
 The evidence does not establish credential-bearing post-wait/supervisor
 recovery, directly observed deletion of systemd's `CREDENTIALS_DIRECTORY`, or
@@ -4583,11 +4587,13 @@ previous failed launch-driver unit unchanged; no new ACP unit, test worker,
 runc process, or test-specific launch-driver root remained. No old fixture was
 cleaned or signaled. At that historical head, CI run `40154200500` passed all
 four Ubuntu/macOS × Python 3.11/3.12 jobs and independent exact-diff QC returned
-GO. The later exact-head run `40159366849` also passed 4/4 at head `7497108`;
-that follow-up changed only test portability and evidence wording, not runtime
-code. Neither CI run establishes credential-bearing recovery, production
-authentication/egress, reboot recovery, or default OCI activation. Tasks #2370
-and #3441 remain open; PR #42 remains draft/open/unmerged.
+GO. Later exact-head runs `40159366849` at `7497108` and `40161071493` at
+`e2bca96` also passed 4/4. These follow-ups changed tests, evidence wording,
+documentation, or docstrings, not sandbox runtime behavior. CI does not enable
+the disposable-Linux opt-in replays; it does not establish credential-bearing
+recovery, systemd credential-directory deletion, production authentication or
+egress, reboot recovery, or default OCI activation. Tasks #2370 and #3441 remain
+open; PR #42 remains draft/open/unmerged.
 
 ### Experimental sealed-FD provider credential replay (2026-10-25)
 
