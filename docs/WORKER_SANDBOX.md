@@ -1141,7 +1141,11 @@ the first `/proc` lookup. The Linux v6.5 UAPI header defines the option
 the kernel's coredump path documents using it to guard `/proc/<pid>` against
 PID recycling ([source](https://github.com/torvalds/linux/blob/master/fs/coredump.c)).
 Python need not expose a named constant; unsupported kernels or failed
-`getsockopt` probes deny authorization. The supervisor's `/proc` view must use
+`getsockopt` probes deny authorization. Provider-egress requests now perform a
+real AF_UNIX `SO_PEERPIDFD` probe before attempt reservation and again before
+launch-driver activation; unsupported hosts fail before worker launch. The
+no-provider path does not run this probe. Kernel version strings are not used
+as a substitute for the runtime check. The supervisor's `/proc` view must use
 the same PID namespace as `SO_PEERCRED`. A same-UID process outside the exact
 cgroup is denied. PID pinning does not make the cgroup observation atomic or
 prevent a process with sufficient cgroup permissions from moving after the
@@ -4472,3 +4476,51 @@ but does not prove arbitrary hostile-kernel resistance, same-UID concurrent
 filesystem-mutation defense, provider-backed execution/egress, full crash or
 cancellation recovery through `run_worker()`, or default-path enablement.
 Acceptance #2370 remains open.
+
+### Provider peer-pidfd prerequisite: Linux 6.1 negative exact-head replay (2026-10-25)
+
+The exact-head supervised TLS/mock/cancellation replay on the clean leased
+Debian 12 ARM64 guest (`Linux 6.1.0-53-cloud-arm64`, systemd 252.39, rootless
+runc 1.5.2) failed and is not a pass. The worker launched, but its initial
+synthetic CONNECT did not receive the expected success response; the test
+worker exited 7, and the attempt nevertheless reached `cleanup_verified` with
+the exact runc-client wait evidence. The isolated TLS hook recorded zero
+resolver and dial calls, so no DNS or provider request occurred. A follow-up
+read-only `getsockopt(SOL_SOCKET, 77)` on an AF_UNIX socketpair returned
+`ENOPROTOOPT` (errno 92), identifying the kernel's missing
+`SO_PEERPIDFD` capability as the fail-closed authorization prerequisite. This
+is distinct from the successful Linux 6.12 cancellation replay recorded above.
+
+The launch path now probes this kernel capability before reserving a provider
+attempt, before direct launch-driver activation, and again when a persisted
+provider request is resumed, before `_execute_pinned_request` reads execution
+state or starts worker/runc work. On the same Linux 6.1 guest, the exact
+updated source exercised the registered-worker composition with a named mock
+policy: it refused on `SO_PEERPIDFD` before calling the attempt-reservation
+stub. One earlier combined focused guest invocation had a transient failure
+in `test_attempt_proxy_service_closes_real_relay_tunnel_on_shutdown`: an
+ordinary handler exception racing with close was reported as proxy failure.
+That test passed on isolated rerun, the combined focused rerun, and 10/10
+subsequent isolated repetitions without a source change. The handler now
+ignores ordinary exceptions only after cancellation has begun; shutdown still
+joins the handler and verifies channel drain, while `SystemExit` and other
+non-`Exception` failures remain fail-closed. A deterministic regression test
+covers both classifications. The final exact-source focused
+`test_provider_proxy.py` and `test_sandbox_launch_driver_service.py` suites
+passed; the three tests requiring real peer-PIDFD authorization skipped
+because this kernel lacks option 77. The no-provider path separately asserts
+that it does not run the probe. The
+gate-only composition test started no worker, production listener, provider
+request, or new ACP unit (other focused unit tests use local socket/listener
+fixtures). This is not a successful provider CONNECT or worker replay.
+Provider-backed acceptance, credential delivery, and parent task #2370 remain
+open.
+
+Host and guest SHA-256 values matched for the exact staged source and tests:
+
+| File | SHA-256 |
+| --- | --- |
+| `provider_proxy.py` | `02036e6d427c1ae5a4dcac580e3107bfafd668600607cfa50805b54e188c582f` |
+| `sandbox_launch_driver_service.py` | `4f3c03a15881c0816219f6df027c1512f64a2af4f6f717ed0b24292ac2c3fc67` |
+| `test_provider_proxy.py` | `38446f531109d98251bc0fecb190da76ec2ed7654f9f9ed0d18ab9fe2a81ea80` |
+| `test_sandbox_launch_driver_service.py` | `38b79087778471bc0386373c97e0163e27932424d9f9a078d6db2190c116f3f4` |

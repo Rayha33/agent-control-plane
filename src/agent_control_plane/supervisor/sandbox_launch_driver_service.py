@@ -324,6 +324,17 @@ def _reject_runner_credential_in_command(request: dict[str, Any], credential: st
         )
 
 
+def _require_provider_proxy_runtime(request: dict[str, Any]) -> None:
+    if request.get("provider_egress_policy") is None:
+        return
+    try:
+        provider_proxy.require_peer_pidfd_support()
+    except SupervisorError as error:
+        raise SandboxLaunchDriverServiceError(
+            "provider egress requires kernel SO_PEERPIDFD support for attempt-scoped peer authorization"
+        ) from error
+
+
 def _validate_runner_credential(credential: str | None) -> None:
     if credential is not None and (
         not isinstance(credential, str)
@@ -1108,6 +1119,7 @@ def start_sandbox_launch_driver(
         provider_egress_policy_name=provider_egress_policy_name,
         provider_egress_destinations=provider_egress_destinations,
     )
+    _require_provider_proxy_runtime(request)
     _reject_runner_credential_in_command(request, credential)
     _validate_runner_credential(credential)
     if _test_worker_canary is not None and (
@@ -1861,6 +1873,7 @@ def _execute_pinned_request(
 ) -> None:
     """Keep all launch, attestation, gate, and runc wait capabilities in this process."""
 
+    _require_provider_proxy_runtime(request)
     attempt_id, claim_token, execution_id = expected_identity
     execution = supervisor._sandbox_execution_get(attempt_id)
     if (
@@ -2426,6 +2439,7 @@ def start_registered_no_model_sandbox_worker(
             "test worker canary must not be included in the worker command"
         )
     validated_command = tuple(preflight_request["command"])
+    _require_provider_proxy_runtime(preflight_request)
 
     rootfs_pin = supervisor.config.oci_rootfs_pin
     runc_pin = supervisor.config.oci_runc_executable

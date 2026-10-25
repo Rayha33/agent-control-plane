@@ -58,6 +58,53 @@ def _get_peer_pidfd(channel: socket.socket) -> int:
     return channel.getsockopt(socket.SOL_SOCKET, _SO_PEERPIDFD)
 
 
+def require_peer_pidfd_support() -> None:
+    """Reject provider-proxy mode unless the host kernel can pin UDS peers."""
+
+    if not sys.platform.startswith("linux") or getattr(socket, "SO_PEERCRED", None) is None:
+        raise SupervisorError(
+            "provider_proxy_peer_pidfd_unsupported",
+            "provider proxy requires Linux SO_PEERCRED and SO_PEERPIDFD support",
+        )
+
+    peer_pidfd: int | None = None
+    try:
+        left, right = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            peer_pidfd = _get_peer_pidfd(left)
+            if type(peer_pidfd) is not int or peer_pidfd < 0:
+                raise SupervisorError(
+                    "provider_proxy_peer_pidfd_unsupported",
+                    "provider proxy kernel peer-pidfd probe returned an invalid descriptor",
+                )
+            if os.get_inheritable(peer_pidfd):
+                raise SupervisorError(
+                    "provider_proxy_peer_pidfd_unsupported",
+                    "provider proxy kernel peer-pidfd descriptor is inheritable",
+                )
+        finally:
+            try:
+                left.close()
+            finally:
+                right.close()
+    except SupervisorError:
+        raise
+    except (AttributeError, OSError, TypeError, ValueError) as error:
+        raise SupervisorError(
+            "provider_proxy_peer_pidfd_unsupported",
+            "provider proxy requires kernel SO_PEERPIDFD support",
+        ) from error
+    finally:
+        if type(peer_pidfd) is int and peer_pidfd >= 0:
+            try:
+                os.close(peer_pidfd)
+            except OSError as error:
+                raise SupervisorError(
+                    "provider_proxy_peer_pidfd_unsupported",
+                    "provider proxy kernel peer-pidfd probe descriptor could not be closed",
+                ) from error
+
+
 def attempt_scoped_peer_authorizer(
     attestation: RunningRuntimeAttestation,
 ) -> _PeerAuthorizer:
@@ -537,7 +584,16 @@ class AttemptProviderProxyService:
         except OSError:
             if not self._stop.is_set():
                 self._fail("attempt proxy request handler failed")
+        except Exception:
+            # The service closes accepted sockets while cancellation unwinds
+            # relay selectors. Exceptions from that concurrent close are
+            # expected once shutdown has begun; `close()` still waits for this
+            # handler and verifies that every channel drained.
+            if not self._stop.is_set():
+                self._fail("attempt proxy request handler failed")
         except BaseException:
+            # Preserve process-control exceptions even when ordinary relay
+            # exceptions are expected during shutdown.
             self._fail("attempt proxy request handler failed")
         finally:
             self._close_channel(channel)

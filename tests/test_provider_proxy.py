@@ -45,6 +45,83 @@ def _require_peer_pidfd(channel: socket.socket) -> None:
         os.close(peer_pidfd)
 
 
+def test_peer_pidfd_runtime_probe_closes_the_kernel_descriptor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(provider_proxy.sys, "platform", "linux")
+    monkeypatch.setattr(provider_proxy.socket, "SO_PEERCRED", 17, raising=False)
+    peer_pidfd, write_fd = os.pipe()
+    real_fstat = os.fstat
+    monkeypatch.setattr(provider_proxy, "_get_peer_pidfd", lambda _channel: peer_pidfd)
+    monkeypatch.setattr(provider_proxy.os, "get_inheritable", lambda _fd: False)
+    try:
+        provider_proxy.require_peer_pidfd_support()
+        with pytest.raises(OSError):
+            real_fstat(peer_pidfd)
+    finally:
+        os.close(write_fd)
+        try:
+            os.close(peer_pidfd)
+        except OSError:
+            pass
+
+
+def test_peer_pidfd_runtime_probe_rejects_unsupported_kernel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(provider_proxy.sys, "platform", "linux")
+    monkeypatch.setattr(provider_proxy.socket, "SO_PEERCRED", 17, raising=False)
+
+    def unsupported(_channel: socket.socket) -> int:
+        raise OSError(92, "Protocol not available")
+
+    monkeypatch.setattr(provider_proxy, "_get_peer_pidfd", unsupported)
+    with pytest.raises(SupervisorError, match="kernel SO_PEERPIDFD support"):
+        provider_proxy.require_peer_pidfd_support()
+
+
+def test_peer_pidfd_runtime_probe_attempts_both_socket_closes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(provider_proxy.sys, "platform", "linux")
+    monkeypatch.setattr(provider_proxy.socket, "SO_PEERCRED", 17, raising=False)
+    peer_pidfd, write_fd = os.pipe()
+
+    class Endpoint:
+        def __init__(self, *, fails_to_close: bool = False) -> None:
+            self.fails_to_close = fails_to_close
+            self.close_calls = 0
+
+        def close(self) -> None:
+            self.close_calls += 1
+            if self.fails_to_close:
+                raise OSError("socket close failed")
+
+    left = Endpoint(fails_to_close=True)
+    right = Endpoint()
+    monkeypatch.setattr(
+        provider_proxy.socket,
+        "socketpair",
+        lambda *_args, **_kwargs: (left, right),
+    )
+    monkeypatch.setattr(provider_proxy, "_get_peer_pidfd", lambda _channel: peer_pidfd)
+    monkeypatch.setattr(provider_proxy.os, "get_inheritable", lambda _fd: False)
+
+    try:
+        with pytest.raises(SupervisorError, match="kernel SO_PEERPIDFD support"):
+            provider_proxy.require_peer_pidfd_support()
+        assert left.close_calls == 1
+        assert right.close_calls == 1
+        with pytest.raises(OSError):
+            os.fstat(peer_pidfd)
+    finally:
+        os.close(write_fd)
+        try:
+            os.close(peer_pidfd)
+        except OSError:
+            pass
+
+
 def _request(authority: str = "api.example.com:443", *, headers: bytes = b"") -> bytes:
     return (
         b"CONNECT "
@@ -394,6 +471,70 @@ def test_attempt_proxy_service_closes_real_relay_tunnel_on_shutdown(
         client.close()
         upstream.close()
         target.close()
+
+
+@pytest.mark.parametrize(
+    ("handler_error", "shutdown_fails"),
+    [(ValueError("relay closed"), False), (SystemExit("stop"), True)],
+    ids=["ordinary-relay-error", "process-control-error"],
+)
+def test_attempt_proxy_handler_exception_after_cancellation_is_classified_safely(
+    private_attempt_directory: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    handler_error: BaseException,
+    shutdown_fails: bool,
+) -> None:
+    listener = provider_proxy.AttemptProviderProxyListener(private_attempt_directory)
+    service = provider_proxy.AttemptProviderProxyService(
+        listener,
+        _policy(),
+        authorize_peer=lambda _channel: True,
+    )
+    handler_started = threading.Event()
+    cancellation_observed = threading.Event()
+
+    def fail_after_cancel(
+        _channel: socket.socket,
+        _policy: ProviderEgressPolicy,
+        *,
+        authorize_peer: object,
+        cancel_event: threading.Event | None,
+    ) -> None:
+        assert callable(authorize_peer)
+        handler_started.set()
+        if cancel_event is not None and cancel_event.wait(2):
+            cancellation_observed.set()
+        raise handler_error
+
+    monkeypatch.setattr(provider_proxy, "serve_connect_connection", fail_after_cancel)
+    channel, peer = socket.socketpair()
+    handler = threading.Thread(target=service._handle_channel, args=(channel,))
+    with service._lock:
+        service._channels.add(channel)
+        service._handler_threads.add(handler)
+    handler.start()
+
+    try:
+        assert handler_started.wait(2)
+        if shutdown_fails:
+            with pytest.raises(SupervisorError, match="request handler failed"):
+                service.close(timeout=2)
+        else:
+            service.close(timeout=2)
+        assert cancellation_observed.is_set()
+        assert (service._failure is not None) is shutdown_fails
+        assert not service._channels
+        assert not service._handler_threads
+    finally:
+        if handler.is_alive():
+            service._stop.set()
+            channel.close()
+            handler.join(timeout=2)
+        try:
+            service.close(timeout=2)
+        except SupervisorError:
+            pass
+        peer.close()
 
 
 def test_attempt_proxy_service_timeout_keeps_shutdown_unverified_until_drained(

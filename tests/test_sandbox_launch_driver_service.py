@@ -5,6 +5,7 @@ import json
 import os
 import socket
 import sqlite3
+import sys
 import tempfile
 import time
 from dataclasses import replace
@@ -153,6 +154,11 @@ def test_registered_no_model_worker_rejects_missing_pins_before_reservation(
 
     monkeypatch.setattr(service.sys, "platform", "linux")
     monkeypatch.setattr(service.os, "geteuid", lambda: 1000)
+    monkeypatch.setattr(
+        service.provider_proxy,
+        "require_peer_pidfd_support",
+        lambda: pytest.fail("no-provider worker must not require SO_PEERPIDFD"),
+    )
     supervisor = SimpleNamespace(
         config=SimpleNamespace(
             oci_rootfs_pin=None,
@@ -171,6 +177,163 @@ def test_registered_no_model_worker_rejects_missing_pins_before_reservation(
             experimental_opt_in=True,
             **_RESOURCES,
         )
+
+
+def test_registered_provider_worker_rejects_unsupported_peer_pidfd_before_reservation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agent_control_plane.supervisor import sandbox_launch_driver_service as service
+
+    monkeypatch.setattr(service.sys, "platform", "linux")
+    monkeypatch.setattr(service.os, "geteuid", lambda: 1000)
+
+    def unsupported() -> None:
+        raise SupervisorError(
+            "provider_proxy_peer_pidfd_unsupported",
+            "provider proxy requires kernel SO_PEERPIDFD support",
+        )
+
+    monkeypatch.setattr(
+        service.provider_proxy,
+        "require_peer_pidfd_support",
+        unsupported,
+    )
+    reservations: list[tuple[object, ...]] = []
+    supervisor = SimpleNamespace(
+        _sandbox_validate_attempt_id=lambda value: value,
+        _sandbox_claim_token=lambda value: value,
+        _sandbox_execution_reserve=lambda *args, **kwargs: reservations.append(args),
+    )
+
+    with pytest.raises(SandboxLaunchDriverServiceError, match="kernel SO_PEERPIDFD"):
+        start_registered_no_model_sandbox_worker(
+            supervisor,
+            attempt_id="attempt-1",
+            claim_token=7,
+            command=("/bin/true",),
+            experimental_opt_in=True,
+            provider_egress_policy_name="local-mock",
+            provider_egress_destinations={"mock.example": [443]},
+            **_RESOURCES,
+        )
+
+    assert reservations == []
+
+
+def test_launch_driver_rejects_unsupported_peer_pidfd_before_service_activation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agent_control_plane.supervisor import sandbox_launch_driver_service as service
+
+    def unsupported() -> None:
+        raise SupervisorError(
+            "provider_proxy_peer_pidfd_unsupported",
+            "provider proxy requires kernel SO_PEERPIDFD support",
+        )
+
+    monkeypatch.setattr(
+        service.provider_proxy,
+        "require_peer_pidfd_support",
+        unsupported,
+    )
+    supervisor = SimpleNamespace(
+        _sandbox_execution_get=lambda _attempt_id: pytest.fail(
+            "unsupported provider mode must fail before activation lookup"
+        )
+    )
+
+    with pytest.raises(SandboxLaunchDriverServiceError, match="kernel SO_PEERPIDFD"):
+        start_sandbox_launch_driver(
+            supervisor,
+            expected_identity=_IDENTITY,
+            command=("/bin/true",),
+            provider_egress_policy_name="local-mock",
+            provider_egress_destinations={"mock.example": [443]},
+            timeout_seconds=30,
+            **_RESOURCES,
+        )
+
+
+def test_redeemed_provider_request_rechecks_peer_pidfd_before_execution_lookup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agent_control_plane.supervisor import sandbox_launch_driver_service as service
+
+    def unsupported() -> None:
+        raise SupervisorError(
+            "provider_proxy_peer_pidfd_unsupported",
+            "provider proxy requires kernel SO_PEERPIDFD support",
+        )
+
+    monkeypatch.setattr(
+        service.provider_proxy,
+        "require_peer_pidfd_support",
+        unsupported,
+    )
+    supervisor = SimpleNamespace(
+        _sandbox_execution_get=lambda _attempt_id: pytest.fail(
+            "persisted provider request must fail before execution/worker lookup"
+        )
+    )
+    request = _validate_request(
+        expected_identity=_IDENTITY,
+        command=("/bin/true",),
+        timeout_seconds=30,
+        provider_egress_policy_name="local-mock",
+        provider_egress_destinations={"mock.example": [443]},
+        **_RESOURCES,
+    )
+
+    with pytest.raises(SandboxLaunchDriverServiceError, match="kernel SO_PEERPIDFD"):
+        service._execute_pinned_request(
+            supervisor,
+            _IDENTITY,
+            request,
+            credential=None,
+        )
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="requires a Linux kernel probe")
+def test_registered_provider_worker_applies_actual_kernel_gate_before_reservation() -> None:
+    from agent_control_plane.supervisor import sandbox_launch_driver_service as service
+
+    if os.geteuid() == 0:
+        pytest.skip("registered no-model composition refuses a root caller")
+    try:
+        service.provider_proxy.require_peer_pidfd_support()
+    except SupervisorError as error:
+        assert error.code == "provider_proxy_peer_pidfd_unsupported"
+        expected_error = "SO_PEERPIDFD"
+    else:
+        expected_error = "pinned rootfs and runc 1.5.2"
+
+    reservations: list[tuple[object, ...]] = []
+    supervisor = SimpleNamespace(
+        config=SimpleNamespace(
+            oci_rootfs_pin=None,
+            oci_runc_executable=None,
+            oci_runc_version=None,
+        ),
+        _sandbox_validate_attempt_id=lambda value: value,
+        _sandbox_claim_token=lambda value: value,
+        _sandbox_execution_reserve=lambda *args, **kwargs: reservations.append(args),
+    )
+    try:
+        start_registered_no_model_sandbox_worker(
+            supervisor,
+            attempt_id="attempt-1",
+            claim_token=7,
+            command=("/bin/true",),
+            experimental_opt_in=True,
+            provider_egress_policy_name="local-mock",
+            provider_egress_destinations={"mock.example": [443]},
+            **_RESOURCES,
+        )
+    except SandboxLaunchDriverServiceError as error:
+        assert expected_error in str(error)
+    else:
+        pytest.fail("registered no-model composition unexpectedly reached worker launch")
+    assert reservations == []
 
 
 def test_post_reservation_preparation_failure_retains_partial_private_tree(
@@ -597,6 +760,10 @@ def test_pinned_request_leaves_provider_directory_for_independent_cleanup(
     scenario: str,
 ) -> None:
     from agent_control_plane.supervisor import sandbox_launch_driver_service as service
+
+    # This parametrized test exercises provider-proxy lifecycle behavior with
+    # local listener fixtures, not the host kernel's SO_PEERPIDFD capability.
+    monkeypatch.setattr(service.provider_proxy, "require_peer_pidfd_support", lambda: None)
 
     events: list[str] = []
     state_root = tmp_path / "state"
