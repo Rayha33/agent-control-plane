@@ -695,7 +695,7 @@ def _scope_status(binding: SandboxMonitorScopeBinding) -> dict[str, Any]:
 def _cancel_scope(binding: SandboxMonitorScopeBinding) -> dict[str, Any]:
     initial = _scope_status(binding)
     if initial["phase"] == "exited":
-        return initial
+        return {**initial, "cancel_method": "not_required"}
     if initial["phase"] not in {"running", "stopping"}:
         raise SandboxMonitorServiceError("monitor refuses to cancel an unverified scope")
     if initial["phase"] == "running":
@@ -724,7 +724,7 @@ def _cancel_scope(binding: SandboxMonitorScopeBinding) -> dict[str, Any]:
 
     current = wait_for_exit(_SCOPE_CANCEL_GRACE_SECONDS)
     if current["phase"] == "exited":
-        return current
+        return {**current, "cancel_method": "graceful"}
     if current["phase"] == "unknown":
         raise SandboxMonitorServiceError("scope identity changed during cancellation")
     if current["phase"] not in {"running", "stopping"}:
@@ -747,9 +747,9 @@ def _cancel_scope(binding: SandboxMonitorScopeBinding) -> dict[str, Any]:
         environment=_trusted_systemd_command_environment(),
     )
     current = wait_for_exit(_SCOPE_CANCEL_FORCE_WAIT_SECONDS)
-    if current["phase"] not in {"stopping", "exited"}:
-        raise SandboxMonitorServiceError("scope did not stop after exact-scope force kill")
-    return current
+    if current["phase"] != "exited":
+        raise SandboxMonitorServiceError("scope did not exit after exact-scope force kill")
+    return {**current, "cancel_method": "sigkill"}
 
 
 def _write_service_receipt(
@@ -1012,6 +1012,7 @@ def start_sandbox_execution_monitor(
         socket_path=socket_path,
         key=key,
         expected_uid=os.geteuid(),
+        control_directory=control_directory,
         timeout_seconds=min(
             30.0,
             max(SANDBOX_MONITOR_OPERATION_TIMEOUT_SECONDS, float(timeout_seconds)),

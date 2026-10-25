@@ -35,6 +35,8 @@ from .sandbox_execution_journal import (
 _MAX_WORKER_LOG_BYTES = 8 * 1024 * 1024
 _WORKER_LOG_TRUNCATION_MARKER = b"\n[ACP worker output truncated at 8 MiB]\n"
 _WORKER_OUTPUT_CHUNK_BYTES = 64 * 1024
+_MONITOR_STATUS_SETTLE_TIMEOUT_SECONDS = 1.0
+_MONITOR_STATUS_SETTLE_POLL_SECONDS = 0.05
 
 
 def _read_worker_output_chunk(
@@ -173,18 +175,34 @@ class WorkersMixin:
                         "cached monitor client is not bound to this process and execution",
                     )
                 client = monitor_client
-            status = client.status()
-            if status.outcome != "ok":
-                raise SupervisorError(
-                    "sandbox_execution_monitor_ambiguous",
-                    "monitor status is ambiguous; execution and resource fences remain held",
-                )
-            if any(status.payload.get(key) != value for key, value in expected_scope.items()):
-                raise SupervisorError(
-                    "sandbox_execution_monitor_identity_mismatch",
-                    "monitor status does not match the journaled scope; execution and resource fences remain held",
-                )
-            phase = status.payload.get("phase")
+            status_deadline = time.monotonic() + _MONITOR_STATUS_SETTLE_TIMEOUT_SECONDS
+            while True:
+                status = client.status()
+                if status.outcome == "ok":
+                    if any(
+                        status.payload.get(key) != value for key, value in expected_scope.items()
+                    ):
+                        raise SupervisorError(
+                            "sandbox_execution_monitor_identity_mismatch",
+                            "monitor status does not match the journaled scope; execution and resource fences remain held",
+                        )
+                    phase = status.payload.get("phase")
+                    if phase != "unknown":
+                        break
+                elif status.outcome != "unknown":
+                    raise SupervisorError(
+                        "sandbox_execution_monitor_ambiguous",
+                        "monitor status is ambiguous; execution and resource fences remain held",
+                    )
+
+                remaining = status_deadline - time.monotonic()
+                if remaining <= 0:
+                    raise SupervisorError(
+                        "sandbox_execution_monitor_ambiguous",
+                        "monitor status is ambiguous; execution and resource fences remain held",
+                    )
+                time.sleep(min(_MONITOR_STATUS_SETTLE_POLL_SECONDS, remaining))
+
             if phase not in {
                 "reserved",
                 "launched",

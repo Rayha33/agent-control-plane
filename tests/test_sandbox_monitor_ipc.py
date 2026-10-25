@@ -76,6 +76,14 @@ def _request(receipt: SandboxMonitorReceipt, operation: str, request_id: str) ->
     )
 
 
+def _scope_identity() -> dict[str, str]:
+    return {
+        "scope_unit": "acp-test.scope",
+        "scope_invocation_id": "b" * 32,
+        "scope_control_group": "/user.slice/acp-test.scope",
+    }
+
+
 def _server(
     tmp_path: Path,
     *,
@@ -95,7 +103,8 @@ def _server(
         expected_identity=(receipt.attempt_id, receipt.claim_token, receipt.execution_id),
         expected_uid=os.geteuid(),
         status_provider=status_provider or (lambda: {"phase": "running", "worker_pid": 500}),
-        cancel_action=cancel_action or (lambda: {"phase": "stopping", "worker_pid": 500}),
+        cancel_action=cancel_action
+        or (lambda: {"phase": "exited", "worker_pid": 500, "cancel_method": "graceful"}),
         request_limit=request_limit,
     )
     return server, receipt, private / "monitor.sock", private
@@ -134,9 +143,14 @@ def test_monitor_client_authenticates_systemd_owned_server_and_round_trips_statu
 
     def cancel() -> dict[str, object]:
         calls["cancel"] += 1
-        return {"phase": "stopping", "worker_pid": 500}
+        return {
+            "phase": "exited",
+            "worker_pid": 500,
+            "cancel_method": "graceful",
+            **_scope_identity(),
+        }
 
-    server, receipt, socket_path, _private = _server(
+    server, receipt, socket_path, private = _server(
         tmp_path, status_provider=status, cancel_action=cancel
     )
     thread = _serve(server)
@@ -146,6 +160,7 @@ def test_monitor_client_authenticates_systemd_owned_server_and_round_trips_statu
             socket_path=socket_path,
             key=_KEY,
             expected_uid=os.geteuid(),
+            control_directory=private,
         )
         status_response = client.status()
         with pytest.raises(SandboxMonitorIPCError, match="caller-held"):
@@ -157,7 +172,39 @@ def test_monitor_client_authenticates_systemd_owned_server_and_round_trips_statu
         assert status_response.payload == {"phase": "running", "worker_pid": 500}
         assert cancel_response.operation == "cancel"
         assert cancel_response.outcome == "ok"
-        assert cancel_response.payload == {"phase": "stopping", "worker_pid": 500}
+        assert cancel_response.payload == {
+            "phase": "exited",
+            "worker_pid": 500,
+            **_scope_identity(),
+        }
+        assert cancel_response.cancel_attestation is not None
+        assert cancel_response.cancel_attestation.request_id == "a" * 32
+        assert (
+            cancel_response.cancel_attestation.request_sha256
+            == hashlib.sha256(_request(receipt, "cancel", "a" * 32)).hexdigest()
+        )
+        assert cancel_response.cancel_attestation.method == "graceful"
+        assert cancel_response.cancel_attestation.phase == "exited"
+        assert cancel_response.cancel_attestation.scope_identity == _scope_identity()
+        attestation_path = private / f"r-{'a' * 32}.cancel-attestation"
+        attestation_record = json.loads(attestation_path.read_text(encoding="ascii"))
+        assert set(attestation_record) == {
+            "format",
+            "request_id",
+            "request_sha256",
+            "identity",
+            "outcome",
+            "phase",
+            "method",
+            "scope_identity",
+            "mac",
+        }
+        assert attestation_record["identity"] == {
+            "attempt_id": receipt.attempt_id,
+            "claim_token": receipt.claim_token,
+            "execution_id": receipt.execution_id,
+        }
+        assert attestation_path.stat().st_mode & 0o777 == 0o600
         assert retried_cancel_response == cancel_response
         assert calls == {"status": 1, "cancel": 1}
     finally:
@@ -178,7 +225,7 @@ def test_monitor_control_client_cannot_be_reused_from_a_forked_process(
 
     def cancel() -> dict[str, object]:
         calls["cancel"] += 1
-        return {"phase": "stopping", "worker_pid": 500}
+        return {"phase": "exited", "worker_pid": 500, "cancel_method": "graceful"}
 
     server, receipt, socket_path, _private = _server(
         tmp_path, status_provider=status, cancel_action=cancel
@@ -284,7 +331,7 @@ def test_cancel_request_id_replay_returns_durable_response_without_repeating_act
     def cancel() -> dict[str, str]:
         nonlocal calls
         calls += 1
-        return {"phase": "stopping"}
+        return {"phase": "exited", "cancel_method": "sigkill"}
 
     server, receipt, _socket_path, private = _server(tmp_path, cancel_action=cancel)
     try:
@@ -308,7 +355,7 @@ def test_read_only_request_does_not_change_a_cancel_replay_record(tmp_path: Path
     def cancel() -> dict[str, str]:
         nonlocal calls
         calls += 1
-        return {"phase": "stopping"}
+        return {"phase": "exited", "cancel_method": "graceful"}
 
     server, receipt, _socket_path, _private = _server(tmp_path, cancel_action=cancel)
     try:
@@ -329,7 +376,7 @@ def test_accepted_without_response_is_reported_unknown_without_reapplying(tmp_pa
     def cancel() -> dict[str, str]:
         nonlocal calls
         calls += 1
-        return {"phase": "stopping"}
+        return {"phase": "exited", "cancel_method": "graceful"}
 
     server, receipt, _socket_path, _private = _server(tmp_path, cancel_action=cancel)
     try:
@@ -360,7 +407,7 @@ def test_peer_uid_and_fencing_identity_are_checked_before_side_effects(tmp_path:
     def cancel() -> dict[str, str]:
         nonlocal calls
         calls += 1
-        return {"phase": "stopping"}
+        return {"phase": "exited", "cancel_method": "graceful"}
 
     server, receipt, _socket_path, _private = _server(tmp_path, cancel_action=cancel)
     try:
@@ -414,7 +461,7 @@ def test_monitor_refuses_existing_socket_path_instead_of_unlinking_it(tmp_path: 
             expected_identity=(receipt.attempt_id, receipt.claim_token, receipt.execution_id),
             expected_uid=os.geteuid(),
             status_provider=lambda: {"phase": "running"},
-            cancel_action=lambda: {"phase": "stopping"},
+            cancel_action=lambda: {"phase": "exited", "cancel_method": "graceful"},
         )
     assert socket_path.read_text(encoding="ascii") == "do not remove"
 
@@ -422,7 +469,7 @@ def test_monitor_refuses_existing_socket_path_instead_of_unlinking_it(tmp_path: 
 def test_monitor_status_payload_rejects_secret_or_arbitrary_fields(tmp_path: Path) -> None:
     server, receipt, _socket_path, _private = _server(
         tmp_path,
-        status_provider=lambda: {"phase": "running", "api_key": "must-not-leak"},
+        status_provider=lambda: {"phase": "running", "cancel_method": "sigkill"},
     )
     try:
         response = server._dispatch(os.geteuid(), _request(receipt, "status", "1" * 32))
@@ -436,7 +483,7 @@ def test_cancel_response_is_unknown_unless_monitor_reports_stopping_or_exited(
     tmp_path: Path,
 ) -> None:
     server, receipt, _socket_path, _private = _server(
-        tmp_path, cancel_action=lambda: {"phase": "running"}
+        tmp_path, cancel_action=lambda: {"phase": "running", "cancel_method": "graceful"}
     )
     try:
         response = server._dispatch(os.geteuid(), _request(receipt, "cancel", "2" * 32))
@@ -445,6 +492,139 @@ def test_cancel_response_is_unknown_unless_monitor_reports_stopping_or_exited(
         assert decoded["payload"] == {"phase": "unknown"}
     finally:
         server.close()
+
+
+def test_cancel_response_is_unknown_for_an_unrecognized_local_method(tmp_path: Path) -> None:
+    server, receipt, _socket_path, _private = _server(
+        tmp_path,
+        cancel_action=lambda: {"phase": "exited", "cancel_method": "not-a-monitor-method"},
+    )
+    try:
+        response = server._dispatch(os.geteuid(), _request(receipt, "cancel", "4" * 32))
+        decoded = json.loads(response)
+        assert decoded["outcome"] == "unknown"
+        assert decoded["payload"] == {"phase": "unknown"}
+    finally:
+        server.close()
+
+
+def test_successful_cancel_response_requires_a_recognized_method(tmp_path: Path) -> None:
+    server, receipt, _socket_path, _private = _server(
+        tmp_path, cancel_action=lambda: {"phase": "exited"}
+    )
+    try:
+        response = server._dispatch(os.geteuid(), _request(receipt, "cancel", "3" * 32))
+        decoded = json.loads(response)
+        assert decoded["outcome"] == "unknown"
+        assert decoded["payload"] == {"phase": "unknown"}
+    finally:
+        server.close()
+
+
+def test_cancel_v1_response_stays_compatible_when_attestation_is_unavailable(
+    tmp_path: Path,
+) -> None:
+    server, receipt, socket_path, private = _server(
+        tmp_path,
+        cancel_action=lambda: {"phase": "exited", "cancel_method": "graceful"},
+    )
+    thread = _serve(server)
+    try:
+        client = SandboxMonitorControlClient(
+            receipt=receipt,
+            socket_path=socket_path,
+            key=_KEY,
+            expected_uid=os.geteuid(),
+            control_directory=private,
+        )
+        response = client.cancel("5" * 32)
+        assert response.outcome == "ok"
+        assert response.payload == {"phase": "exited"}
+        assert response.cancel_attestation is None
+        stored, _decoded = server._load_response("5" * 32, "cancel") or (b"", None)
+        wire = json.loads(stored)
+        assert wire["version"] == 1
+        assert set(wire) == {"version", "request_id", "operation", "outcome", "payload", "mac"}
+        assert wire["payload"] == {"phase": "exited"}
+        assert "cancel_method" not in wire["payload"]
+    finally:
+        _stop(server, thread)
+
+
+def test_cancel_attestation_write_failure_does_not_fail_cancellation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original_create = ipc_module._create_private_record
+
+    def fail_attestation_write(directory_fd: int, name: str, data: bytes) -> None:
+        if name.endswith(".cancel-attestation"):
+            raise OSError("synthetic sidecar write failure")
+        original_create(directory_fd, name, data)
+
+    monkeypatch.setattr(ipc_module, "_create_private_record", fail_attestation_write)
+    server, receipt, socket_path, private = _server(
+        tmp_path,
+        cancel_action=lambda: {
+            "phase": "exited",
+            "cancel_method": "sigkill",
+            **_scope_identity(),
+        },
+    )
+    thread = _serve(server)
+    try:
+        client = SandboxMonitorControlClient(
+            receipt=receipt,
+            socket_path=socket_path,
+            key=_KEY,
+            expected_uid=os.geteuid(),
+            control_directory=private,
+        )
+
+        response = client.cancel("7" * 32)
+
+        assert response.outcome == "ok"
+        assert response.payload["phase"] == "exited"
+        assert response.cancel_attestation is None
+        assert server._load_response("7" * 32, "cancel") is not None
+    finally:
+        _stop(server, thread)
+
+
+def test_corrupt_cancel_attestation_only_removes_method_evidence(tmp_path: Path) -> None:
+    calls = 0
+
+    def cancel() -> dict[str, str]:
+        nonlocal calls
+        calls += 1
+        return {"phase": "exited", "cancel_method": "sigkill", **_scope_identity()}
+
+    server, receipt, socket_path, private = _server(tmp_path, cancel_action=cancel)
+    thread = _serve(server)
+    request_id = "6" * 32
+    try:
+        client = SandboxMonitorControlClient(
+            receipt=receipt,
+            socket_path=socket_path,
+            key=_KEY,
+            expected_uid=os.geteuid(),
+            control_directory=private,
+        )
+        first = client.cancel(request_id)
+        assert first.outcome == "ok"
+        assert first.cancel_attestation is not None
+        attestation_path = private / ipc_module._cancel_attestation_record_name(request_id)
+        attestation = json.loads(attestation_path.read_text(encoding="ascii"))
+        attestation["method"] = "graceful"
+        attestation_path.write_bytes(ipc_module._canonical_json(attestation))
+
+        replay = client.cancel(request_id)
+
+        assert replay.outcome == "ok"
+        assert replay.payload["phase"] == "exited"
+        assert replay.cancel_attestation is None
+        assert calls == 1
+    finally:
+        _stop(server, thread)
 
 
 def test_read_only_status_polling_does_not_consume_cancel_replay_limit(tmp_path: Path) -> None:

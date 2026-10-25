@@ -314,6 +314,7 @@ def reconnect_sandbox_monitor(
             socket_path=control_socket,
             key=key,
             expected_uid=os.geteuid(),
+            control_directory=directory,
             timeout_seconds=timeout_seconds,
         )
     except (SandboxMonitorReceiptError, SandboxMonitorIPCError) as error:

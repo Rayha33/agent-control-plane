@@ -473,6 +473,7 @@ def test_cancel_stops_only_the_bound_scope_and_verifies_inactive_empty_state(
     response = monitor_service._cancel_scope(binding)
 
     assert response["phase"] == "exited"
+    assert response["cancel_method"] == "graceful"
     assert len(calls) == 1
     assert calls[0][-3:] == ["stop", "--", binding.scope_unit]
     assert "--no-block" in calls[0]
@@ -483,12 +484,13 @@ def test_cancel_escalates_an_already_stopping_exact_scope_only_after_grace(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     binding = _binding()
+    phases = iter(("stopping", "stopping", "exited"))
     calls: list[list[str]] = []
     monkeypatch.setattr(
         monitor_service,
         "_scope_status",
         lambda current: {
-            "phase": "stopping",
+            "phase": next(phases),
             "scope_unit": current.scope_unit,
             "scope_invocation_id": current.scope_invocation_id,
             "scope_control_group": current.scope_control_group,
@@ -512,7 +514,8 @@ def test_cancel_escalates_an_already_stopping_exact_scope_only_after_grace(
 
     response = monitor_service._cancel_scope(binding)
 
-    assert response["phase"] == "stopping"
+    assert response["phase"] == "exited"
+    assert response["cancel_method"] == "sigkill"
     assert len(calls) == 1
     assert calls[0] == [
         "/usr/bin/systemctl",
@@ -560,6 +563,7 @@ def test_cancel_force_kills_only_the_exact_scope_after_graceful_timeout(
     response = monitor_service._cancel_scope(binding)
 
     assert response["phase"] == "exited"
+    assert response["cancel_method"] == "sigkill"
     assert calls == [
         [
             "/usr/bin/systemctl",
@@ -579,6 +583,76 @@ def test_cancel_force_kills_only_the_exact_scope_after_graceful_timeout(
             binding.scope_unit,
         ],
     ]
+
+
+def test_cancel_reports_already_exited_without_issuing_a_signal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    binding = _binding()
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        monitor_service,
+        "_scope_status",
+        lambda current: {
+            "phase": "exited",
+            "scope_unit": current.scope_unit,
+            "scope_invocation_id": current.scope_invocation_id,
+            "scope_control_group": current.scope_control_group,
+        },
+    )
+    monkeypatch.setattr(
+        monitor_service,
+        "_run_trusted_runtime_command",
+        lambda argv, **_kwargs: calls.append(argv) or b"",
+    )
+
+    response = monitor_service._cancel_scope(binding)
+
+    assert response["phase"] == "exited"
+    assert response["cancel_method"] == "not_required"
+    assert calls == []
+
+
+def test_cancel_force_kill_fails_closed_if_exact_scope_does_not_exit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    binding = _binding()
+    phases = iter(("running", "stopping", "stopping"))
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        monitor_service,
+        "_scope_status",
+        lambda current: {
+            "phase": next(phases),
+            "scope_unit": current.scope_unit,
+            "scope_invocation_id": current.scope_invocation_id,
+            "scope_control_group": current.scope_control_group,
+        },
+    )
+    monkeypatch.setattr(
+        monitor_service,
+        "_run_trusted_runtime_command",
+        lambda argv, **_kwargs: calls.append(argv) or b"",
+    )
+    monkeypatch.setattr(
+        monitor_service, "_trusted_systemctl_executable", lambda: Path("/usr/bin/systemctl")
+    )
+    monkeypatch.setattr(
+        monitor_service,
+        "_trusted_systemd_command_environment",
+        lambda: {"XDG_RUNTIME_DIR": "/run/user/1000"},
+    )
+    monkeypatch.setattr(monitor_service, "_SCOPE_CANCEL_GRACE_SECONDS", 0.0)
+    monkeypatch.setattr(monitor_service, "_SCOPE_CANCEL_FORCE_WAIT_SECONDS", 0.0)
+
+    with pytest.raises(
+        monitor_service.SandboxMonitorServiceError,
+        match="did not exit after exact-scope force kill",
+    ):
+        monitor_service._cancel_scope(binding)
+
+    assert len(calls) == 2
+    assert calls[1][-3:] == ["--kill-whom=all", "--", binding.scope_unit]
 
 
 def test_cancel_does_not_escalate_after_scope_identity_becomes_unknown(

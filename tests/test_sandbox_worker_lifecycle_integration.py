@@ -121,6 +121,20 @@ For the fresh-supervisor cancellation branch, add:
 
     ACP_LIVE_CANCEL_AFTER_START=1
 
+To force that branch through the monitor's exact-scope SIGKILL escalation,
+also set ``ACP_LIVE_FORCE_CANCEL_AFTER_START=1``. This strict submode uses a
+TERM-ignoring BusyBox payload, disables provider/model features, requires the
+fresh-supervisor response to report ``exited``, then reconnects to the same
+authenticated monitor and replays the identity-bound cancel ID. The replayed
+v1 response is checked alongside its verified monitor cancellation attestation
+sidecar, including method, exact scope identity, and attempt/claim/execution
+fences. Those facts and the independently verified cleanup phase are written
+as a credential-free receipt under the host test run directory and printed as
+``ACP_LIVE_FORCE_CANCEL_RECEIPT=...``.
+The enrolled harness credential is used only for control-plane authorization;
+no provider credential or provider request is used. Run with ``pytest -s`` to
+retain the receipt in the test log.
+
 For the launch-driver timeout branch, add:
 
     ACP_LIVE_TIMEOUT_AFTER_START=1
@@ -3864,6 +3878,7 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
     isolation_probes = os.environ.get("ACP_LIVE_ISOLATION_PROBES") == "1"
     import_result_after_cleanup = os.environ.get("ACP_LIVE_IMPORT_RESULT_AFTER_CLEANUP") == "1"
     supervised_run_worker = os.environ.get("ACP_LIVE_SUPERVISED_RUN_WORKER") == "1"
+    force_cancel_after_start = os.environ.get("ACP_LIVE_FORCE_CANCEL_AFTER_START") == "1"
     provider_proxy_uds = os.environ.get("ACP_LIVE_PROVIDER_PROXY_UDS") == "1"
     provider_proxy_cancel = os.environ.get("ACP_LIVE_PROVIDER_PROXY_CANCEL") == "1"
     provider_tls_redirect = os.environ.get("ACP_LIVE_PROVIDER_TLS_REDIRECT") == "1"
@@ -4785,6 +4800,7 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
         post_wait_execution_before_recovery: dict[str, Any] | None = None
         post_wait_pre_recovery_evidence: dict[str, Any] | None = None
         post_wait_recovery_result: tuple[Any, ...] | None = None
+        force_cancel_monitor_receipt: dict[str, Any] | None = None
 
         cancel_after_start = os.environ.get("ACP_LIVE_CANCEL_AFTER_START") == "1"
         timeout_after_start = os.environ.get("ACP_LIVE_TIMEOUT_AFTER_START") == "1"
@@ -4825,6 +4841,25 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
         ):
             pytest.fail(
                 "live cancel, timeout, lease-expiry, and crash-injection modes are mutually exclusive"
+            )
+        if force_cancel_after_start and (
+            not cancel_after_start
+            or supervised_run_worker
+            or provider_proxy_uds
+            or provider_proxy_cancel
+            or provider_tls_redirect
+            or worker_canary_fd4
+            or isolation_probes
+            or cross_attempt_probes
+            or import_result_after_cleanup
+            or lease_expiry_after_stop
+            or timeout_after_start
+            or concurrent_live_child
+            or coding_task
+        ):
+            pytest.fail(
+                "forced SIGKILL attestation requires only fresh-supervisor cancellation and "
+                "the no-provider, no-model, non-probe fixture"
             )
         if user_manager_reexec_after_driver_crash and not (
             crash_after_monitor_acceptance or crash_before_monitor_start
@@ -4907,7 +4942,9 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
             pytest.fail("provider UDS cancellation requires ACP_LIVE_PROVIDER_PROXY_CANCEL=1")
         monitor_acceptance_marker = run_root / "monitor-handoff-crash.json"
         payload_sleep_seconds = (
-            120
+            180
+            if force_cancel_after_start
+            else 120
             if concurrent_live_child
             else 30
             if cancel_after_start or timeout_after_start or lease_expiry_after_stop
@@ -4916,6 +4953,8 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
         sandbox_timeout_seconds = (
             150
             if concurrent_live_child or provider_tls_redirect
+            else 60
+            if force_cancel_after_start
             else 1
             if timeout_after_start
             else 30
@@ -4927,6 +4966,16 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
                 "/bin/busybox",
                 "sh",
                 f"/workspace/{_CROSS_ATTEMPT_PROBE_SCRIPT_NAME}",
+            )
+        elif force_cancel_after_start:
+            payload_command = (
+                "/bin/busybox",
+                "sh",
+                "-c",
+                "set -eu; "
+                "printf 'production-driver-started\\n' > /workspace/launch-driver-started; "
+                "trap '' TERM; "
+                "exec /bin/busybox sleep 180",
             )
         elif provider_proxy_uds and crash_after_exit_before_cleanup_report:
             payload_command = (
@@ -6540,7 +6589,65 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
                 assert termination["execution_id"] == execution["execution_id"]
                 assert termination["stop_requested"] is True
                 assert termination["cleanup_verified"] is False
-                assert termination["monitor_phase"] in {"stopping", "exited"}
+                if force_cancel_after_start:
+                    assert termination["monitor_phase"] == "exited"
+                    assert identity is not None and execution is not None
+                    control_directory, monitor_receipt_path, monitor_socket_path = (
+                        sandbox_monitor_lifecycle.sandbox_monitor_control_paths(
+                            state_path=execution["state_path"],
+                            expected_identity=identity,
+                        )
+                    )
+                    monitor_client = sandbox_monitor_lifecycle.reconnect_sandbox_monitor(
+                        control_directory=control_directory,
+                        receipt_path=monitor_receipt_path,
+                        socket_path=monitor_socket_path,
+                        expected_identity=identity,
+                    )
+                    cancel_request_id = sandbox_monitor_lifecycle.sandbox_monitor_cancel_request_id(
+                        identity
+                    )
+                    replayed_response = monitor_client.cancel(cancel_request_id)
+                    expected_scope_identity = {
+                        "scope_unit": durable["scope_unit"],
+                        "scope_invocation_id": durable["scope_invocation_id"],
+                        "scope_control_group": durable["cgroup_path"],
+                    }
+                    assert replayed_response.outcome == "ok"
+                    assert replayed_response.payload["phase"] == "exited"
+                    assert {
+                        key: replayed_response.payload[key] for key in expected_scope_identity
+                    } == expected_scope_identity
+                    cancel_attestation = replayed_response.cancel_attestation
+                    assert cancel_attestation is not None
+                    assert cancel_attestation.request_id == cancel_request_id
+                    assert cancel_attestation.attempt_id == attempt["id"]
+                    assert cancel_attestation.claim_token == attempt["claim_token"]
+                    assert cancel_attestation.execution_id == execution["execution_id"]
+                    assert cancel_attestation.method == "sigkill"
+                    assert cancel_attestation.phase == replayed_response.payload["phase"]
+                    assert cancel_attestation.scope_identity == expected_scope_identity
+                    assert not provider_proxy_uds and not provider_tls_redirect
+                    force_cancel_monitor_receipt = {
+                        "attempt_id": attempt["id"],
+                        "claim_token_fence": attempt["claim_token"],
+                        "execution_id": execution["execution_id"],
+                        "cancel_request_id": cancel_request_id,
+                        "cancel_request_sha256": cancel_attestation.request_sha256,
+                        "monitor_outcome": replayed_response.outcome,
+                        "monitor_phase": replayed_response.payload["phase"],
+                        "monitor_cancel_method": cancel_attestation.method,
+                        "scope_identity": expected_scope_identity,
+                        "evidence_source": (
+                            "authenticated_v1_monitor_response_replay"
+                            "+verified_monitor_attestation_sidecar"
+                        ),
+                        "worker_output_used_as_evidence": False,
+                        "provider_proxy_enabled": False,
+                        "provider_request_made": False,
+                    }
+                else:
+                    assert termination["monitor_phase"] in {"stopping", "exited"}
             else:
                 stopped = supervisor._sandbox_execution_request_stop(
                     attempt["id"],
@@ -6599,6 +6706,18 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
         assert runner["credential"] not in service_log
         expected_cleanup_phase = "cleanup_verified" if supervised_run_worker else "cleanup_reported"
         assert durable is not None and durable["phase"] == expected_cleanup_phase, service_log
+        if provider_proxy_uds and durable["phase"] == "cleanup_reported":
+            assert provider_proxy_directory is not None
+            provider_artifact = durable["provider_proxy_artifact"]
+            assert provider_artifact["directory"]["path"] == str(provider_proxy_directory)
+            provider_directory_info = provider_proxy_directory.lstat()
+            assert (provider_directory_info.st_dev, provider_directory_info.st_ino) == (
+                provider_artifact["directory"]["device"],
+                provider_artifact["directory"]["inode"],
+            ), "cleanup_reported provider directory no longer matches its durable inode fence"
+            assert list(provider_proxy_directory.iterdir()) == [], (
+                "provider directory must be empty, but remain fenced until independent cleanup verification"
+            )
         expected_worker_credential_transport = "test_canary_fd4" if worker_canary_fd4 else "none"
         assert (
             durable["launch_plan"]["launch"]["worker_credential_transport"]
@@ -6621,6 +6740,15 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
                 attempt_id=attempt["id"],
                 execution_id=execution["execution_id"],
             )
+        durable = supervisor._sandbox_execution_get(attempt["id"])
+        assert durable is not None
+        if durable["phase"] == "cleanup_reported":
+            durable = supervisor._sandbox_execution_verify_cleanup(
+                attempt["id"],
+                attempt["claim_token"],
+                credential=runner["credential"],
+            )
+        assert durable["phase"] == "cleanup_verified"
         if isolation_probes and durable["runc_exit_code"] != 0:
             probe_marker = Path(durable["workspace_root_path"]) / "launch-driver-started"
             probe_detail = (
@@ -6718,21 +6846,9 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
                 assert family_probe["AF_INET"].startswith("denied:")
                 assert family_probe["AF_INET6"].startswith("denied:")
                 assert provider_tls_hook_evidence["public_pin_was_mapped_only_to_test_uds"] is True
-            if expected_cleanup_phase == "cleanup_reported":
-                provider_artifact = durable["provider_proxy_artifact"]
-                assert provider_artifact["directory"]["path"] == str(provider_proxy_directory)
-                provider_directory_info = provider_proxy_directory.lstat()
-                assert (provider_directory_info.st_dev, provider_directory_info.st_ino) == (
-                    provider_artifact["directory"]["device"],
-                    provider_artifact["directory"]["inode"],
-                ), "cleanup_reported provider directory no longer matches its durable inode fence"
-                assert list(provider_proxy_directory.iterdir()) == [], (
-                    "provider directory must be empty, but remain fenced until independent cleanup verification"
-                )
-            else:
-                assert not os.path.lexists(provider_proxy_directory), (
-                    "verified provider proxy directory remained after production cleanup"
-                )
+            assert not os.path.lexists(provider_proxy_directory), (
+                "verified provider proxy directory remained after production cleanup"
+            )
         if not cancel_after_start and not timeout_after_start and not lease_expiry_after_stop:
             assert durable["runc_exit_code"] == 0
         else:
@@ -6839,7 +6955,7 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
             if service_log_path.exists():
                 assert test_worker_canary not in service_log_path.read_bytes()
         assert not (Path(execution["state_path"]) / "launch-driver-request.json").exists()
-        assert durable["phase"] == expected_cleanup_phase
+        assert durable["phase"] == "cleanup_verified"
         assert durable["cleanup_receipt"]["version"] == 3
         assert durable["cleanup_receipt"]["verification_status"] == "unverified"
         action = durable["cleanup_receipt"]["action"]
@@ -7358,7 +7474,38 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
                 "synthetic host process sentinel exited before the worker probe completed; "
                 f"pid={host_process_sentinel.pid}"
             )
+        if force_cancel_after_start:
+            assert force_cancel_monitor_receipt is not None
+            assert verified["phase"] == "cleanup_verified"
+            force_cancel_receipt_path = run_root / "forced-cancel-attestation.json"
+            worker_workspace = Path(verified["workspace_root_path"]).resolve(strict=False)
+            assert not force_cancel_receipt_path.resolve(strict=False).is_relative_to(
+                worker_workspace
+            ), "attestation receipt must remain outside the worker-controlled workspace"
+            force_cancel_receipt = {
+                "format": "acp-live-force-cancel-attestation-v1",
+                **force_cancel_monitor_receipt,
+                "cleanup_phase": verified["phase"],
+                "cleanup_verified": True,
+            }
+            receipt_json = json.dumps(force_cancel_receipt, sort_keys=True, separators=(",", ":"))
+            assert runner["credential"] not in receipt_json
+            receipt_fd = os.open(
+                force_cancel_receipt_path,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+            )
+            try:
+                with os.fdopen(receipt_fd, "w", encoding="ascii", closefd=False) as stream:
+                    stream.write(receipt_json + "\n")
+                    stream.flush()
+                    os.fsync(receipt_fd)
+            finally:
+                os.close(receipt_fd)
+            assert stat.S_IMODE(force_cancel_receipt_path.stat().st_mode) == 0o600
+            print(f"ACP_LIVE_FORCE_CANCEL_RECEIPT={receipt_json}", flush=True)
     finally:
+        pending_exception = sys.exc_info()
         if (
             provider_probe_release is not None
             and not provider_proxy_cancel
@@ -7408,12 +7555,16 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
                     if isinstance(teardown_execution, dict)
                     else None
                 )
-                pytest.fail(
+                guard_message = (
                     "durable execution has not reached its exact expected cleanup phase; "
                     "leaving ACP units and fixture untouched at "
                     f"{run_root}; phase={observed_phase!r}; "
                     f"expected={expected_teardown_phase!r}; execution_id={identity[2]}"
                 )
+                if pending_exception[0] is not None:
+                    print(guard_message, file=sys.stderr, flush=True)
+                    raise pending_exception[1].with_traceback(pending_exception[2])
+                pytest.fail(guard_message)
         driver_safe = _stop_attempted_units_and_check_quiescence(
             systemctl, service_unit, service_start_attempted, slice_unit, slice_start_attempted
         )

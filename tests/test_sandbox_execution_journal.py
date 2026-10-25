@@ -7035,6 +7035,142 @@ def test_ambiguous_monitor_cancel_keeps_sandbox_execution_fenced(
         os.close(gate_read)
 
 
+def test_monitor_unknown_status_retries_read_only_before_cancelling(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    execution = reserve(supervisor, attempt)
+    gate_read, gate_write = os.pipe()
+    handle = _test_runc_handle(target=_test_runc_target(execution), gate_writer=gate_write)
+    record_launch(supervisor, attempt, runc_handle=handle)
+    execution_with_scope = supervisor._sandbox_execution_get(attempt["id"])
+    assert execution_with_scope is not None
+    status_calls = 0
+    cancel_calls: list[str] = []
+
+    def status() -> SimpleNamespace:
+        nonlocal status_calls
+        status_calls += 1
+        if status_calls == 1:
+            return SimpleNamespace(outcome="unknown", payload={"phase": "unknown"})
+        return SimpleNamespace(
+            outcome="ok",
+            payload={
+                "phase": "running",
+                "scope_unit": execution_with_scope["scope_unit"],
+                "scope_invocation_id": execution_with_scope["scope_invocation_id"],
+                "scope_control_group": execution_with_scope["cgroup_path"],
+            },
+        )
+
+    def cancel(request_id: str) -> SimpleNamespace:
+        cancel_calls.append(request_id)
+        return SimpleNamespace(outcome="ok", payload={"phase": "exited"})
+
+    client = SimpleNamespace(status=status, cancel=cancel)
+    monkeypatch.setattr(
+        monitor_lifecycle_module,
+        "sandbox_monitor_control_paths",
+        lambda **_kwargs: (
+            Path("/private/control"),
+            Path("/private/control/receipt"),
+            Path("/private/runtime/socket"),
+        ),
+    )
+    monkeypatch.setattr(
+        monitor_lifecycle_module, "reconnect_sandbox_monitor", lambda **_kwargs: client
+    )
+    monkeypatch.setattr(workers_module, "_MONITOR_STATUS_SETTLE_POLL_SECONDS", 0.0)
+    monkeypatch.setattr(
+        supervisor,
+        "_open_registered_pidfd",
+        lambda *_args: pytest.fail("monitor status retry must not fall back to a host PID"),
+    )
+
+    try:
+        result = supervisor.terminate_worker(attempt["id"])
+
+        assert status_calls == 2
+        assert len(cancel_calls) == 1
+        assert result["monitor_phase"] == "exited"
+        assert result["stop_requested"] is True
+    finally:
+        handle.close_gate()
+        os.close(gate_read)
+
+
+def test_persistent_unknown_monitor_status_remains_fail_closed(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    execution = reserve(supervisor, attempt)
+    gate_read, gate_write = os.pipe()
+    handle = _test_runc_handle(target=_test_runc_target(execution), gate_writer=gate_write)
+    record_launch(supervisor, attempt, runc_handle=handle)
+    status_calls = 0
+    cancel_calls: list[str] = []
+
+    def status() -> SimpleNamespace:
+        nonlocal status_calls
+        status_calls += 1
+        return SimpleNamespace(outcome="unknown", payload={"phase": "unknown"})
+
+    client = SimpleNamespace(
+        status=status,
+        cancel=lambda request_id: cancel_calls.append(request_id),
+    )
+    monkeypatch.setattr(
+        monitor_lifecycle_module,
+        "sandbox_monitor_control_paths",
+        lambda **_kwargs: (
+            Path("/private/control"),
+            Path("/private/control/receipt"),
+            Path("/private/runtime/socket"),
+        ),
+    )
+    monkeypatch.setattr(
+        monitor_lifecycle_module, "reconnect_sandbox_monitor", lambda **_kwargs: client
+    )
+    clock = [0.0]
+    monkeypatch.setattr(
+        workers_module,
+        "time",
+        SimpleNamespace(
+            monotonic=lambda: clock[0],
+            sleep=lambda seconds: clock.__setitem__(0, clock[0] + seconds),
+        ),
+    )
+    monkeypatch.setattr(
+        supervisor,
+        "_open_registered_pidfd",
+        lambda *_args: pytest.fail("unknown monitor status must not fall back to a host PID"),
+    )
+
+    try:
+        with pytest.raises(SupervisorError) as termination:
+            supervisor.terminate_worker(attempt["id"])
+
+        assert termination.value.code == "sandbox_execution_monitor_ambiguous"
+        assert status_calls > 1
+        assert clock[0] >= workers_module._MONITOR_STATUS_SETTLE_TIMEOUT_SECONDS
+        assert cancel_calls == []
+        durable = supervisor._sandbox_execution_get(attempt["id"])
+        assert durable["phase"] == "launched"
+        with supervisor.connect() as connection:
+            assert (
+                journal_module._sandbox_execution_launch_stop_reason(connection, durable)
+                == "terminate_worker"
+            )
+        with pytest.raises(SupervisorError) as gate_rejected:
+            handle.release_gate()
+        assert gate_rejected.value.code == "sandbox_launch_gate_closed"
+    finally:
+        handle.close_gate()
+        os.close(gate_read)
+
+
 def test_monitor_for_another_scope_cannot_cancel_this_execution(
     repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

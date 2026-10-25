@@ -41,12 +41,16 @@ _MAX_FRAME_BYTES = 4096
 _MAX_STATUS_BYTES = 2048
 _MAX_REQUESTS = 256
 _CONTROL_KEY_BYTES = 32
+_MAX_CANCEL_ATTESTATION_BYTES = 2048
+_CANCEL_ATTESTATION_FORMAT = "acp-monitor-cancel-attestation-v1"
+_CANCEL_ATTESTATION_DOMAIN = b"acp-monitor-cancel-attestation-v1\0"
 SANDBOX_MONITOR_OPERATION_TIMEOUT_SECONDS = 15.0
 _REQUEST_ID = re.compile(r"[0-9a-f]{32}\Z")
 _SOCKET_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,72}\.sock\Z")
 _SCOPE_UNIT = re.compile(r"[A-Za-z0-9_.:@\\-]+\.scope\Z")
 _INVOCATION_ID = re.compile(r"[0-9a-f]{32}\Z")
 _SCOPE_STATUS_FIELDS = frozenset({"scope_unit", "scope_invocation_id", "scope_control_group"})
+_CANCEL_METHODS = frozenset({"not_required", "graceful", "sigkill"})
 _PHASES = frozenset(
     {"reserved", "launched", "running", "stopping", "exited", "cleanup_verified", "unknown"}
 )
@@ -214,14 +218,19 @@ def _peer_credentials(connection: socket.socket) -> tuple[int, int, int]:
     return pid, uid, gid
 
 
-def _validate_status_payload(value: Any) -> dict[str, Any]:
-    if not isinstance(value, Mapping) or set(value) - {
+def _validate_status_payload(
+    value: Any, *, allow_cancel_result: bool = False, require_cancel_result: bool = False
+) -> dict[str, Any]:
+    allowed_fields = {
         "phase",
         "worker_pid",
         "worker_exit_code",
         "cleanup_verified",
         *_SCOPE_STATUS_FIELDS,
-    }:
+    }
+    if allow_cancel_result:
+        allowed_fields.add("cancel_method")
+    if not isinstance(value, Mapping) or set(value) - allowed_fields:
         raise SandboxMonitorIPCError("monitor status has an unsupported shape")
     phase = value.get("phase")
     if not isinstance(phase, str) or phase not in _PHASES:
@@ -241,6 +250,17 @@ def _validate_status_payload(value: Any) -> dict[str, Any]:
         if type(value["cleanup_verified"]) is not bool:
             raise SandboxMonitorIPCError("monitor cleanup status is invalid")
         result["cleanup_verified"] = value["cleanup_verified"]
+    if "cancel_method" in value:
+        cancel_method = value["cancel_method"]
+        if (
+            not allow_cancel_result
+            or not isinstance(cancel_method, str)
+            or cancel_method not in _CANCEL_METHODS
+        ):
+            raise SandboxMonitorIPCError("monitor cancellation method is invalid")
+        result["cancel_method"] = cancel_method
+    elif require_cancel_result:
+        raise SandboxMonitorIPCError("monitor cancellation method is missing")
     present_scope_fields = _SCOPE_STATUS_FIELDS.intersection(value)
     if present_scope_fields and present_scope_fields != _SCOPE_STATUS_FIELDS:
         raise SandboxMonitorIPCError("monitor scope identity is incomplete")
@@ -273,6 +293,186 @@ def _validate_status_payload(value: Any) -> dict[str, Any]:
     return result
 
 
+@dataclass(frozen=True)
+class SandboxMonitorCancelAttestation:
+    """Verified local evidence for how one exact monitor cancellation completed."""
+
+    request_id: str
+    request_sha256: str
+    attempt_id: str
+    claim_token: int
+    execution_id: str
+    method: str
+    phase: str
+    scope_unit: str
+    scope_invocation_id: str
+    scope_control_group: str
+
+    @property
+    def scope_identity(self) -> dict[str, str]:
+        return {
+            "scope_unit": self.scope_unit,
+            "scope_invocation_id": self.scope_invocation_id,
+            "scope_control_group": self.scope_control_group,
+        }
+
+
+def _cancel_attestation_record_name(request_id: str) -> str:
+    if not isinstance(request_id, str) or _REQUEST_ID.fullmatch(request_id) is None:
+        raise SandboxMonitorIPCError("cancel attestation request ID is invalid")
+    return f"r-{request_id}.cancel-attestation"
+
+
+def _encode_cancel_attestation(
+    *,
+    key: bytes,
+    request_id: str,
+    request_sha256: str,
+    expected_identity: tuple[str, int, str],
+    payload: Mapping[str, Any],
+    method: str,
+) -> bytes | None:
+    """Encode private evidence; no cancellation method is added to IPC v1."""
+
+    if (
+        type(key) is not bytes
+        or len(key) != _CONTROL_KEY_BYTES
+        or not isinstance(request_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", request_sha256) is None
+        or not isinstance(method, str)
+        or method not in _CANCEL_METHODS
+        or not isinstance(payload.get("phase"), str)
+        or payload.get("phase") not in {"stopping", "exited"}
+    ):
+        raise SandboxMonitorIPCError("cancel attestation fields are invalid")
+    scope_fields = _SCOPE_STATUS_FIELDS.intersection(payload)
+    if not scope_fields:
+        # Older/test handlers without a scope binding may still cancel through
+        # the unchanged v1 response, but cannot produce exact-scope evidence.
+        return None
+    if scope_fields != _SCOPE_STATUS_FIELDS:
+        raise SandboxMonitorIPCError("cancel attestation scope identity is incomplete")
+    validated = _validate_status_payload(
+        {"phase": payload["phase"], **{name: payload[name] for name in _SCOPE_STATUS_FIELDS}}
+    )
+    material = {
+        "format": _CANCEL_ATTESTATION_FORMAT,
+        "request_id": request_id,
+        "request_sha256": request_sha256,
+        "identity": {
+            "attempt_id": expected_identity[0],
+            "claim_token": expected_identity[1],
+            "execution_id": expected_identity[2],
+        },
+        "outcome": "ok",
+        "phase": validated["phase"],
+        "method": method,
+        "scope_identity": {name: validated[name] for name in _SCOPE_STATUS_FIELDS},
+    }
+    tag = hmac.new(
+        key, _CANCEL_ATTESTATION_DOMAIN + _canonical_json(material), hashlib.sha256
+    ).hexdigest()
+    encoded = _canonical_json({**material, "mac": tag})
+    if len(encoded) > _MAX_CANCEL_ATTESTATION_BYTES:
+        raise SandboxMonitorIPCError("cancel attestation exceeds its size bound")
+    return encoded
+
+
+def _decode_cancel_attestation(
+    encoded: bytes,
+    *,
+    key: bytes,
+    request_id: str,
+    request_sha256: str,
+    expected_identity: tuple[str, int, str],
+    response_payload: Mapping[str, Any],
+) -> SandboxMonitorCancelAttestation:
+    if (
+        not encoded
+        or len(encoded) > _MAX_CANCEL_ATTESTATION_BYTES
+        or len(key) != _CONTROL_KEY_BYTES
+    ):
+        raise SandboxMonitorIPCError("cancel attestation is empty or oversized")
+    try:
+        decoded = json.loads(encoded.decode("ascii"), object_pairs_hook=_reject_duplicate_keys)
+    except (UnicodeDecodeError, json.JSONDecodeError, SandboxMonitorReceiptError) as error:
+        raise SandboxMonitorIPCError("cancel attestation is not valid canonical JSON") from error
+    expected_fields = {
+        "format",
+        "request_id",
+        "request_sha256",
+        "identity",
+        "outcome",
+        "phase",
+        "method",
+        "scope_identity",
+        "mac",
+    }
+    if not isinstance(decoded, dict) or set(decoded) != expected_fields:
+        raise SandboxMonitorIPCError("cancel attestation has an unsupported shape")
+    if _canonical_json(decoded) != encoded:
+        raise SandboxMonitorIPCError("cancel attestation is not canonical JSON")
+    if (
+        decoded["format"] != _CANCEL_ATTESTATION_FORMAT
+        or decoded["request_id"] != request_id
+        or decoded["request_sha256"] != request_sha256
+        or decoded["outcome"] != "ok"
+        or not isinstance(decoded["phase"], str)
+        or decoded["phase"] not in {"stopping", "exited"}
+        or not isinstance(decoded["method"], str)
+        or decoded["method"] not in _CANCEL_METHODS
+        or not isinstance(decoded["mac"], str)
+        or re.fullmatch(r"[0-9a-f]{64}", decoded["mac"]) is None
+    ):
+        raise SandboxMonitorIPCError("cancel attestation identity or fields do not match")
+    identity = decoded["identity"]
+    if (
+        not isinstance(identity, dict)
+        or set(identity) != {"attempt_id", "claim_token", "execution_id"}
+        or identity
+        != {
+            "attempt_id": expected_identity[0],
+            "claim_token": expected_identity[1],
+            "execution_id": expected_identity[2],
+        }
+    ):
+        raise SandboxMonitorIPCError("cancel attestation execution fence does not match")
+    try:
+        sandbox_container_id(
+            identity["attempt_id"], identity["claim_token"], identity["execution_id"]
+        )
+    except SandboxMonitorReceiptError as error:
+        raise SandboxMonitorIPCError("cancel attestation execution fence is invalid") from error
+
+    scope_identity = decoded["scope_identity"]
+    if not isinstance(scope_identity, dict) or set(scope_identity) != _SCOPE_STATUS_FIELDS:
+        raise SandboxMonitorIPCError("cancel attestation scope identity is incomplete")
+    validated_scope = _validate_status_payload({"phase": decoded["phase"], **scope_identity})
+    if response_payload.get("phase") != decoded["phase"] or any(
+        response_payload.get(name) != validated_scope[name] for name in _SCOPE_STATUS_FIELDS
+    ):
+        raise SandboxMonitorIPCError("cancel attestation does not match its authenticated response")
+
+    material = {name: value for name, value in decoded.items() if name != "mac"}
+    expected_mac = hmac.new(
+        key, _CANCEL_ATTESTATION_DOMAIN + _canonical_json(material), hashlib.sha256
+    ).hexdigest()
+    if not hmac.compare_digest(decoded["mac"], expected_mac):
+        raise SandboxMonitorIPCError("cancel attestation authentication failed")
+    return SandboxMonitorCancelAttestation(
+        request_id=request_id,
+        request_sha256=request_sha256,
+        attempt_id=expected_identity[0],
+        claim_token=expected_identity[1],
+        execution_id=expected_identity[2],
+        method=decoded["method"],
+        phase=decoded["phase"],
+        scope_unit=validated_scope["scope_unit"],
+        scope_invocation_id=validated_scope["scope_invocation_id"],
+        scope_control_group=validated_scope["scope_control_group"],
+    )
+
+
 def _encode_response(
     *,
     key: bytes,
@@ -303,6 +503,7 @@ class SandboxMonitorControlResponse:
     operation: str
     outcome: str
     payload: dict[str, Any]
+    cancel_attestation: SandboxMonitorCancelAttestation | None = None
 
 
 def _decode_response(
@@ -619,11 +820,37 @@ class SandboxMonitorControlServer:
                 if request.operation == "status":
                     payload = _validate_status_payload(self._status_provider())
                 elif request.operation == "cancel":
-                    payload = _validate_status_payload(self._cancel_action())
+                    payload = _validate_status_payload(
+                        self._cancel_action(),
+                        allow_cancel_result=True,
+                        require_cancel_result=True,
+                    )
                     if payload["phase"] not in {"stopping", "exited"}:
                         raise SandboxMonitorIPCError(
                             "monitor cancel handler did not confirm stopping or exited"
                         )
+                    cancel_method = payload.pop("cancel_method")
+                    # Cancellation success and the v1 response remain
+                    # available if optional method evidence cannot be encoded
+                    # or persisted. The forced-attestation test separately
+                    # requires it.
+                    try:
+                        attestation = _encode_cancel_attestation(
+                            key=self._key,
+                            request_id=request.request_id,
+                            request_sha256=digest,
+                            expected_identity=self._expected_identity,
+                            payload=payload,
+                            method=cancel_method,
+                        )
+                        if attestation is not None:
+                            _create_private_record(
+                                self._ledger_fd,
+                                _cancel_attestation_record_name(request.request_id),
+                                attestation,
+                            )
+                    except (OSError, SandboxMonitorIPCError):
+                        pass
                 else:  # Defense in depth if the codec's operation set changes.
                     raise SandboxMonitorIPCError("monitor control operation is unsupported")
                 outcome = "ok"
@@ -729,6 +956,7 @@ class SandboxMonitorControlClient:
         socket_path: Path,
         key: bytes,
         expected_uid: int,
+        control_directory: Path | None = None,
         timeout_seconds: float = 2.0,
     ) -> None:
         if type(receipt) is not SandboxMonitorReceipt:
@@ -737,6 +965,14 @@ class SandboxMonitorControlClient:
             raise SandboxMonitorIPCError("monitor control key must contain exactly 32 bytes")
         if type(expected_uid) is not int or expected_uid != os.geteuid():
             raise SandboxMonitorIPCError("monitor server UID must match the controller owner")
+        if control_directory is not None and (
+            not isinstance(control_directory, Path)
+            or not control_directory.is_absolute()
+            or control_directory == Path("/")
+            or ".." in control_directory.parts
+            or str(control_directory) != os.path.normpath(str(control_directory))
+        ):
+            raise SandboxMonitorIPCError("monitor control directory is invalid")
         if type(timeout_seconds) not in {int, float} or not 0.05 <= timeout_seconds <= 30:
             raise SandboxMonitorIPCError("monitor client timeout is invalid")
         if (
@@ -762,6 +998,7 @@ class SandboxMonitorControlClient:
             )
         self._receipt = receipt
         self._socket_path = socket_path
+        self._control_directory = control_directory
         self._key = key
         self._expected_uid = expected_uid
         self._timeout_seconds = float(timeout_seconds)
@@ -808,12 +1045,66 @@ class SandboxMonitorControlClient:
             raise SandboxMonitorIPCError("monitor control connection failed") from error
         finally:
             client.close()
-        return _decode_response(
+        response = _decode_response(
             response_body,
             key=self._key,
             request_id=request_id,
             operation=operation,
         )
+        if operation != "cancel" or response.outcome != "ok":
+            return response
+
+        cancel_attestation = self._read_cancel_attestation(
+            request_id=request_id,
+            request_sha256=hashlib.sha256(encoded).hexdigest(),
+            response_payload=response.payload,
+        )
+        return SandboxMonitorControlResponse(
+            request_id=response.request_id,
+            operation=response.operation,
+            outcome=response.outcome,
+            payload=response.payload,
+            cancel_attestation=cancel_attestation,
+        )
+
+    def _read_cancel_attestation(
+        self,
+        *,
+        request_id: str,
+        request_sha256: str,
+        response_payload: Mapping[str, Any],
+    ) -> SandboxMonitorCancelAttestation | None:
+        directory = getattr(self, "_control_directory", None)
+        if directory is None:
+            return None
+        directory_fd = -1
+        try:
+            directory_fd = _open_private_directory(directory)
+            encoded = _read_private_record(
+                directory_fd,
+                _cancel_attestation_record_name(request_id),
+                limit=_MAX_CANCEL_ATTESTATION_BYTES,
+            )
+            return _decode_cancel_attestation(
+                encoded,
+                key=self._key,
+                request_id=request_id,
+                request_sha256=request_sha256,
+                expected_identity=(
+                    self._receipt.attempt_id,
+                    self._receipt.claim_token,
+                    self._receipt.execution_id,
+                ),
+                response_payload=response_payload,
+            )
+        except (OSError, SandboxMonitorIPCError, SandboxMonitorReceiptError):
+            # Sidecar evidence is optional for mixed-version availability. A
+            # corrupt, missing, or mismatched record only removes the method
+            # claim; the already-authenticated v1 cancellation stays valid.
+            return None
+        finally:
+            if directory_fd >= 0:
+                os.close(directory_fd)
 
     def status(self, request_id: str | None = None) -> SandboxMonitorControlResponse:
         """Return current state; status requests are read-only and not ledgered."""

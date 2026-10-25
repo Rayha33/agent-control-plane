@@ -1420,6 +1420,85 @@ The full exact-head GitHub Actions matrix for test-only commit
 This matrix checks the repository test suite; it is not additional
 sandbox-isolation, provider-egress, activation, or crash-recovery evidence.
 
+### Forced exact-scope SIGKILL cancellation mode (opt-in)
+
+To make fresh-supervisor cancellation prove the monitor's forced branch rather
+than allowing a graceful exit, combine
+`ACP_LIVE_CANCEL_AFTER_START=1` with
+`ACP_LIVE_FORCE_CANCEL_AFTER_START=1` on the disposable Linux guest:
+
+```sh
+ACP_RUN_SANDBOX_WORKER_LIFECYCLE=1 \
+ACP_OCI_TEST_RUNC=/usr/local/bin/runc \
+ACP_OCI_TEST_RUNC_VERSION=1.5.2 \
+ACP_OCI_TEST_BUSYBOX=/usr/bin/busybox \
+ACP_LIVE_CANCEL_AFTER_START=1 \
+ACP_LIVE_FORCE_CANCEL_AFTER_START=1 \
+uv run --frozen --extra dev pytest -s -vv \
+  tests/test_sandbox_worker_lifecycle_integration.py::test_live_production_launch_driver_runs_exact_pinned_runc_request
+```
+
+The isolated submode runs a TERM-ignoring BusyBox sleep payload without
+provider/model features. It requires the fresh supervisor's authenticated
+cancel result to report `phase=exited`, then reconnects to the same monitor and
+replays the identity-bound request ID. The IPC v1 response schema remains
+unchanged; the client may attach a separately verified, private monitor
+attestation bound to the request digest, execution identity, outcome phase,
+method, and exact scope tuple. The test requires that attestation to report
+`sigkill` and match the journaled scope. A missing or invalid sidecar does not
+undo cancellation success, but this forced-attestation mode fails unless the
+method evidence is valid. After independent cleanup verification it emits
+`ACP_LIVE_FORCE_CANCEL_RECEIPT=...`; the JSON receipt is written outside the
+worker workspace and excludes the enrolled harness credential. The harness
+credential authorizes the control-plane attempt only; no provider credential
+or provider request is used. A passing test log is required before this mode
+can be cited as live SIGKILL evidence.
+
+### Forced exact-scope cancellation replay (2026-10-25 UTC; no provider)
+
+The forced-cancel mode passed 1/1 on the disposable Debian 12 ARM64 Lima guest
+`acp-2370-live-sandbox-kernel612-20261021` (Linux
+`6.12.95+deb12-cloud-arm64`, systemd `252.39`, rootless runc `1.5.2`, SHA-256
+`d10ecae898361832a059be2089bab92d158aec54661b18ed7346ed79628b46b0`). The
+guest used CPython `3.12.15` and the frozen development environment. The exact
+forced-cancel environment was `ACP_RUN_SANDBOX_WORKER_LIFECYCLE=1`,
+`ACP_LIVE_CANCEL_AFTER_START=1`, and
+`ACP_LIVE_FORCE_CANCEL_AFTER_START=1`, with the pinned runc and BusyBox paths
+above. It finished in 16.24 seconds and emitted this non-secret receipt:
+
+| Evidence | Value |
+| --- | --- |
+| Attempt / execution / claim fence | `4eb4cc6e-3902-4c14-8a58-a82bc65ee5ee` / `8be9dc6e-4ea7-4291-a798-97925d2ff26c` / `1` |
+| Cancel request / request SHA-256 | `c639ddd3174cfb499b20158b966f8929` / `e050148a4c6bea12797b4a7af9e01dd24a1ded9eef5edacf2a583c05886e948f` |
+| Monitor result | `ok`, `exited`, `sigkill`; authenticated v1 response replay plus verified attestation sidecar |
+| Exact systemd scope | `acp-acp-215afab494c3c86448d99764bfa8fadca83cc3eac64fafee7fd7b34bd4e9.scope`; invocation `ca50dab8dbf74b08b951aed9fad3c761` |
+| Exact cgroup | `/user.slice/user-501.slice/user@501.service/user.slice/user-acp.slice/user-acp-088cad51d91aeadfc5e060cac7292a441bc128b57834700471e9b03ee4fe23a1.slice/acp-acp-215afab494c3c86448d99764bfa8fadca83cc3eac64fafee7fd7b34bd4e9.scope` |
+| Cleanup / evidence boundaries | `cleanup_verified=true`; provider proxy disabled; no real-provider request; worker output not used as evidence |
+
+Host and guest SHA-256 values matched for all eight changed source/test files
+staged for the replay:
+
+| File | SHA-256 |
+| --- | --- |
+| `src/agent_control_plane/supervisor/sandbox_monitor_ipc.py` | `40f5ff805bc56ce9348c3fe23fc5f35525bd5ac115b8fc18df4d9d91b07b996c` |
+| `src/agent_control_plane/supervisor/sandbox_monitor_lifecycle.py` | `41fea59aed41c2381dcc87d9f26e1c684f192f88a6b7e3175d76c41aa1ee2b43` |
+| `src/agent_control_plane/supervisor/sandbox_monitor_service.py` | `696e377c33cda461c264ec351fd472718fcc2c3410b18a259eeb887517e4b0cd` |
+| `src/agent_control_plane/supervisor/workers.py` | `51d1b9586dc8bee873a2b74bfabe281b960261dd36eb1696698a7bca267f9488` |
+| `tests/test_sandbox_execution_journal.py` | `a25faea4361dc798009e5337d00c6f8a8def3e91687a12a5c93a6fe5c25457f9` |
+| `tests/test_sandbox_monitor_ipc.py` | `b8a66d713ba7574edee8982d98b33ba437404f55e99275b58c55546518e690e9` |
+| `tests/test_sandbox_monitor_service.py` | `43c66258096c93b2c36986033407447dbe4785b3f6ef96b46fe2a40cf2ba81e7` |
+| `tests/test_sandbox_worker_lifecycle_integration.py` | `d46b897c1d25e3c95a44a80cb970bbae1179ac44ec1994b806dccb59b838c51b` |
+
+A second 1/1 live run enabled only `ACP_LIVE_PROVIDER_PROXY_UDS=1`. It
+exercised the `cleanup_reported` inode-fenced, empty-directory check before
+independent verification and the directory-absence check after
+`cleanup_verified`. Its worker sent the synthetic blocked-domain CONNECT probe
+only over the local test UDS and received the expected HTTP 403; it made no
+external DNS lookup or request to a real provider endpoint. Two unrelated,
+pre-existing monitor services were also unchanged before and after both
+replays: PID `1435`, invocation `d531078c38064b5fbba59d53452bb512`, and PID
+`858`, invocation `407e326439354d3d8964a8a5228f8864`. Neither was signaled.
+
 ### Exact-head provider UDS cancellation replay (2026-10-24; no provider)
 
 After PR #42 advanced to code commit
